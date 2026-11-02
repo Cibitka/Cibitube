@@ -39,6 +39,7 @@ pub struct MetrolistApp {
     repeat_mode: usize,
     shuffle_state: bool,
     settings_menu_tab: usize,
+    show_lyrics_in_player: bool,
     search_query: String,
     search_results: Vec<Track>,
     is_searching: bool,
@@ -96,6 +97,7 @@ impl MetrolistApp {
             repeat_mode: 0,
             shuffle_state: false,
             settings_menu_tab: 0,
+            show_lyrics_in_player: false,
             search_query: String::new(),
             search_results: Vec::new(),
             is_searching: false,
@@ -238,17 +240,21 @@ impl MetrolistApp {
         self.lyrics = None;
     }
 
-    fn shuffle_queue(&mut self) {
-        if self.queue.len() <= 1 { return; }
+    fn shuffle_slice(slice: &mut [Track]) {
+        if slice.len() <= 1 { return; }
         let mut seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        for i in (1..self.queue.len()).rev() {
+        for i in (1..slice.len()).rev() {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let j = (seed >> 32) as usize % (i + 1);
-            self.queue.swap(i, j);
+            slice.swap(i, j);
         }
+    }
+
+    fn shuffle_queue(&mut self) {
+        Self::shuffle_slice(&mut self.queue);
     }
 
     fn play_next(&mut self) {
@@ -544,7 +550,7 @@ impl eframe::App for MetrolistApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("♫").size(24.0).color(accent));
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("METROLIST").size(18.0).strong().color(accent));
+                        ui.label(RichText::new("CIBITUBE").size(18.0).strong().color(accent));
                         ui.label(RichText::new("Взято за идею Metrolist").size(10.0).weak());
                     });
                 });
@@ -607,7 +613,7 @@ impl eframe::App for MetrolistApp {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Взято за идею Metrolist").size(10.0).weak());
+                    ui.label(RichText::new("Cibitube • Взято за идею Metrolist").size(10.0).weak());
                 });
             });
         }
@@ -728,6 +734,7 @@ impl eframe::App for MetrolistApp {
                                 let time_width = 38.0;
                                 let spacing = 6.0;
                                 let slider_width = (center_w - time_width * 2.0 - spacing * 2.0).max(80.0);
+                                ui.spacing_mut().slider_width = slider_width;
 
                                 ui.add_sized([time_width, 14.0], egui::Label::new(RichText::new(curr_str).size(11.0).weak()));
                                 ui.add_space(spacing);
@@ -945,6 +952,20 @@ impl MetrolistApp {
 
             ui.add_space(8.0);
             if !self.library.liked_tracks.is_empty() {
+                let shuffle_btn = egui::Button::new(RichText::new("🔀 Перемешать всё").strong())
+                    .fill(Color32::from_rgb(40, 36, 52))
+                    .rounding(Rounding::same(6.0));
+                if ui.add(shuffle_btn).on_hover_text("Перемешать любимые треки и начать воспроизведение").clicked() {
+                    let mut tracks = self.library.liked_tracks.clone();
+                    Self::shuffle_slice(&mut tracks);
+                    self.queue = tracks.clone();
+                    if let Some(first) = tracks.first().cloned() {
+                        self.play_track(first);
+                    }
+                }
+
+                ui.add_space(8.0);
+
                 let dl_all_btn = egui::Button::new(RichText::new("⬇ Скачать все").strong())
                     .fill(Color32::from_rgb(32, 45, 58))
                     .rounding(Rounding::same(6.0));
@@ -1063,6 +1084,18 @@ impl MetrolistApp {
                             if ui.add(play_all_btn).clicked() {
                                 self.queue = self.playlist_tracks.clone();
                                 if let Some(first) = self.playlist_tracks.first().cloned() {
+                                    self.play_track(first);
+                                }
+                            }
+
+                            let shuffle_pl_btn = egui::Button::new(RichText::new("🔀 Перемешать плейлист").strong())
+                                .fill(Color32::from_rgb(40, 36, 52))
+                                .rounding(Rounding::same(6.0));
+                            if ui.add(shuffle_pl_btn).on_hover_text("Перемешать треки плейлиста и начать воспроизведение").clicked() {
+                                let mut tracks = self.playlist_tracks.clone();
+                                Self::shuffle_slice(&mut tracks);
+                                self.queue = tracks.clone();
+                                if let Some(first) = tracks.first().cloned() {
                                     self.play_track(first);
                                 }
                             }
@@ -1305,7 +1338,12 @@ impl MetrolistApp {
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("☰ Очередь воспроизведения").size(18.0).strong());
-            ui.add_space(20.0);
+            ui.add_space(16.0);
+            if ui.button("🔀 Перемешать очередь").clicked() {
+                self.shuffle_queue();
+                self.status_message = Some("Очередь перемешана".to_string());
+            }
+            ui.add_space(8.0);
             if ui.button("Очистить очередь").clicked() {
                 self.queue.clear();
                 self.current_index = None;
@@ -1488,7 +1526,7 @@ impl MetrolistApp {
         let accent = self.accent_color();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("⚙ Настройки").size(22.0).strong());
+            ui.label(RichText::new("⚙ Настройки Cibitube").size(22.0).strong());
             ui.add_space(12.0);
             ui.label(RichText::new("Взято за идею Metrolist").size(12.0).weak());
         });
@@ -1996,7 +2034,7 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
-                        if ui.checkbox(&mut self.settings.discord_show_buttons, "Отображать кнопку «Слушать в Metrolist» в профиле Discord").changed() {
+                        if ui.checkbox(&mut self.settings.discord_show_buttons, "Отображать кнопку «Слушать в Cibitube» в профиле Discord").changed() {
                             self.settings.save();
                         }
                     });
@@ -2066,23 +2104,89 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
 
         // 2. Responsive dimensions: dynamically scaled with window size
-        let content_w = (avail_w * 0.85).clamp(360.0, 720.0);
-        let center_offset = ((avail_w - content_w) / 2.0).max(0.0);
-
-        // Calculate dynamic album art size so it can be BIGGER (up to 440px)
+        // Calculate dynamic album art size (up to 440px)
         let bottom_controls_h = 240.0;
         let top_bar_h = 48.0;
         let space_for_art = (avail_h - top_bar_h - bottom_controls_h).max(180.0);
-        let art_size = space_for_art.min(content_w * 0.80).clamp(220.0, 440.0);
-        let flexible_gap = (avail_h - (top_bar_h + art_size + bottom_controls_h)).max(8.0);
+        let max_w_allowed = (avail_w - 40.0).max(180.0);
+        let art_size = space_for_art.min(max_w_allowed).clamp(240.0, 440.0);
+        let flexible_gap = (avail_h - (top_bar_h + art_size + bottom_controls_h)).clamp(6.0, 36.0);
+
+        // Center the entire player column
+        let center_offset = ((avail_w - art_size) / 2.0).max(0.0);
 
         ui.horizontal(|ui| {
             ui.add_space(center_offset);
-            ui.allocate_ui_with_layout(Vec2::new(content_w, ui.available_height()), egui::Layout::top_down(egui::Align::Center), |ui| {
-                // Top: Centered Large Album Art
+            ui.allocate_ui_with_layout(Vec2::new(art_size, ui.available_height()), egui::Layout::top_down(egui::Align::Center), |ui| {
                 let art_rounding = Rounding::same(20.0);
 
-                if !self.settings.hide_player_thumbnail {
+                // Top: Centered Large Album Art OR Synced Lyrics in-place
+                if self.show_lyrics_in_player {
+                    let frame = egui::Frame::none()
+                        .fill(Color32::from_rgb(20, 20, 26))
+                        .rounding(art_rounding)
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 45, 55)))
+                        .inner_margin(14.0);
+                    frame.show(ui, |ui| {
+                        ui.set_width(art_size - 28.0);
+                        ui.set_height(art_size - 28.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("♫ Текст песни").size(13.0).strong().color(accent));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(RichText::new("✕ Обложка").size(11.0)).clicked() {
+                                    self.show_lyrics_in_player = false;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        if let Some(lyrics) = &self.lyrics {
+                            if !lyrics.is_synced {
+                                egui::ScrollArea::vertical()
+                                    .max_height(art_size - 80.0)
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(&lyrics.plain).size(14.0).line_height(Some(22.0)));
+                                    });
+                            } else {
+                                let current_time = playback_info.position_secs;
+                                let current_line_idx = lyrics.lines.iter().rposition(|l| l.seconds <= current_time);
+                                egui::ScrollArea::vertical()
+                                    .max_height(art_size - 80.0)
+                                    .show(ui, |ui| {
+                                        for (idx, line) in lyrics.lines.iter().enumerate() {
+                                            let is_active = Some(idx) == current_line_idx;
+                                            let text = if is_active {
+                                                RichText::new(&line.text)
+                                                    .size(16.0)
+                                                    .strong()
+                                                    .color(accent)
+                                            } else if Some(idx) < current_line_idx {
+                                                RichText::new(&line.text)
+                                                    .size(13.0)
+                                                    .color(Color32::from_rgb(120, 120, 130))
+                                            } else {
+                                                RichText::new(&line.text)
+                                                    .size(13.0)
+                                                    .color(Color32::from_rgb(200, 200, 210))
+                                            };
+                                            let resp = ui.label(text);
+                                            if is_active && self.settings.lyrics_auto_scroll {
+                                                resp.scroll_to_me(Some(egui::Align::Center));
+                                            }
+                                            ui.add_space(6.0);
+                                        }
+                                    });
+                            }
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space((art_size / 2.0) - 50.0);
+                                ui.label(RichText::new("Текст песни загружается или недоступен").weak());
+                            });
+                        }
+                    });
+                } else if !self.settings.hide_player_thumbnail {
                     if let Some(track) = &current_track {
                         if let Some(thumb) = &track.thumbnail_url {
                             ui.add(egui::Image::new(thumb)
@@ -2104,14 +2208,14 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                 ui.add_space(flexible_gap);
 
                 // --- BOTTOM INTERFACE SECTION ---
-                // Track metadata row: Title & Artist + Share & Heart
-                ui.allocate_ui_with_layout(Vec2::new(content_w, 56.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.allocate_ui_with_layout(Vec2::new(content_w - 95.0, 52.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                // Track metadata row: Title & Artist + Share & Heart (width = art_size)
+                ui.allocate_ui_with_layout(Vec2::new(art_size, 52.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(art_size - 80.0, 48.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         if let Some(track) = &current_track {
-                            ui.label(RichText::new(&track.title).size(22.0).strong().color(Color32::WHITE));
-                            ui.label(RichText::new(&track.artist).size(15.0).weak());
+                            ui.label(RichText::new(&track.title).size(20.0).strong().color(Color32::WHITE));
+                            ui.label(RichText::new(&track.artist).size(14.0).weak());
                         } else {
-                            ui.label(RichText::new("Ничего не играет").size(18.0).weak());
+                            ui.label(RichText::new("Ничего не играет").size(16.0).weak());
                         }
                     });
 
@@ -2120,39 +2224,41 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                             let is_liked = self.library.is_liked(&track.id);
                             let heart_color = if is_liked { Color32::from_rgb(244, 63, 94) } else { Color32::GRAY };
                             let heart_symbol = if is_liked { "♥" } else { "♡" };
-                            let heart_btn = egui::Button::new(RichText::new(heart_symbol).size(24.0).color(heart_color)).frame(false);
+                            let heart_btn = egui::Button::new(RichText::new(heart_symbol).size(22.0).color(heart_color)).frame(false);
                             if ui.add(heart_btn).clicked() {
                                 self.library.toggle_like(track.clone());
                             }
 
-                            ui.add_space(10.0);
+                            ui.add_space(8.0);
 
-                            let share_btn = egui::Button::new(RichText::new("↗").size(22.0).color(Color32::WHITE)).frame(false);
+                            let share_btn = egui::Button::new(RichText::new("↗").size(20.0).color(Color32::WHITE)).frame(false);
                             if ui.add(share_btn).on_hover_text("Копировать ссылку на трек").clicked() {
                                 let link = format!("https://music.youtube.com/watch?v={}", track.id);
                                 ui.output_mut(|o| o.copied_text = link);
-                                self.status_message = Some("Ссылка на трек скопирована!".to_string());
+                                self.status_message = Some("Ссылка скопирована!".to_string());
                             }
                         }
                     });
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
-                // Full-width Progress Slider & Time Labels
+                // Progress Slider across the ENTIRE artwork width
+                ui.spacing_mut().slider_width = art_size;
                 let max_d = if playback_info.duration_secs > 0.0 { playback_info.duration_secs } else { 100.0 };
                 let mut pos = playback_info.position_secs;
                 let slider = egui::Slider::new(&mut pos, 0.0..=max_d)
                     .show_value(false)
                     .trailing_fill(true);
-                let resp = ui.add_sized([content_w, 18.0], slider);
+                let resp = ui.add_sized([art_size, 16.0], slider);
                 if resp.dragged() || resp.clicked() {
                     self.player.seek(pos);
                 }
 
-                ui.add_space(4.0);
+                ui.add_space(3.0);
 
-                ui.allocate_ui_with_layout(Vec2::new(content_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // Time labels flush with slider ends
+                ui.allocate_ui_with_layout(Vec2::new(art_size, 16.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let curr_str = Self::format_time(playback_info.position_secs);
                     let dur_str = if self.settings.show_remaining_time && playback_info.duration_secs > playback_info.position_secs {
                         format!("-{}", Self::format_time(playback_info.duration_secs - playback_info.position_secs))
@@ -2165,43 +2271,53 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                     });
                 });
 
-                ui.add_space(16.0);
+                ui.add_space(14.0);
 
-                // Controls row: LARGER Buttons
+                // Controls row: Centered directly under cover & slider
+                let playback_w = 56.0 + 16.0 + 160.0 + 16.0 + 56.0; // 304.0
+                let playback_pad = ((art_size - playback_w) / 2.0).max(0.0);
+
                 ui.horizontal(|ui| {
+                    ui.add_space(playback_pad);
+
                     let prev_btn = egui::Button::new(RichText::new("⏮").size(22.0).strong().color(Color32::WHITE))
                         .fill(Color32::from_rgb(34, 34, 44))
                         .rounding(Rounding::same(27.0));
-                    if ui.add_sized([58.0, 54.0], prev_btn).clicked() {
+                    if ui.add_sized([56.0, 54.0], prev_btn).clicked() {
                         self.play_prev();
                     }
 
-                    ui.add_space(18.0);
+                    ui.add_space(16.0);
 
                     let (icon, text) = if playback_info.is_playing { ("⏸", "Пауза") } else { ("▶", "Играть") };
                     let play_btn = egui::Button::new(RichText::new(format!("{}  {}", icon, text)).size(17.0).color(Color32::WHITE).strong())
                         .fill(accent)
-                        .rounding(Rounding::same(28.0));
-                    if ui.add_sized([180.0, 56.0], play_btn).clicked() {
+                        .rounding(Rounding::same(27.0));
+                    if ui.add_sized([160.0, 54.0], play_btn).clicked() {
                         self.player.toggle_pause();
                     }
 
-                    ui.add_space(18.0);
+                    ui.add_space(16.0);
 
                     let next_btn = egui::Button::new(RichText::new("⏭").size(22.0).strong().color(Color32::WHITE))
                         .fill(Color32::from_rgb(34, 34, 44))
                         .rounding(Rounding::same(27.0));
-                    if ui.add_sized([58.0, 54.0], next_btn).clicked() {
+                    if ui.add_sized([56.0, 54.0], next_btn).clicked() {
                         self.play_next();
                     }
                 });
 
-                ui.add_space(20.0);
+                ui.add_space(16.0);
 
-                // Bottom Action Icons Row (Queue, Sleep, Shuffle, Lyrics, Repeat)
+                // Bottom Action Icons Row (Queue, Shuffle, Lyrics, Repeat): Centered
+                let action_w = 44.0 * 4.0 + 14.0 * 3.0; // 218.0
+                let action_pad = ((art_size - action_w) / 2.0).max(0.0);
+
                 ui.horizontal(|ui| {
+                    ui.add_space(action_pad);
+
                     let queue_btn = egui::Button::new(RichText::new("☰").size(18.0).color(Color32::WHITE)).frame(false);
-                    if ui.add_sized([46.0, 38.0], queue_btn).on_hover_text("Очередь треков").clicked() {
+                    if ui.add_sized([44.0, 36.0], queue_btn).on_hover_text("Очередь треков").clicked() {
                         self.active_tab = ActiveTab::Queue;
                     }
 
@@ -2209,7 +2325,7 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
 
                     let shuffle_col = if self.shuffle_state { accent } else { Color32::GRAY };
                     let shuffle_btn = egui::Button::new(RichText::new("🔀").size(18.0).color(shuffle_col)).frame(false);
-                    if ui.add_sized([46.0, 38.0], shuffle_btn).on_hover_text("Перемешать очередь").clicked() {
+                    if ui.add_sized([44.0, 36.0], shuffle_btn).on_hover_text("Перемешать очередь").clicked() {
                         self.shuffle_state = !self.shuffle_state;
                         if self.shuffle_state {
                             self.shuffle_queue();
@@ -2219,9 +2335,10 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
 
                     ui.add_space(14.0);
 
-                    let lyrics_btn = egui::Button::new(RichText::new("♫").size(18.0).color(Color32::WHITE)).frame(false);
-                    if ui.add_sized([46.0, 38.0], lyrics_btn).on_hover_text("Текст песни").clicked() {
-                        self.active_tab = ActiveTab::Lyrics;
+                    let lyrics_col = if self.show_lyrics_in_player { accent } else { Color32::WHITE };
+                    let lyrics_btn = egui::Button::new(RichText::new("♫").size(18.0).color(lyrics_col)).frame(false);
+                    if ui.add_sized([44.0, 36.0], lyrics_btn).on_hover_text(if self.show_lyrics_in_player { "Скрыть текст песни" } else { "Показать текст песни вместо обложки" }).clicked() {
+                        self.show_lyrics_in_player = !self.show_lyrics_in_player;
                     }
 
                     ui.add_space(14.0);
@@ -2232,7 +2349,7 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                         _ => ("🔁", Color32::GRAY),
                     };
                     let rep_btn = egui::Button::new(RichText::new(rep_icon).size(18.0).color(rep_col)).frame(false);
-                    if ui.add_sized([46.0, 38.0], rep_btn).on_hover_text("Режим повтора").clicked() {
+                    if ui.add_sized([44.0, 36.0], rep_btn).on_hover_text("Режим повтора").clicked() {
                         self.repeat_mode = (self.repeat_mode + 1) % 3;
                     }
                 });

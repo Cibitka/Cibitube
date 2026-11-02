@@ -146,7 +146,7 @@ fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
             "large_image": image_url,
             "large_text": format!("{} — {}", act.title, act.artist),
             "small_image": "https://raw.githubusercontent.com/MetrolistGroup/Metrolist/main/assets/ic_launcher-playstore.png",
-            "small_text": "Metrolist"
+            "small_text": "Cibitube"
         },
         "type": if act.activity_type == 1 { 0 } else { 2 } // 2 = Listening, 0 = Playing
     });
@@ -160,8 +160,8 @@ fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
             }));
         }
         buttons.push(json!({
-            "label": "Metrolist",
-            "url": "https://github.com/MetrolistGroup/Metrolist"
+            "label": "Cibitube",
+            "url": "https://github.com/Cibitka/Metrolist-Rust"
         }));
         activity_obj["buttons"] = json!(buttons);
     }

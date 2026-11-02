@@ -38,15 +38,15 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Metrolist — YouTube Music Client")
-            .with_app_id("metrolist")
+            .with_title("Cibitube — YouTube Music Client")
+            .with_app_id("cibitube")
             .with_inner_size(Vec2::new(1040.0, 700.0))
             .with_min_inner_size(Vec2::new(850.0, 520.0)),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Metrolist",
+        "Cibitube",
         native_options,
         Box::new(|cc| {
             setup_custom_fonts(&cc.egui_ctx);
