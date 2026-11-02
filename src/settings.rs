@@ -27,6 +27,10 @@ pub struct AppSettings {
     // 2. Тема и оформление (photo_3)
     pub theme_mode: usize, // 0 = AMOLED Black, 1 = Dark Slate, 2 = Light
     pub accent_color_idx: usize, // 0 = Emerald (#1DB954), 1 = Blue (#3B82F6), 2 = Purple (#8B5CF6), 3 = Crimson (#E11D48), 4 = Orange (#F97316)
+    #[serde(default = "default_custom_color")]
+    pub custom_accent_color: [u8; 3], // [R, G, B]
+    #[serde(default)]
+    pub use_custom_accent: bool,
     #[serde(default = "default_true")]
     pub high_refresh_rate: bool, // 120 Гц
     #[serde(default)]
@@ -130,6 +134,8 @@ impl Default for AppSettings {
 
             theme_mode: 0, // Default AMOLED Black like Metrolist
             accent_color_idx: 0, // Metrolist Emerald Accent
+            custom_accent_color: [29, 185, 84],
+            use_custom_accent: false,
             high_refresh_rate: true,
             landscape_scaling: false,
             dynamic_icon_colors: true,
@@ -225,4 +231,8 @@ fn default_one_usize() -> usize {
 
 fn default_one_f32() -> f32 {
     1.0
+}
+
+fn default_custom_color() -> [u8; 3] {
+    [29, 185, 84]
 }

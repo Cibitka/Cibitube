@@ -4,10 +4,10 @@ use crate::downloader::Downloader;
 use crate::innertube::InnertubeClient;
 use crate::library::Library;
 use crate::lyrics::LyricsClient;
-use crate::models::{AccountProfile, ActiveTab, Lyrics, Playlist, Track};
+use crate::models::{AccountProfile, ActiveTab, Lyrics, PlaybackInfo, Playlist, Track};
 use crate::player::AudioPlayer;
 use crate::settings::AppSettings;
-use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, RichText, Rounding, Stroke, Vec2};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -191,7 +191,12 @@ impl MetrolistApp {
     }
 
     fn accent_color(&self) -> Color32 {
-        Self::accent_colors()[self.settings.accent_color_idx.min(Self::accent_colors().len() - 1)]
+        if self.settings.use_custom_accent {
+            let [r, g, b] = self.settings.custom_accent_color;
+            Color32::from_rgb(r, g, b)
+        } else {
+            Self::accent_colors()[self.settings.accent_color_idx.min(Self::accent_colors().len() - 1)]
+        }
     }
 
     fn current_track(&self) -> Option<&Track> {
@@ -254,6 +259,23 @@ impl MetrolistApp {
     }
 
     fn shuffle_queue(&mut self) {
+        if self.queue.len() <= 1 {
+            return;
+        }
+
+        if let Some(curr_idx) = self.current_index {
+            if curr_idx < self.queue.len() {
+                // Сохраняем текущий играющий трек, чтобы обложка, звук и позиция не сбивались
+                let current_track = self.queue.remove(curr_idx);
+                // Перемешиваем остальные треки в очереди
+                Self::shuffle_slice(&mut self.queue);
+                // Возвращаем текущий трек на первое место (индекс 0)
+                self.queue.insert(0, current_track);
+                self.current_index = Some(0);
+                return;
+            }
+        }
+
         Self::shuffle_slice(&mut self.queue);
     }
 
@@ -387,6 +409,134 @@ impl MetrolistApp {
         let mins = total_secs / 60;
         let secs = total_secs % 60;
         format!("{:02}:{:02}", mins, secs)
+    }
+
+    fn render_playback_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        width: f32,
+        height: f32,
+        playback_info: &PlaybackInfo,
+    ) {
+        let max_d = if playback_info.duration_secs > 0.0 { playback_info.duration_secs } else { 100.0 };
+        let pos = playback_info.position_secs.clamp(0.0, max_d);
+        let fraction = if max_d > 0.0 { (pos / max_d).clamp(0.0, 1.0) as f32 } else { 0.0 };
+
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click_and_drag());
+
+        // Seeking interaction
+        if resp.clicked() || resp.dragged() {
+            if let Some(mouse_pos) = resp.interact_pointer_pos() {
+                let frac = ((mouse_pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let seek_target = frac as f64 * max_d;
+                self.player.seek(seek_target);
+            }
+        }
+
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let accent = self.accent_color();
+        let unplayed_color = Color32::from_rgb(50, 50, 60);
+        let center_y = rect.center().y;
+        let played_x = rect.left() + fraction * rect.width();
+
+        let painter = ui.painter();
+
+        match self.settings.slider_style {
+            // 1 = Волнистый (Змейка) / Squiggly seekbar
+            1 => {
+                // If song is playing, animate the wave phase!
+                if playback_info.is_playing {
+                    ui.ctx().request_repaint();
+                }
+
+                let time_sec = ui.input(|i| i.time) as f32;
+                let phase = if playback_info.is_playing { time_sec * 5.0 } else { 0.0 };
+                let wave_len = 22.0_f32; // wave period length
+                let amplitude = if playback_info.is_playing { 3.5_f32 } else { 2.5_f32 };
+
+                // Draw unplayed straight line on the right
+                if played_x < rect.right() {
+                    painter.line_segment(
+                        [Pos2::new(played_x, center_y), Pos2::new(rect.right(), center_y)],
+                        Stroke::new(3.5_f32, unplayed_color),
+                    );
+                }
+
+                // Draw animated sine wave for played portion
+                if played_x > rect.left() {
+                    let step = 2.0_f32;
+                    let mut prev_pt = Pos2::new(rect.left(), center_y);
+
+                    let mut x = rect.left() + step;
+                    while x <= played_x {
+                        // Smoothly taper amplitude at the very start and near the thumb
+                        let dist_from_start = x - rect.left();
+                        let dist_from_end = played_x - x;
+                        let taper = (dist_from_start / 10.0).min(dist_from_end / 10.0).clamp(0.0, 1.0);
+
+                        let current_amp = amplitude * taper;
+                        let y = center_y + ((dist_from_start / wave_len) * std::f32::consts::TAU - phase).sin() * current_amp;
+                        let curr_pt = Pos2::new(x, y);
+
+                        painter.line_segment([prev_pt, curr_pt], Stroke::new(3.5_f32, accent));
+                        prev_pt = curr_pt;
+                        x += step;
+                    }
+
+                    if prev_pt.x < played_x {
+                        painter.line_segment([prev_pt, Pos2::new(played_x, center_y)], Stroke::new(3.5_f32, accent));
+                    }
+                }
+
+                // Thumb circle
+                let thumb_radius = if resp.hovered() || resp.dragged() { 7.5 } else { 6.0 };
+                painter.circle_filled(Pos2::new(played_x, center_y), thumb_radius, Color32::WHITE);
+                painter.circle_stroke(Pos2::new(played_x, center_y), thumb_radius, Stroke::new(2.0_f32, accent));
+            }
+
+            // 2 = Тонкий (Minimal thin line)
+            2 => {
+                // Background track
+                painter.line_segment(
+                    [Pos2::new(rect.left(), center_y), Pos2::new(rect.right(), center_y)],
+                    Stroke::new(2.0_f32, unplayed_color),
+                );
+                // Played track
+                if played_x > rect.left() {
+                    painter.line_segment(
+                        [Pos2::new(rect.left(), center_y), Pos2::new(played_x, center_y)],
+                        Stroke::new(2.5_f32, accent),
+                    );
+                }
+                // Small thumb
+                let thumb_radius = if resp.hovered() || resp.dragged() { 5.0 } else { 3.5 };
+                painter.circle_filled(Pos2::new(played_x, center_y), thumb_radius, accent);
+                painter.circle_stroke(Pos2::new(played_x, center_y), thumb_radius, Stroke::new(1.0_f32, Color32::WHITE));
+            }
+
+            // 0 = Прямой (Classic standard bar)
+            _ => {
+                // Background unplayed track
+                painter.line_segment(
+                    [Pos2::new(rect.left(), center_y), Pos2::new(rect.right(), center_y)],
+                    Stroke::new(4.0_f32, unplayed_color),
+                );
+                // Played track
+                if played_x > rect.left() {
+                    painter.line_segment(
+                        [Pos2::new(rect.left(), center_y), Pos2::new(played_x, center_y)],
+                        Stroke::new(4.0_f32, accent),
+                    );
+                }
+                // Thumb circle
+                let thumb_radius = if resp.hovered() || resp.dragged() { 7.0 } else { 5.5 };
+                painter.circle_filled(Pos2::new(played_x, center_y), thumb_radius, Color32::WHITE);
+                painter.circle_stroke(Pos2::new(played_x, center_y), thumb_radius, Stroke::new(1.5_f32, accent));
+            }
+        }
     }
 }
 
@@ -739,15 +889,7 @@ impl eframe::App for MetrolistApp {
                                 ui.add_sized([time_width, 14.0], egui::Label::new(RichText::new(curr_str).size(11.0).weak()));
                                 ui.add_space(spacing);
 
-                                let max_d = if playback_info.duration_secs > 0.0 { playback_info.duration_secs } else { 100.0 };
-                                let mut pos = playback_info.position_secs;
-                                let slider = egui::Slider::new(&mut pos, 0.0..=max_d)
-                                    .show_value(false)
-                                    .trailing_fill(true);
-                                let resp = ui.add_sized([slider_width, 14.0], slider);
-                                if resp.dragged() || resp.clicked() {
-                                    self.player.seek(pos);
-                                }
+                                self.render_playback_slider(ui, slider_width, 14.0, &playback_info);
                                 ui.add_space(spacing);
 
                                 ui.add_sized([time_width, 14.0], egui::Label::new(RichText::new(dur_str).size(11.0).weak()));
@@ -1746,15 +1888,44 @@ impl MetrolistApp {
                             let color_names = ["Изумруд (Metrolist)", "Рубин", "Аметист", "Кибер-синий", "Янтарь"];
                             for (i, name) in color_names.iter().enumerate() {
                                 let color = Self::accent_colors()[i];
-                                let is_sel = self.settings.accent_color_idx == i;
+                                let is_sel = !self.settings.use_custom_accent && self.settings.accent_color_idx == i;
                                 let btn = egui::Button::new(RichText::new(*name).color(Color32::WHITE))
                                     .fill(if is_sel { color } else { Color32::from_rgb(35, 35, 45) });
                                 if ui.add(btn).clicked() {
+                                    self.settings.use_custom_accent = false;
                                     self.settings.accent_color_idx = i;
                                     self.settings.save();
                                     self.apply_theme(ctx);
                                 }
                             }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Кастомный цвет:");
+                            let mut custom_c = Color32::from_rgb(
+                                self.settings.custom_accent_color[0],
+                                self.settings.custom_accent_color[1],
+                                self.settings.custom_accent_color[2],
+                            );
+                            let is_custom = self.settings.use_custom_accent;
+                            let custom_btn = egui::Button::new(RichText::new("🎨 Свой цвет").color(Color32::WHITE))
+                                .fill(if is_custom { custom_c } else { Color32::from_rgb(35, 35, 45) });
+                            if ui.add(custom_btn).on_hover_text("Активировать свой цвет").clicked() {
+                                self.settings.use_custom_accent = true;
+                                self.settings.save();
+                                self.apply_theme(ctx);
+                            }
+
+                            if egui::color_picker::color_edit_button_srgba(ui, &mut custom_c, egui::color_picker::Alpha::Opaque).changed() {
+                                self.settings.use_custom_accent = true;
+                                self.settings.custom_accent_color = [custom_c.r(), custom_c.g(), custom_c.b()];
+                                self.settings.save();
+                                self.apply_theme(ctx);
+                            }
+
+                            let hex_str = format!("#{:02X}{:02X}{:02X}", custom_c.r(), custom_c.g(), custom_c.b());
+                            ui.label(RichText::new(hex_str).monospace().weak());
                         });
 
                         ui.add_space(6.0);
@@ -1843,7 +2014,7 @@ impl MetrolistApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Стиль ползунка плеера:");
-                            let slider_styles = ["Прямой", "Волнистый", "Тонкий"];
+                            let slider_styles = ["Прямой", "Волнистый (Змейка)", "Тонкий"];
                             for (i, name) in slider_styles.iter().enumerate() {
                                 if ui.selectable_label(self.settings.slider_style == i, *name).clicked() {
                                     self.settings.slider_style = i;
@@ -2244,16 +2415,7 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                 ui.add_space(6.0);
 
                 // Progress Slider across the ENTIRE artwork width
-                ui.spacing_mut().slider_width = art_size;
-                let max_d = if playback_info.duration_secs > 0.0 { playback_info.duration_secs } else { 100.0 };
-                let mut pos = playback_info.position_secs;
-                let slider = egui::Slider::new(&mut pos, 0.0..=max_d)
-                    .show_value(false)
-                    .trailing_fill(true);
-                let resp = ui.add_sized([art_size, 16.0], slider);
-                if resp.dragged() || resp.clicked() {
-                    self.player.seek(pos);
-                }
+                self.render_playback_slider(ui, art_size, 18.0, &playback_info);
 
                 ui.add_space(3.0);
 
