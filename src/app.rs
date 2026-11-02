@@ -133,6 +133,16 @@ impl MetrolistApp {
         app.apply_theme(&cc.egui_ctx);
         app.player.set_volume(app.settings.volume);
 
+        // Continuous heartbeat thread: wakes up Wayland/Hyprland winit event loop every 50ms,
+        // completely preventing compositor ANR / "window not responding" timeouts on inactive workspaces
+        let heartbeat_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                heartbeat_ctx.request_repaint();
+            }
+        });
+
         // Check for updates in background on startup
         let tx_up = app.event_tx.clone();
         tokio::spawn(async move {
@@ -587,9 +597,9 @@ impl MetrolistApp {
 
 impl eframe::App for MetrolistApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let playback_info = self.player.info.lock().unwrap().clone();
-        // Consistent 16ms heartbeat: guarantees instant Wayland ping/pong replies, completely preventing compositor ANR / not responding dialogs
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        let playback_info = self.player.info.try_lock().map(|g| g.clone()).unwrap_or_default();
+        // Repaint request for smooth progress animation
+        ctx.request_repaint_after(std::time::Duration::from_millis(20));
 
         // Poll events
         while let Ok(event) = self.event_rx.try_recv() {
@@ -760,8 +770,8 @@ impl eframe::App for MetrolistApp {
 
         let accent = self.accent_color();
 
-        // 1. Sidebar (Left panel - hidden in fullscreen NowPlaying if enabled)
-        let show_sidebar = !(self.active_tab == ActiveTab::NowPlaying && self.settings.hide_status_bar_fullscreen);
+        // 1. Sidebar (Left panel - hidden in fullscreen NowPlaying mode)
+        let show_sidebar = self.active_tab != ActiveTab::NowPlaying;
         if show_sidebar {
             egui::SidePanel::left("sidebar")
                 .resizable(false)
@@ -1766,7 +1776,7 @@ impl MetrolistApp {
             (3, "🎨 Оформление"),
             (4, "▶ Плеер"),
             (5, "♫ Текст песни"),
-            (6, "📱 Экран"),
+            (6, "🖥 Окно и Вид"),
             (7, "🔊 Звук"),
             (8, "🎮 Discord"),
             (9, "💾 Хранилище"),
@@ -2014,28 +2024,9 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(6.0);
-                        if ui.checkbox(&mut self.settings.high_refresh_rate, "Включить высокую частоту обновления (120 Гц)").changed() {
+                        if ui.checkbox(&mut self.settings.dynamic_icon_colors, "Динамические цвета значка под обложку").changed() {
                             self.settings.save();
                         }
-                        if ui.checkbox(&mut self.settings.landscape_scaling, "Масштабирование в альбомной ориентации").changed() {
-                            self.settings.save();
-                        }
-                        if ui.checkbox(&mut self.settings.dynamic_icon_colors, "Динамические цвета значка").changed() {
-                            self.settings.save();
-                        }
-
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Плотность интерфейса:");
-                            let scales = [(0.85, "Компактная (85%)"), (1.0, "Стандартная (100%)"), (1.15, "Просторная (115%)")];
-                            for (s, label) in scales {
-                                let is_sel = (self.settings.density_scale - s).abs() < 0.05;
-                                if ui.selectable_label(is_sel, label).clicked() {
-                                    self.settings.density_scale = s;
-                                    self.settings.save();
-                                }
-                            }
-                        });
                     });
                 ui.add_space(12.0);
             }
@@ -2109,19 +2100,6 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
-                        if ui.checkbox(&mut self.settings.swipe_track_switch, "Включить переключение треков свайпом").changed() {
-                            self.settings.save();
-                        }
-
-                        ui.horizontal(|ui| {
-                            ui.label("Чувствительность свайпа мини-плеера:");
-                            let mut sens = self.settings.swipe_sensitivity;
-                            if ui.add(egui::Slider::new(&mut sens, 0.5..=2.0).text("x")).changed() {
-                                self.settings.swipe_sensitivity = sens;
-                                self.settings.save();
-                            }
-                        });
-
                         if ui.checkbox(&mut self.settings.experimental_lyrics, "Экспериментальный текст").changed() {
                             self.settings.save();
                         }
@@ -2165,7 +2143,7 @@ impl MetrolistApp {
                         if ui.checkbox(&mut self.settings.lyrics_respect_artist_position, "Учитывать позиционирование исполнителя").changed() {
                             self.settings.save();
                         }
-                        if ui.checkbox(&mut self.settings.lyrics_change_on_tap, "Менять текст песни по касанию").changed() {
+                        if ui.checkbox(&mut self.settings.lyrics_change_on_tap, "Перемотка трека по клику на строку текста").changed() {
                             self.settings.save();
                         }
                         if ui.checkbox(&mut self.settings.lyrics_auto_scroll, "Автоматическая плавная прокрутка текста").changed() {
@@ -2175,16 +2153,12 @@ impl MetrolistApp {
                 ui.add_space(12.0);
             }
 
-            // 6. ПОЛНОЭКРАННЫЙ РЕЖИМ И НАВИГАЦИЯ
+            // 6. ОКНО И НАВИГАЦИЯ
             if self.settings_menu_tab == 0 || self.settings_menu_tab == 6 {
-                egui::CollapsingHeader::new(RichText::new("📱 Полноэкранный режим и Навигация").size(16.0).strong())
+                egui::CollapsingHeader::new(RichText::new("🖥 Окно и Навигация").size(16.0).strong())
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
-                        if ui.checkbox(&mut self.settings.hide_status_bar_fullscreen, "Скрывать строку состояния в полноэкранном режиме").changed() {
-                            self.settings.save();
-                        }
-
                         ui.horizontal(|ui| {
                             ui.label("Вкладка навигации по умолчанию:");
                             let nav_tabs = ["Главная", "Плейлисты", "Любимые треки", "Поиск"];
@@ -2197,12 +2171,12 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
-                        if ui.checkbox(&mut self.settings.slim_nav_bar, "Тонкая панель навигации").changed() {
+                        if ui.checkbox(&mut self.settings.slim_nav_bar, "Компактная боковая панель навигации").changed() {
                             self.settings.save();
                         }
 
                         ui.horizontal(|ui| {
-                            ui.label("Размер ячейки сетки:");
+                            ui.label("Размер ячейки сетки библиотеки:");
                             let grid_sizes = ["Маленький", "Средний", "Большой"];
                             for (i, name) in grid_sizes.iter().enumerate() {
                                 if ui.selectable_label(self.settings.grid_cell_size == i, *name).clicked() {
@@ -2427,7 +2401,7 @@ impl MetrolistApp {
     }
 fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
         let accent = self.accent_color();
-        let playback_info = self.player.info.lock().unwrap().clone();
+        let playback_info = self.player.info.try_lock().map(|g| g.clone()).unwrap_or_default();
         let current_track = self.current_track().cloned();
 
         let avail_w = ui.available_width();
@@ -2464,11 +2438,11 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
 
         // 2. Responsive dimensions: dynamically scaled with window size
         // Calculate dynamic album art size (up to 440px)
-        let bottom_controls_h = 240.0;
+        let bottom_controls_h = 275.0;
         let top_bar_h = 48.0;
         let space_for_art = (avail_h - top_bar_h - bottom_controls_h).max(180.0);
         let max_w_allowed = (avail_w - 40.0).max(180.0);
-        let art_size = space_for_art.min(max_w_allowed).clamp(240.0, 440.0);
+        let art_size = space_for_art.min(max_w_allowed).clamp(220.0, 440.0);
         let flexible_gap = (avail_h - (top_bar_h + art_size + bottom_controls_h)).clamp(6.0, 36.0);
 
         // Center the entire player column
@@ -2703,6 +2677,34 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                     if ui.add_sized([44.0, 36.0], rep_btn).on_hover_text("Режим повтора").clicked() {
                         self.repeat_mode = (self.repeat_mode + 1) % 3;
                     }
+                });
+
+                ui.add_space(14.0);
+
+                // Volume slider row: Centered with mute toggle & percentage
+                let vol_row_w = 210.0;
+                let vol_pad = ((art_size - vol_row_w) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(vol_pad);
+                    let vol_icon = if self.settings.volume == 0.0 { "🔇" } else if self.settings.volume < 50.0 { "🔉" } else { "🔊" };
+                    let mute_btn = egui::Button::new(RichText::new(vol_icon).size(15.0)).frame(false);
+                    if ui.add(mute_btn).on_hover_text("Без звука / Включить звук").clicked() {
+                        if self.settings.volume > 0.0 {
+                            self.settings.volume = 0.0;
+                        } else {
+                            self.settings.volume = 80.0;
+                        }
+                        self.player.set_volume(self.settings.volume);
+                        self.settings.save();
+                    }
+                    let mut vol = self.settings.volume;
+                    let vol_slider = egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
+                    if ui.add_sized([130.0, 14.0], vol_slider).changed() {
+                        self.settings.volume = vol;
+                        self.player.set_volume(vol);
+                        self.settings.save();
+                    }
+                    ui.label(RichText::new(format!("{}%", vol as u32)).size(11.0).weak());
                 });
             });
         });

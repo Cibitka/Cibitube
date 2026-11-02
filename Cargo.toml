@@ -1,6 +1,6 @@
 [package]
-name = "metrolist-desktop"
-version = "0.2.6"
+name = "cibitube"
+version = "0.2.8"
 edition = "2021"
 
 [dependencies]

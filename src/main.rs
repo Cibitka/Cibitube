@@ -12,6 +12,22 @@ mod updater;
 
 use app::MetrolistApp;
 use eframe::egui::Vec2;
+use std::sync::Arc;
+
+fn load_app_icon() -> Option<Arc<eframe::egui::IconData>> {
+    let bytes = include_bytes!("../assets/icon.png");
+    if let Ok(img) = image::load_from_memory(bytes) {
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Some(Arc::new(eframe::egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        }))
+    } else {
+        None
+    }
+}
 
 fn setup_custom_fonts(ctx: &eframe::egui::Context) {
     let mut fonts = eframe::egui::FontDefinitions::default();
@@ -37,12 +53,18 @@ fn main() -> eframe::Result<()> {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Cibitube — YouTube Music Client")
+        .with_app_id("cibitube")
+        .with_inner_size(Vec2::new(1040.0, 700.0))
+        .with_min_inner_size(Vec2::new(850.0, 520.0));
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Cibitube — YouTube Music Client")
-            .with_app_id("cibitube")
-            .with_inner_size(Vec2::new(1040.0, 700.0))
-            .with_min_inner_size(Vec2::new(850.0, 520.0)),
+        viewport,
         ..Default::default()
     };
 

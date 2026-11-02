@@ -622,6 +622,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cibitube"
+version = "0.2.8"
+dependencies = [
+ "dirs",
+ "eframe",
+ "egui_extras",
+ "image",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tokio",
+ "urlencoding",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2064,22 +2080,6 @@ dependencies = [
  "log",
  "objc",
  "paste",
-]
-
-[[package]]
-name = "metrolist-desktop"
-version = "0.2.6"
-dependencies = [
- "dirs",
- "eframe",
- "egui_extras",
- "image",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tokio",
- "urlencoding",
 ]
 
 [[package]]
