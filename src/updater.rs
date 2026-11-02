@@ -26,7 +26,7 @@ pub struct UpdateInfo {
 pub struct Updater;
 
 impl Updater {
-    pub const REPO: &'static str = "Cibitka/Metrolist-Rust";
+    pub const REPO: &'static str = "Cibitka/Cibitube";
     pub const CURRENT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     /// Checks if a newer version exists on GitHub

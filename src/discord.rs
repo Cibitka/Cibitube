@@ -161,7 +161,7 @@ fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
         }
         buttons.push(json!({
             "label": "Cibitube",
-            "url": "https://github.com/Cibitka/Metrolist-Rust"
+            "url": "https://github.com/Cibitka/Cibitube"
         }));
         activity_obj["buttons"] = json!(buttons);
     }
