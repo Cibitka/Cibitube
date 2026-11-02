@@ -109,6 +109,8 @@ pub struct AppSettings {
 
     // 10. Загрузки
     pub download_dir: String,
+    #[serde(default = "default_volume")]
+    pub volume: f64,
 }
 
 impl Default for AppSettings {
@@ -180,6 +182,7 @@ impl Default for AppSettings {
             discord_activity_type: 0, // Listening
 
             download_dir: music_dir,
+            volume: 80.0,
         }
     }
 }
@@ -235,4 +238,8 @@ fn default_one_f32() -> f32 {
 
 fn default_custom_color() -> [u8; 3] {
     [29, 185, 84]
+}
+
+fn default_volume() -> f64 {
+    80.0
 }

@@ -22,6 +22,8 @@ enum AppEvent {
     DownloadFinished { track: Track, result: Result<String, String> },
     AccountsDiscovered(Vec<AccountProfile>),
     CookiesExtracted(Result<String, String>),
+    UpdateCheckResult(Result<Option<crate::updater::UpdateInfo>, String>),
+    UpdateApplied(Result<(), String>),
 }
 
 pub struct MetrolistApp {
@@ -45,6 +47,13 @@ pub struct MetrolistApp {
     is_searching: bool,
     status_message: Option<String>,
     download_status: Option<String>,
+
+    // Updater State
+    update_info: Option<crate::updater::UpdateInfo>,
+    is_checking_update: bool,
+    is_applying_update: bool,
+    update_status: Option<String>,
+    show_update_confirm: bool,
 
     // Playlists state
     playlists: Vec<Playlist>,
@@ -103,6 +112,11 @@ impl MetrolistApp {
             is_searching: false,
             status_message: None,
             download_status: None,
+            update_info: None,
+            is_checking_update: false,
+            is_applying_update: false,
+            update_status: None,
+            show_update_confirm: false,
             playlists: Vec::new(),
             selected_playlist: None,
             playlist_tracks: Vec::new(),
@@ -117,6 +131,14 @@ impl MetrolistApp {
         };
 
         app.apply_theme(&cc.egui_ctx);
+        app.player.set_volume(app.settings.volume);
+
+        // Check for updates in background on startup
+        let tx_up = app.event_tx.clone();
+        tokio::spawn(async move {
+            let res = crate::updater::Updater::check_for_update().await;
+            let _ = tx_up.send(AppEvent::UpdateCheckResult(res));
+        });
 
         // Non-blocking async cookie extraction on startup
         let tx = app.event_tx.clone();
@@ -538,6 +560,29 @@ impl MetrolistApp {
             }
         }
     }
+
+    fn draw_share_icon(ui: &mut egui::Ui, hover_color: Color32) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(30.0, 30.0), egui::Sense::click());
+        let color = if resp.hovered() { hover_color } else { Color32::from_rgb(200, 200, 215) };
+        let painter = ui.painter();
+        let center = rect.center();
+
+        // Standard sleek vector share icon: 3 circular nodes connected by 2 lines
+        let p_left = Pos2::new(center.x - 6.5, center.y);
+        let p_top_right = Pos2::new(center.x + 6.5, center.y - 6.5);
+        let p_bot_right = Pos2::new(center.x + 6.5, center.y + 6.5);
+
+        let stroke = Stroke::new(1.8_f32, color);
+        painter.line_segment([p_left, p_top_right], stroke);
+        painter.line_segment([p_left, p_bot_right], stroke);
+
+        let node_r = 3.0_f32;
+        painter.circle_filled(p_left, node_r, color);
+        painter.circle_filled(p_top_right, node_r, color);
+        painter.circle_filled(p_bot_right, node_r, color);
+
+        resp
+    }
 }
 
 impl eframe::App for MetrolistApp {
@@ -673,6 +718,32 @@ impl eframe::App for MetrolistApp {
                         }
                     }
                 }
+                AppEvent::UpdateCheckResult(res) => {
+                    self.is_checking_update = false;
+                    match res {
+                        Ok(Some(info)) => {
+                            self.status_message = Some(format!("Доступна новая версия: {}!", info.version));
+                            self.update_info = Some(info);
+                        }
+                        Ok(None) => {
+                            self.update_status = Some("У вас установлена самая последняя версия".to_string());
+                        }
+                        Err(e) => {
+                            self.update_status = Some(format!("Ошибка проверки: {}", e));
+                        }
+                    }
+                }
+                AppEvent::UpdateApplied(res) => {
+                    self.is_applying_update = false;
+                    match res {
+                        Ok(()) => {
+                            self.update_status = Some("✓ Обновление успешно установлено! Старая версия удалена.".to_string());
+                        }
+                        Err(e) => {
+                            self.update_status = Some(format!("Ошибка установки: {}", e));
+                        }
+                    }
+                }
             }
         }
 
@@ -759,6 +830,17 @@ impl eframe::App for MetrolistApp {
                 if let Some(dl) = &self.download_status {
                     ui.add_space(6.0);
                     ui.label(RichText::new(dl).size(10.0).color(Color32::from_rgb(56, 189, 248)));
+                }
+
+                if let Some(info) = &self.update_info {
+                    ui.add_space(8.0);
+                    let up_btn = egui::Button::new(RichText::new(format!("● Обновление {}", info.version)).size(11.0).strong().color(Color32::WHITE))
+                        .fill(Color32::from_rgb(16, 185, 129))
+                        .rounding(Rounding::same(6.0));
+                    if ui.add(up_btn).on_hover_text("Нажмите для перехода в меню обновлений").clicked() {
+                        self.active_tab = ActiveTab::Settings;
+                        self.settings_menu_tab = 10;
+                    }
                 }
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -910,6 +992,8 @@ impl eframe::App for MetrolistApp {
                             let vol_slider = egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
                             if ui.add_sized([60.0, 12.0], vol_slider).changed() {
                                 self.player.set_volume(vol);
+                                self.settings.volume = vol;
+                                self.settings.save();
                             }
                             ui.label(RichText::new("🔊").size(13.0));
                         });
@@ -1686,6 +1770,7 @@ impl MetrolistApp {
             (7, "🔊 Звук"),
             (8, "🎮 Discord"),
             (9, "💾 Хранилище"),
+            (10, "🔄 Обновления"),
         ];
 
         ui.horizontal_wrapped(|ui| {
@@ -2235,6 +2320,109 @@ impl MetrolistApp {
                     });
                 ui.add_space(12.0);
             }
+
+            // 10. ОБНОВЛЕНИЯ ПРОГРАММЫ
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 10 {
+                egui::CollapsingHeader::new(RichText::new("🔄 Обновления программы (GitHub)").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        let cur_ver = crate::updater::Updater::CURRENT_VERSION;
+                        ui.label(RichText::new(format!("Текущая версия Cibitube: v{}", cur_ver)).size(13.0).strong());
+                        ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            let check_btn = egui::Button::new(RichText::new("🔍 Проверить обновления").strong())
+                                .fill(Color32::from_rgb(35, 45, 55))
+                                .rounding(Rounding::same(6.0));
+                            if ui.add(check_btn).clicked() {
+                                self.is_checking_update = true;
+                                self.update_status = Some("Проверка новых релизов на GitHub...".to_string());
+                                let tx = self.event_tx.clone();
+                                tokio::spawn(async move {
+                                    let res = crate::updater::Updater::check_for_update().await;
+                                    let _ = tx.send(AppEvent::UpdateCheckResult(res));
+                                });
+                            }
+
+                            if self.is_checking_update {
+                                ui.spinner();
+                            }
+                        });
+
+                        ui.add_space(6.0);
+
+                        if let Some(info) = self.update_info.clone() {
+                            let frame = egui::Frame::none()
+                                .fill(Color32::from_rgb(20, 35, 28))
+                                .rounding(Rounding::same(8.0))
+                                .inner_margin(12.0)
+                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(30, 80, 50)));
+
+                            frame.show(ui, |ui| {
+                                ui.label(RichText::new(format!("★ Доступна новая версия: {}!", info.version)).size(15.0).strong().color(Color32::from_rgb(52, 211, 153)));
+                                if !info.notes.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(&info.notes).size(12.0).weak());
+                                }
+                                ui.add_space(8.0);
+
+                                if self.is_applying_update {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(RichText::new("Скачивание и замена файла программы...").color(Color32::from_rgb(56, 189, 248)));
+                                    });
+                                } else if self.show_update_confirm {
+                                    ui.label(RichText::new("Вы уверены, что хотите обновить приложение? Текущая версия будет автоматически заменена на новую.").size(12.0).color(Color32::YELLOW));
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        let confirm_btn = egui::Button::new(RichText::new("✓ Да, установить обновление").strong().color(Color32::WHITE))
+                                            .fill(Color32::from_rgb(16, 185, 129))
+                                            .rounding(Rounding::same(6.0));
+                                        if ui.add(confirm_btn).clicked() {
+                                            self.is_applying_update = true;
+                                            self.show_update_confirm = false;
+                                            self.update_status = Some("Загрузка обновления...".to_string());
+                                            let dl = info.download_url.clone();
+                                            let tx = self.event_tx.clone();
+                                            tokio::spawn(async move {
+                                                let res = crate::updater::Updater::apply_update(dl).await;
+                                                let _ = tx.send(AppEvent::UpdateApplied(res));
+                                            });
+                                        }
+
+                                        if ui.button("Отмена").clicked() {
+                                            self.show_update_confirm = false;
+                                        }
+                                    });
+                                } else {
+                                    let update_btn = egui::Button::new(RichText::new(format!("⬇ Скачать и обновить до {}", info.version)).strong().color(Color32::WHITE))
+                                        .fill(Color32::from_rgb(16, 185, 129))
+                                        .rounding(Rounding::same(6.0));
+                                    if ui.add(update_btn).clicked() {
+                                        self.show_update_confirm = true;
+                                    }
+                                }
+                            });
+                        }
+
+                        if let Some(status) = &self.update_status {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(status).size(12.0).color(Color32::from_rgb(147, 197, 253)));
+                                if status.contains("✓") {
+                                    let restart_btn = egui::Button::new(RichText::new("🚀 Перезапустить Cibitube").strong().color(Color32::WHITE))
+                                        .fill(accent)
+                                        .rounding(Rounding::same(6.0));
+                                    if ui.add(restart_btn).clicked() {
+                                        crate::updater::Updater::restart();
+                                    }
+                                }
+                            });
+                        }
+                    });
+                ui.add_space(12.0);
+            }
         });
     }
 fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
@@ -2403,8 +2591,8 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
 
                             ui.add_space(8.0);
 
-                            let share_btn = egui::Button::new(RichText::new("🔗").size(18.0).color(Color32::WHITE)).frame(false);
-                            if ui.add(share_btn).on_hover_text("Поделиться: копировать ссылку на трек").clicked() {
+                            let share_resp = Self::draw_share_icon(ui, accent);
+                            if share_resp.on_hover_text("Поделиться: копировать ссылку на трек").clicked() {
                                 let link = format!("https://music.youtube.com/watch?v={}", track.id);
                                 ui.output_mut(|o| o.copied_text = link);
                                 self.status_message = Some("Ссылка скопирована!".to_string());

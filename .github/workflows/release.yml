@@ -32,13 +32,15 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/metrolist-desktop dist/metrolist
-          chmod +x dist/metrolist
-          tar -czvf dist/metrolist-linux-x86_64.tar.gz -C dist metrolist
+          cp target/release/metrolist-desktop dist/cibitube
+          chmod +x dist/metrolist dist/cibitube
+          tar -czvf dist/cibitube-linux-x86_64.tar.gz -C dist cibitube metrolist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            dist/metrolist-linux-x86_64.tar.gz
+            dist/cibitube-linux-x86_64.tar.gz
+            dist/cibitube
             dist/metrolist

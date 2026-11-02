@@ -8,6 +8,7 @@ mod lyrics;
 mod models;
 mod player;
 mod settings;
+mod updater;
 
 use app::MetrolistApp;
 use eframe::egui::Vec2;
