@@ -2360,7 +2360,8 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
                 } else if !self.settings.hide_player_thumbnail {
                     if let Some(track) = &current_track {
                         if let Some(thumb) = &track.thumbnail_url {
-                            ui.add(egui::Image::new(thumb)
+                            let hd_thumb = InnertubeClient::upgrade_thumbnail_quality(thumb);
+                            ui.add(egui::Image::new(&hd_thumb)
                                 .fit_to_exact_size(Vec2::new(art_size, art_size))
                                 .rounding(art_rounding));
                         } else {
@@ -2402,8 +2403,8 @@ fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
 
                             ui.add_space(8.0);
 
-                            let share_btn = egui::Button::new(RichText::new("↗").size(20.0).color(Color32::WHITE)).frame(false);
-                            if ui.add(share_btn).on_hover_text("Копировать ссылку на трек").clicked() {
+                            let share_btn = egui::Button::new(RichText::new("🔗").size(18.0).color(Color32::WHITE)).frame(false);
+                            if ui.add(share_btn).on_hover_text("Поделиться: копировать ссылку на трек").clicked() {
                                 let link = format!("https://music.youtube.com/watch?v={}", track.id);
                                 ui.output_mut(|o| o.copied_text = link);
                                 self.status_message = Some("Ссылка скопирована!".to_string());

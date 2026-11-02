@@ -15,6 +15,23 @@ impl InnertubeClient {
         Self { client }
     }
 
+    /// Automatically upscales YouTube Music thumbnails to HD / 800x800 master resolution
+    pub fn upgrade_thumbnail_quality(url: &str) -> String {
+        if url.contains("googleusercontent.com") || url.contains("ggpht.com") {
+            if let Some(idx) = url.rfind('=') {
+                let base = &url[..idx];
+                return format!("{}=w800-h800-l90-rj", base);
+            }
+        } else if url.contains("i.ytimg.com/vi/") {
+            if url.contains("hqdefault.jpg") {
+                return url.replace("hqdefault.jpg", "maxresdefault.jpg");
+            } else if url.contains("mqdefault.jpg") {
+                return url.replace("mqdefault.jpg", "maxresdefault.jpg");
+            }
+        }
+        url.to_string()
+    }
+
     /// Helper to compute SAPISIDHASH auth header if SAPISID or __Secure-3PAPISID cookie exists
     fn get_sapisid_auth(cookie: &str) -> Option<(String, &'static str, &'static str)> {
         let sapisid = cookie.split(';')
@@ -283,7 +300,7 @@ impl InnertubeClient {
                         .and_then(|arr| arr.last())
                         .and_then(|t| t.get("url"))
                         .and_then(|u| u.as_str())
-                        .map(|s| s.to_string());
+                        .map(|s| InnertubeClient::upgrade_thumbnail_quality(s));
 
                     if !browse_id.is_empty() 
                         && !title.eq_ignore_ascii_case("новый") 
@@ -456,7 +473,7 @@ impl InnertubeClient {
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))
             .and_then(|u| u.as_str())
-            .map(|s| s.to_string());
+            .map(|s| Self::upgrade_thumbnail_quality(s));
 
         Some(Track {
             id: video_id,
@@ -491,7 +508,7 @@ impl InnertubeClient {
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))
             .and_then(|u| u.as_str())
-            .map(|s| s.to_string());
+            .map(|s| Self::upgrade_thumbnail_quality(s));
 
         Some(Track {
             id: video_id,
