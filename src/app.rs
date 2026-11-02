@@ -227,9 +227,22 @@ impl MetrolistApp {
         }
         if let Some(idx) = self.current_index {
             if idx + 1 < self.queue.len() {
-                let next_track = self.queue[idx + 1].clone();
+                let next_idx = idx + 1;
+                let next_track = self.queue[next_idx].clone();
+                self.current_index = Some(next_idx);
+                self.play_track(next_track);
+            } else {
+                // Loop to start of queue
+                let next_idx = 0;
+                let next_track = self.queue[next_idx].clone();
+                self.current_index = Some(next_idx);
                 self.play_track(next_track);
             }
+        } else {
+            let next_idx = 0;
+            let next_track = self.queue[next_idx].clone();
+            self.current_index = Some(next_idx);
+            self.play_track(next_track);
         }
     }
 
@@ -239,9 +252,29 @@ impl MetrolistApp {
         }
         if let Some(idx) = self.current_index {
             if idx > 0 {
-                let prev_track = self.queue[idx - 1].clone();
+                let prev_idx = idx - 1;
+                let prev_track = self.queue[prev_idx].clone();
+                self.current_index = Some(prev_idx);
+                self.play_track(prev_track);
+            } else {
+                // Loop to end of queue
+                let prev_idx = self.queue.len() - 1;
+                let prev_track = self.queue[prev_idx].clone();
+                self.current_index = Some(prev_idx);
                 self.play_track(prev_track);
             }
+        }
+    }
+
+    fn download_playlist(&mut self, tracks: Vec<Track>) {
+        if tracks.is_empty() {
+            self.download_status = Some("В плейлисте нет треков для скачивания".to_string());
+            return;
+        }
+        let total = tracks.len();
+        self.download_status = Some(format!("Добавлено в очередь скачивания: {} треков", total));
+        for track in tracks {
+            self.download_track(track);
         }
     }
 
@@ -436,7 +469,7 @@ impl eframe::App for MetrolistApp {
         }
 
         // Auto next track when EOF reached
-        if self.player.track_finished.load(Ordering::SeqCst) {
+        if self.player.track_finished.swap(false, Ordering::SeqCst) {
             self.play_next();
         }
 
@@ -526,14 +559,14 @@ impl eframe::App for MetrolistApp {
         };
 
         egui::TopBottomPanel::bottom("player_bar")
-            .exact_height(88.0)
-            .frame(egui::Frame::none().fill(bar_bg).inner_margin(8.0))
+            .exact_height(86.0)
+            .frame(egui::Frame::none().fill(bar_bg).inner_margin(egui::Margin::symmetric(14.0, 8.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Track info (Left)
                     let rounding = Rounding::same(self.settings.album_art_rounding);
                     ui.allocate_ui_with_layout(
-                        Vec2::new(280.0, 60.0),
+                        Vec2::new(260.0, 64.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             if let Some(track) = self.current_track() {
@@ -551,11 +584,12 @@ impl eframe::App for MetrolistApp {
                                     ui.label(RichText::new(&track.artist).size(11.0).weak());
                                 });
 
-                                // Like button in player bar
+                                // Like button in player bar - borderless
                                 let is_liked = self.library.is_liked(&track.id);
                                 let heart_color = if is_liked { Color32::from_rgb(244, 63, 94) } else { Color32::GRAY };
                                 let heart_symbol = if is_liked { "♥" } else { "♡" };
-                                if ui.button(RichText::new(heart_symbol).size(16.0).color(heart_color)).clicked() {
+                                let heart_btn = egui::Button::new(RichText::new(heart_symbol).size(18.0).color(heart_color)).frame(false);
+                                if ui.add(heart_btn).clicked() {
                                     self.library.toggle_like(track.clone());
                                 }
                             } else {
@@ -565,29 +599,36 @@ impl eframe::App for MetrolistApp {
                     );
 
                     // Central controls (Play/Pause, Slider)
-                    let center_width = (ui.available_width() - 180.0).max(200.0);
-                    ui.allocate_ui_with_layout(Vec2::new(center_width, 64.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                    let center_width = (ui.available_width() - 170.0).max(220.0);
+                    ui.allocate_ui_with_layout(Vec2::new(center_width, 68.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                        // Buttons row
                         ui.horizontal(|ui| {
-                            if ui.add(egui::Button::new(RichText::new("⏮").size(16.0)).frame(false)).clicked() {
+                            let controls_width = 36.0 + 16.0 + 40.0 + 16.0 + 36.0;
+                            let pad = ((center_width - controls_width) / 2.0).max(0.0);
+                            ui.add_space(pad);
+
+                            let prev_btn = egui::Button::new(RichText::new("⏮").size(18.0).strong()).frame(false);
+                            if ui.add_sized([36.0, 36.0], prev_btn).clicked() {
                                 self.play_prev();
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(16.0);
 
                             let play_icon = if playback_info.is_playing { "⏸" } else { "▶" };
-                            let play_btn = egui::Button::new(RichText::new(play_icon).size(16.0).color(Color32::WHITE))
+                            let play_btn = egui::Button::new(RichText::new(play_icon).size(18.0).color(Color32::WHITE).strong())
                                 .fill(accent)
                                 .rounding(Rounding::same(20.0));
-                            if ui.add_sized([36.0, 36.0], play_btn).clicked() {
+                            if ui.add_sized([40.0, 40.0], play_btn).clicked() {
                                 self.player.toggle_pause();
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(16.0);
 
-                            if ui.add(egui::Button::new(RichText::new("⏭").size(16.0)).frame(false)).clicked() {
+                            let next_btn = egui::Button::new(RichText::new("⏭").size(18.0).strong()).frame(false);
+                            if ui.add_sized([36.0, 36.0], next_btn).clicked() {
                                 self.play_next();
                             }
                         });
 
-                        ui.add_space(2.0);
+                        ui.add_space(4.0);
 
                         // Progress slider
                         ui.horizontal(|ui| {
@@ -597,19 +638,26 @@ impl eframe::App for MetrolistApp {
                             } else {
                                 Self::format_time(playback_info.duration_secs)
                             };
-                            ui.label(RichText::new(curr_str).size(10.0).weak());
+
+                            let time_width = 44.0;
+                            let spacing = 8.0;
+                            let slider_width = (center_width - time_width * 2.0 - spacing * 2.0).max(80.0);
+
+                            ui.add_sized([time_width, 14.0], egui::Label::new(RichText::new(curr_str).size(11.0).weak()));
+                            ui.add_space(spacing);
 
                             let max_d = if playback_info.duration_secs > 0.0 { playback_info.duration_secs } else { 100.0 };
                             let mut pos = playback_info.position_secs;
                             let slider = egui::Slider::new(&mut pos, 0.0..=max_d)
                                 .show_value(false)
                                 .trailing_fill(true);
-                            let resp = ui.add_sized([ui.available_width() - 45.0, 10.0], slider);
+                            let resp = ui.add_sized([slider_width, 14.0], slider);
                             if resp.dragged() || resp.clicked() {
                                 self.player.seek(pos);
                             }
+                            ui.add_space(spacing);
 
-                            ui.label(RichText::new(dur_str).size(10.0).weak());
+                            ui.add_sized([time_width, 14.0], egui::Label::new(RichText::new(dur_str).size(11.0).weak()));
                         });
                     });
 
@@ -694,11 +742,11 @@ impl MetrolistApp {
 
         // List results
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut track_to_play = None;
+            let mut track_idx_to_play = None;
             let mut track_to_queue = None;
             let mut track_to_download = None;
 
-            for track in &self.search_results {
+            for (idx, track) in self.search_results.iter().enumerate() {
                 let card_bg = Color32::from_rgb(26, 26, 34);
                 let rounding = Rounding::same(self.settings.album_art_rounding);
                 let frame = egui::Frame::none()
@@ -732,7 +780,7 @@ impl MetrolistApp {
                                 .fill(accent)
                                 .rounding(Rounding::same(6.0));
                             if ui.add(play_btn).clicked() {
-                                track_to_play = Some(track.clone());
+                                track_idx_to_play = Some(idx);
                             }
 
                             // Like button
@@ -758,8 +806,11 @@ impl MetrolistApp {
                 ui.add_space(6.0);
             }
 
-            if let Some(t) = track_to_play {
-                self.play_track(t);
+            if let Some(idx) = track_idx_to_play {
+                self.queue = self.search_results.clone();
+                self.current_index = Some(idx);
+                let track = self.search_results[idx].clone();
+                self.play_track(track);
             }
             if let Some(t) = track_to_queue {
                 self.queue.push(t);
@@ -799,6 +850,16 @@ impl MetrolistApp {
                     });
                 }
             }
+
+            ui.add_space(8.0);
+            if !self.library.liked_tracks.is_empty() {
+                let dl_all_btn = egui::Button::new(RichText::new("⬇ Скачать все").strong())
+                    .fill(Color32::from_rgb(32, 45, 58))
+                    .rounding(Rounding::same(6.0));
+                if ui.add(dl_all_btn).on_hover_text("Скачать все любимые треки в папку Музыка").clicked() {
+                    self.download_playlist(self.library.liked_tracks.clone());
+                }
+            }
         });
 
         ui.add_space(12.0);
@@ -814,12 +875,12 @@ impl MetrolistApp {
         }
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut track_to_play = None;
+            let mut track_idx_to_play = None;
             let mut track_to_download = None;
             let mut track_to_toggle_like = None;
             let rounding = Rounding::same(self.settings.album_art_rounding);
 
-            for track in &self.library.liked_tracks {
+            for (idx, track) in self.library.liked_tracks.iter().enumerate() {
                 let frame = egui::Frame::none()
                     .fill(Color32::from_rgb(26, 26, 34))
                     .rounding(Rounding::same(8.0))
@@ -844,7 +905,7 @@ impl MetrolistApp {
                                 .fill(accent)
                                 .rounding(Rounding::same(6.0));
                             if ui.add(play_btn).clicked() {
-                                track_to_play = Some(track.clone());
+                                track_idx_to_play = Some(idx);
                             }
 
                             if ui.button(RichText::new("♥").size(15.0).color(Color32::from_rgb(244, 63, 94))).clicked() {
@@ -863,8 +924,11 @@ impl MetrolistApp {
             if let Some(t) = track_to_toggle_like {
                 self.library.toggle_like(t);
             }
-            if let Some(t) = track_to_play {
-                self.play_track(t);
+            if let Some(idx) = track_idx_to_play {
+                self.queue = self.library.liked_tracks.clone();
+                self.current_index = Some(idx);
+                let track = self.library.liked_tracks[idx].clone();
+                self.play_track(track);
             }
             if let Some(t) = track_to_download {
                 self.download_track(t);
@@ -915,6 +979,14 @@ impl MetrolistApp {
                                 self.queue.extend(self.playlist_tracks.clone());
                                 self.status_message = Some("Плейлист добавлен в очередь".to_string());
                             }
+
+                            // Download whole playlist button
+                            let dl_all_btn = egui::Button::new(RichText::new("⬇ Скачать весь плейлист").strong())
+                                .fill(Color32::from_rgb(32, 45, 58))
+                                .rounding(Rounding::same(6.0));
+                            if ui.add(dl_all_btn).on_hover_text("Скачать все треки из этого плейлиста в папку Музыка").clicked() {
+                                self.download_playlist(self.playlist_tracks.clone());
+                            }
                         }
                     });
                 });
@@ -941,7 +1013,7 @@ impl MetrolistApp {
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut track_to_play = None;
+                let mut track_idx_to_play = None;
                 let mut track_to_queue = None;
                 let mut track_to_download = None;
                 let rounding = Rounding::same(self.settings.album_art_rounding);
@@ -971,7 +1043,7 @@ impl MetrolistApp {
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button(RichText::new("▶").strong()).clicked() {
-                                    track_to_play = Some(track.clone());
+                                    track_idx_to_play = Some(idx);
                                 }
                                 if ui.button("+").on_hover_text("Добавить в очередь").clicked() {
                                     track_to_queue = Some(track.clone());
@@ -985,8 +1057,11 @@ impl MetrolistApp {
                     ui.add_space(4.0);
                 }
 
-                if let Some(t) = track_to_play {
-                    self.play_track(t);
+                if let Some(idx) = track_idx_to_play {
+                    self.queue = self.playlist_tracks.clone();
+                    self.current_index = Some(idx);
+                    let track = self.playlist_tracks[idx].clone();
+                    self.play_track(track);
                 }
                 if let Some(t) = track_to_queue {
                     self.queue.push(t);

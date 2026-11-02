@@ -98,6 +98,13 @@ impl AudioPlayer {
                                         lock.is_playing = !p;
                                     }
                                 }
+                                "eof-reached" => {
+                                    if let Some(eof) = data.as_bool() {
+                                        if eof {
+                                            finished_clone.store(true, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -110,6 +117,7 @@ impl AudioPlayer {
         let _ = cmd_tx.send(r#"{"command":["observe_property",1,"time-pos"]}"#.to_string());
         let _ = cmd_tx.send(r#"{"command":["observe_property",2,"duration"]}"#.to_string());
         let _ = cmd_tx.send(r#"{"command":["observe_property",3,"pause"]}"#.to_string());
+        let _ = cmd_tx.send(r#"{"command":["observe_property",4,"eof-reached"]}"#.to_string());
         let _ = cmd_tx.send(r#"{"command":["set_property","volume",80]}"#.to_string());
 
         Ok(Self {
