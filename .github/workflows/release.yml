@@ -31,8 +31,12 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/release/metrolist-desktop dist/metrolist
-          cp target/release/metrolist-desktop dist/cibitube
+          BIN_PATH="target/release/cibitube"
+          if [ ! -f "$BIN_PATH" ]; then
+            BIN_PATH="target/release/metrolist-desktop"
+          fi
+          cp "$BIN_PATH" dist/metrolist
+          cp "$BIN_PATH" dist/cibitube
           chmod +x dist/metrolist dist/cibitube
           tar -czvf dist/cibitube-linux-x86_64.tar.gz -C dist cibitube metrolist
 
