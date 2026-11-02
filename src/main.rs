@@ -29,20 +29,6 @@ fn setup_custom_fonts(ctx: &eframe::egui::Context) {
         }
     }
 
-    // Load JetBrainsMono Nerd Font for nerd glyphs & icons
-    if let Ok(bytes) = std::fs::read("/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf") {
-        fonts.font_data.insert(
-            "nerd_font".to_owned(),
-            std::sync::Arc::new(eframe::egui::FontData::from_owned(bytes)),
-        );
-        if let Some(prop) = fonts.families.get_mut(&eframe::egui::FontFamily::Proportional) {
-            prop.push("nerd_font".to_owned());
-        }
-        if let Some(mono) = fonts.families.get_mut(&eframe::egui::FontFamily::Monospace) {
-            mono.push("nerd_font".to_owned());
-        }
-    }
-
     ctx.set_fonts(fonts);
 }
 

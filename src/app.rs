@@ -38,6 +38,7 @@ pub struct MetrolistApp {
     previous_tab: ActiveTab,
     repeat_mode: usize,
     shuffle_state: bool,
+    settings_menu_tab: usize,
     search_query: String,
     search_results: Vec<Track>,
     is_searching: bool,
@@ -94,6 +95,7 @@ impl MetrolistApp {
             previous_tab: default_tab,
             repeat_mode: 0,
             shuffle_state: false,
+            settings_menu_tab: 0,
             search_query: String::new(),
             search_results: Vec::new(),
             is_searching: false,
@@ -385,13 +387,8 @@ impl MetrolistApp {
 impl eframe::App for MetrolistApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let playback_info = self.player.info.lock().unwrap().clone();
-        // Snappy heartbeat: 16ms when high_refresh_rate (120Hz) is enabled, guarantees 0 Wayland stalls!
-        let repaint_interval = if self.settings.high_refresh_rate {
-            if playback_info.is_playing { 16 } else { 50 }
-        } else {
-            if playback_info.is_playing { 40 } else { 80 }
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_interval));
+        // Consistent 16ms heartbeat: guarantees instant Wayland ping/pong replies, completely preventing compositor ANR / not responding dialogs
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
         // Poll events
         while let Ok(event) = self.event_rx.try_recv() {
@@ -548,7 +545,7 @@ impl eframe::App for MetrolistApp {
                     ui.label(RichText::new("♫").size(24.0).color(accent));
                     ui.vertical(|ui| {
                         ui.label(RichText::new("METROLIST").size(18.0).strong().color(accent));
-                        ui.label(RichText::new("YouTube Music Client").size(10.0).weak());
+                        ui.label(RichText::new("Взято за идею Metrolist").size(10.0).weak());
                     });
                 });
 
@@ -610,7 +607,7 @@ impl eframe::App for MetrolistApp {
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Metrolist Rust v0.2.1").size(10.0).weak());
+                    ui.label(RichText::new("Взято за идею Metrolist").size(10.0).weak());
                 });
             });
         }
@@ -633,11 +630,16 @@ impl eframe::App for MetrolistApp {
                 .exact_height(80.0)
                 .frame(egui::Frame::none().fill(bar_bg).inner_margin(egui::Margin::symmetric(14.0, 8.0)))
                 .show(ctx, |ui| {
+                    let total_bar_w = ui.available_width();
+                    let left_w = (total_bar_w * 0.34).clamp(180.0, 340.0);
+                    let right_w = 120.0;
+                    let center_w = (total_bar_w - left_w - right_w - 20.0).max(180.0);
+
                     ui.horizontal(|ui| {
                         // Left: Track thumbnail + Title & Artist + Pill Heart button [ ❤️ ]
                         let rounding = Rounding::same(self.settings.album_art_rounding);
                         ui.allocate_ui_with_layout(
-                            Vec2::new(320.0, 64.0),
+                            Vec2::new(left_w, 64.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 if let Some(track) = &current_track_clone {
@@ -688,8 +690,7 @@ impl eframe::App for MetrolistApp {
                         );
 
                         // Center: Controls row & Time Slider underneath matching screenshot!
-                        let center_width = (ui.available_width() - 140.0).max(220.0);
-                        ui.allocate_ui_with_layout(Vec2::new(center_width, 68.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                        ui.allocate_ui_with_layout(Vec2::new(center_w, 68.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                             // Row 1: Buttons
                             ui.horizontal(|ui| {
                                 let prev_btn = egui::Button::new(RichText::new("⏮").size(18.0).strong().color(Color32::from_rgb(210, 210, 220))).frame(false);
@@ -726,7 +727,7 @@ impl eframe::App for MetrolistApp {
 
                                 let time_width = 38.0;
                                 let spacing = 6.0;
-                                let slider_width = (center_width - time_width * 2.0 - spacing * 2.0).max(80.0);
+                                let slider_width = (center_w - time_width * 2.0 - spacing * 2.0).max(80.0);
 
                                 ui.add_sized([time_width, 14.0], egui::Label::new(RichText::new(curr_str).size(11.0).weak()));
                                 ui.add_space(spacing);
@@ -1484,576 +1485,563 @@ impl MetrolistApp {
     }
 
     fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label(RichText::new("⚙ Настройки Metrolist").size(20.0).strong());
+        let accent = self.accent_color();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("⚙ Настройки").size(22.0).strong());
+            ui.add_space(12.0);
+            ui.label(RichText::new("Взято за идею Metrolist").size(12.0).weak());
+        });
+        ui.add_space(10.0);
+
+        // 1. Быстрые фильтры меню (разбивка на удобные категории)
+        let categories = [
+            (0, "📂 Все меню"),
+            (1, "👤 Аккаунты"),
+            (2, "📑 Библиотека"),
+            (3, "🎨 Оформление"),
+            (4, "▶ Плеер"),
+            (5, "♫ Текст песни"),
+            (6, "📱 Экран"),
+            (7, "🔊 Звук"),
+            (8, "🎮 Discord"),
+            (9, "💾 Хранилище"),
+        ];
+
+        ui.horizontal_wrapped(|ui| {
+            for (cat_id, title) in categories {
+                let is_sel = self.settings_menu_tab == cat_id;
+                let btn = egui::Button::new(RichText::new(title).size(12.0).color(if is_sel { Color32::WHITE } else { Color32::from_rgb(205, 205, 215) }))
+                    .fill(if is_sel { accent } else { Color32::from_rgb(28, 28, 36) })
+                    .rounding(Rounding::same(8.0));
+                if ui.add_sized([106.0, 32.0], btn).clicked() {
+                    self.settings_menu_tab = cat_id;
+                }
+            }
+        });
+
         ui.add_space(14.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // 1. АККАУНТ YOUTUBE MUSIC (Account Settings)
-            ui.group(|ui| {
-                ui.label(RichText::new("👤 Аккаунты Google / YouTube Music").size(15.0).strong());
-                ui.add_space(6.0);
-
-                let is_logged_in = !self.settings.google_cookie.is_empty();
-
-                if is_logged_in {
-                    let user_title = self.settings.account_name.as_deref().unwrap_or("Пользователь YouTube");
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").size(12.0).color(Color32::from_rgb(16, 185, 129)));
-                        ui.label(RichText::new(format!("Текущий активный аккаунт: {}", user_title)).size(13.0).strong().color(Color32::WHITE));
-                    });
-                    ui.label(RichText::new("Синхронизация библиотеки, плейлистов и любимых треков с выбранным профилем активна.").size(11.0).weak());
-                    ui.add_space(10.0);
-
-                    // ACCOUNT SWITCHER
-                    if !self.settings.available_accounts.is_empty() {
-                        ui.label(RichText::new("Выберите, в какой аккаунт войти:").size(12.0).strong());
+            // 1. АККАУНТ GOOGLE / YOUTUBE MUSIC
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 1 {
+                egui::CollapsingHeader::new(RichText::new("👤 Аккаунты Google / YouTube Music").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
                         ui.add_space(4.0);
+                        let is_logged_in = !self.settings.google_cookie.is_empty();
 
-                        let mut account_to_switch = None;
+                        if is_logged_in {
+                            let user_title = self.settings.account_name.as_deref().unwrap_or("Пользователь YouTube");
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("●").size(12.0).color(Color32::from_rgb(16, 185, 129)));
+                                ui.label(RichText::new(format!("Текущий активный аккаунт: {}", user_title)).size(13.0).strong().color(Color32::WHITE));
+                            });
+                            ui.label(RichText::new("Синхронизация библиотеки, плейлистов и любимых треков с выбранным профилем активна.").size(11.0).weak());
+                            ui.add_space(10.0);
 
-                        for acc in &self.settings.available_accounts {
-                            let is_selected = acc.auth_user == self.settings.auth_user_index;
-                            let radio_text = if acc.email.is_empty() {
-                                acc.name.clone()
-                            } else {
-                                format!("{} ({})", acc.name, acc.email)
-                            };
+                            // ACCOUNT SWITCHER
+                            if !self.settings.available_accounts.is_empty() {
+                                ui.label(RichText::new("Выберите, в какой аккаунт войти:").size(12.0).strong());
+                                ui.add_space(4.0);
 
-                            let frame = egui::Frame::none()
-                                .fill(if is_selected { Color32::from_rgb(30, 45, 38) } else { Color32::from_rgb(24, 24, 30) })
-                                .rounding(Rounding::same(6.0))
-                                .inner_margin(8.0)
-                                .stroke(Stroke::new(1.0_f32, if is_selected { Color32::from_rgb(16, 185, 129) } else { Color32::from_rgb(40, 40, 50) }));
+                                let mut account_to_switch = None;
 
-                            frame.show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let symbol = if is_selected { "●" } else { "○" };
-                                    let symbol_col = if is_selected { Color32::from_rgb(16, 185, 129) } else { Color32::GRAY };
-                                    ui.label(RichText::new(symbol).size(14.0).color(symbol_col));
-                                    ui.label(RichText::new(&radio_text).size(13.0).strong());
-
-                                    if is_selected {
-                                        ui.label(RichText::new("[Активен]").size(11.0).color(Color32::from_rgb(16, 185, 129)));
+                                for acc in &self.settings.available_accounts {
+                                    let is_selected = acc.auth_user == self.settings.auth_user_index;
+                                    let radio_text = if acc.email.is_empty() {
+                                        acc.name.clone()
                                     } else {
-                                        if ui.button("Выбрать этот").clicked() {
-                                            account_to_switch = Some(acc.clone());
-                                        }
+                                        format!("{} ({})", acc.name, acc.email)
+                                    };
+
+                                    let frame = egui::Frame::none()
+                                        .fill(if is_selected { Color32::from_rgb(30, 45, 38) } else { Color32::from_rgb(24, 24, 30) })
+                                        .rounding(Rounding::same(6.0))
+                                        .inner_margin(8.0)
+                                        .stroke(Stroke::new(1.0_f32, if is_selected { Color32::from_rgb(16, 185, 129) } else { Color32::from_rgb(40, 40, 50) }));
+
+                                    frame.show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let symbol = if is_selected { "●" } else { "○" };
+                                            let symbol_col = if is_selected { Color32::from_rgb(16, 185, 129) } else { Color32::GRAY };
+                                            ui.label(RichText::new(symbol).size(14.0).color(symbol_col));
+                                            ui.label(RichText::new(&radio_text).size(13.0).strong());
+
+                                            if is_selected {
+                                                ui.label(RichText::new("[Активен]").size(11.0).color(Color32::from_rgb(16, 185, 129)));
+                                            } else {
+                                                if ui.button("Выбрать этот").clicked() {
+                                                    account_to_switch = Some(acc.clone());
+                                                }
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(4.0);
+                                }
+
+                                if let Some(acc) = account_to_switch {
+                                    self.settings.auth_user_index = acc.auth_user;
+                                    self.settings.account_name = Some(acc.name.clone());
+                                    self.settings.save();
+                                    self.status_message = Some(format!("Переключено на аккаунт: {}", acc.name));
+                                    self.sync_playlists();
+                                }
+
+                                ui.add_space(8.0);
+                            }
+
+                            ui.horizontal(|ui| {
+                                if ui.button("🔄 Обновить список аккаунтов").clicked() {
+                                    let client = Arc::clone(&self.innertube);
+                                    let cookie = self.settings.google_cookie.clone();
+                                    let tx = self.event_tx.clone();
+                                    tokio::spawn(async move {
+                                        let accounts = client.discover_accounts(&cookie).await;
+                                        let _ = tx.send(AppEvent::AccountsDiscovered(accounts));
+                                    });
+                                }
+
+                                if ui.button(RichText::new("🚪 Выйти из аккаунта").color(Color32::from_rgb(244, 63, 94))).clicked() {
+                                    self.settings.google_cookie.clear();
+                                    self.settings.account_name = None;
+                                    self.settings.available_accounts.clear();
+                                    self.settings.save();
+                                    self.status_message = Some("Вы вышли из аккаунта".to_string());
+                                }
+                            });
+                        } else {
+                            ui.label(RichText::new("Вход позволяет слушать ваши плейлисты, синхронизировать лайки и рекомендации с YouTube Music.").size(12.0).weak());
+                            ui.add_space(8.0);
+
+                            let ff_btn = egui::Button::new(RichText::new("🦊 Войти через Firefox в один клик").size(13.0).strong().color(Color32::WHITE))
+                                .fill(Color32::from_rgb(234, 88, 12))
+                                .rounding(Rounding::same(8.0));
+
+                            if ui.add_sized([260.0, 36.0], ff_btn).clicked() {
+                                self.status_message = Some("Чтение профилей Firefox в фоне...".to_string());
+                                let tx = self.event_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let res = BrowserAuth::extract_firefox_cookies();
+                                    let _ = tx.send(AppEvent::CookiesExtracted(res));
+                                });
+                            }
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Автоматически обнаруживает все ваши аккаунты Google в Firefox и даёт выбрать нужный.").size(11.0).weak());
+
+                            ui.add_space(8.0);
+                            ui.collapsing("Ввести Cookie вручную (для Chromium / Chrome / Edge)", |ui| {
+                                let mut save_clicked = false;
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut self.settings.google_cookie)
+                                        .hint_text("Вставьте строку Cookie...")
+                                        .desired_width(ui.available_width() - 90.0));
+                                    if ui.button("Сохранить").clicked() {
+                                        save_clicked = true;
                                     }
                                 });
+                                if save_clicked {
+                                    self.settings.save();
+                                    let client = Arc::clone(&self.innertube);
+                                    let cookie = self.settings.google_cookie.clone();
+                                    let tx = self.event_tx.clone();
+                                    tokio::spawn(async move {
+                                        let accounts = client.discover_accounts(&cookie).await;
+                                        let _ = tx.send(AppEvent::AccountsDiscovered(accounts));
+                                    });
+                                }
                             });
-                            ui.add_space(4.0);
-                        }
-
-                        if let Some(acc) = account_to_switch {
-                            self.settings.auth_user_index = acc.auth_user;
-                            self.settings.account_name = Some(acc.name.clone());
-                            self.settings.save();
-                            self.status_message = Some(format!("Переключено на аккаунт: {}", acc.name));
-                            self.sync_playlists();
-                        }
-
-                        ui.add_space(8.0);
-                    }
-
-                    ui.horizontal(|ui| {
-                        // Refresh accounts button
-                        if ui.button("🔄 Обновить список аккаунтов").clicked() {
-                            let client = Arc::clone(&self.innertube);
-                            let cookie = self.settings.google_cookie.clone();
-                            let tx = self.event_tx.clone();
-                            tokio::spawn(async move {
-                                let accounts = client.discover_accounts(&cookie).await;
-                                let _ = tx.send(AppEvent::AccountsDiscovered(accounts));
-                            });
-                        }
-
-                        // Logout button
-                        if ui.button(RichText::new("🚪 Выйти из аккаунта").color(Color32::from_rgb(244, 63, 94))).clicked() {
-                            self.settings.google_cookie.clear();
-                            self.settings.account_name = None;
-                            self.settings.available_accounts.clear();
-                            self.settings.save();
-                            self.status_message = Some("Вы вышли из аккаунта".to_string());
                         }
                     });
-                } else {
-                    ui.label(RichText::new("Вход позволяет слушать ваши плейлисты, синхронизировать лайки и рекомендации с YouTube Music.").size(12.0).weak());
-                    ui.add_space(8.0);
+                ui.add_space(12.0);
+            }
 
-                    // ONE-CLICK FIREFOX LOGIN BUTTON
-                    let ff_btn = egui::Button::new(RichText::new("🦊 Войти через Firefox в один клик").size(13.0).strong().color(Color32::WHITE))
-                        .fill(Color32::from_rgb(234, 88, 12)) // Firefox Orange
-                        .rounding(Rounding::same(8.0));
+            // 2. АВТОСОЗДАННЫЕ ПЛЕЙЛИСТЫ
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 2 {
+                egui::CollapsingHeader::new(RichText::new("📑 Автосозданные плейлисты (Библиотека)").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Отображать автосозданные плейлисты в библиотеке:").size(12.0).weak());
+                        ui.add_space(6.0);
 
-                    if ui.add_sized([260.0, 36.0], ff_btn).clicked() {
-                        self.status_message = Some("Чтение профилей Firefox в фоне...".to_string());
-                        let tx = self.event_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let res = BrowserAuth::extract_firefox_cookies();
-                            let _ = tx.send(AppEvent::CookiesExtracted(res));
-                        });
-                    }
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Автоматически обнаруживает все ваши аккаунты Google в Firefox и даёт выбрать нужный.").size(11.0).weak());
+                        if ui.checkbox(&mut self.settings.show_liked_playlist, "Понравившиеся").changed() {
+                            self.settings.save();
+                        }
+                        if ui.checkbox(&mut self.settings.show_downloaded_playlist, "Скачанные").changed() {
+                            self.settings.save();
+                        }
+                        if ui.checkbox(&mut self.settings.show_top_playlist, "Топ").changed() {
+                            self.settings.save();
+                        }
+                        if ui.checkbox(&mut self.settings.show_cached_playlist, "Кэшированные").changed() {
+                            self.settings.save();
+                        }
+                        if ui.checkbox(&mut self.settings.show_uploaded_playlist, "Загруженные").changed() {
+                            self.settings.save();
+                        }
+                    });
+                ui.add_space(12.0);
+            }
 
-                    ui.add_space(8.0);
-                    // Collapsible manual cookie entry
-                    ui.collapsing("Ввести Cookie вручную (для Chromium / Chrome / Edge)", |ui| {
-                        let mut save_clicked = false;
+            // 3. ВНЕШНИЙ ВИД И ТЕМА
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 3 {
+                egui::CollapsingHeader::new(RichText::new("🎨 Внешний вид и Тема").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.google_cookie)
-                                .hint_text("Вставьте строку Cookie...")
-                                .desired_width(ui.available_width() - 90.0));
-                            if ui.button("Сохранить").clicked() {
-                                save_clicked = true;
+                            ui.label("Режим темы:");
+                            let themes = ["Чисто чёрный (AMOLED)", "Тёмный сланец", "Светлая"];
+                            for (i, t_name) in themes.iter().enumerate() {
+                                let is_sel = self.settings.theme_mode == i;
+                                if ui.selectable_label(is_sel, *t_name).clicked() {
+                                    self.settings.theme_mode = i;
+                                    self.settings.save();
+                                    self.apply_theme(ctx);
+                                }
                             }
                         });
-                        if save_clicked {
-                            self.settings.save();
-                            let client = Arc::clone(&self.innertube);
-                            let cookie = self.settings.google_cookie.clone();
-                            let tx = self.event_tx.clone();
-                            tokio::spawn(async move {
-                                let accounts = client.discover_accounts(&cookie).await;
-                                let _ = tx.send(AppEvent::AccountsDiscovered(accounts));
-                            });
-                        }
-                    });
-                }
-            });
 
-            ui.add_space(10.0);
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Акцентный цвет:");
+                            let color_names = ["Изумруд (Metrolist)", "Рубин", "Аметист", "Кибер-синий", "Янтарь"];
+                            for (i, name) in color_names.iter().enumerate() {
+                                let color = Self::accent_colors()[i];
+                                let is_sel = self.settings.accent_color_idx == i;
+                                let btn = egui::Button::new(RichText::new(*name).color(Color32::WHITE))
+                                    .fill(if is_sel { color } else { Color32::from_rgb(35, 35, 45) });
+                                if ui.add(btn).clicked() {
+                                    self.settings.accent_color_idx = i;
+                                    self.settings.save();
+                                    self.apply_theme(ctx);
+                                }
+                            }
+                        });
 
-            // 2. АВТОСОЗДАННЫЕ ПЛЕЙЛИСТЫ (photo_1)
-            ui.group(|ui| {
-                ui.label(RichText::new("📑 Автосозданные плейлисты").size(15.0).strong());
-                ui.label(RichText::new("Отображать автосозданные плейлисты в библиотеке").size(11.0).weak());
-                ui.add_space(6.0);
-
-                if ui.checkbox(&mut self.settings.show_liked_playlist, "Понравившиеся").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.show_downloaded_playlist, "Скачанные").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.show_top_playlist, "Топ").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.show_cached_playlist, "Кэшированные").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.show_uploaded_playlist, "Загруженные").changed() {
-                    self.settings.save();
-                }
-            });
-
-            ui.add_space(10.0);
-
-            // 3. ВНЕШНИЙ ВИД И ТЕМА (photo_3)
-            ui.group(|ui| {
-                ui.label(RichText::new("🎨 Внешний вид и Тема").size(15.0).strong());
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Режим темы:");
-                    let themes = ["Чисто чёрный (AMOLED)", "Тёмный сланец", "Светлая"];
-                    for (i, t_name) in themes.iter().enumerate() {
-                        let is_sel = self.settings.theme_mode == i;
-                        if ui.selectable_label(is_sel, *t_name).clicked() {
-                            self.settings.theme_mode = i;
-                            self.settings.save();
-                            self.apply_theme(ctx);
-                        }
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Акцентный цвет:");
-                    let color_names = ["Изумруд (Metrolist)", "Рубин", "Аметист", "Кибер-синий", "Янтарь"];
-                    for (i, name) in color_names.iter().enumerate() {
-                        let color = Self::accent_colors()[i];
-                        let is_sel = self.settings.accent_color_idx == i;
-                        let btn = egui::Button::new(RichText::new(*name).color(Color32::WHITE))
-                            .fill(if is_sel { color } else { Color32::from_rgb(35, 35, 45) });
-                        if ui.add(btn).clicked() {
-                            self.settings.accent_color_idx = i;
-                            self.settings.save();
-                            self.apply_theme(ctx);
-                        }
-                    }
-                });
-
-                ui.add_space(6.0);
-                if ui.checkbox(&mut self.settings.high_refresh_rate, "Включить высокую частоту обновления (120 Гц)").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.landscape_scaling, "Масштабирование в альбомной ориентации").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.dynamic_icon_colors, "Динамические цвета значка").changed() {
-                    self.settings.save();
-                }
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Плотность интерфейса:");
-                    let scales = [(0.85, "Компактная (85%)"), (1.0, "Стандартная (100%)"), (1.15, "Просторная (115%)")];
-                    for (s, label) in scales {
-                        let is_sel = (self.settings.density_scale - s).abs() < 0.05;
-                        if ui.selectable_label(is_sel, label).clicked() {
-                            self.settings.density_scale = s;
+                        ui.add_space(6.0);
+                        if ui.checkbox(&mut self.settings.high_refresh_rate, "Включить высокую частоту обновления (120 Гц)").changed() {
                             self.settings.save();
                         }
-                    }
-                });
-            });
-
-            ui.add_space(10.0);
-
-            // 4. МИНИ-ПЛЕЕР И ПЛЕЕР (photo_4, photo_5, photo_6)
-            ui.group(|ui| {
-                ui.label(RichText::new("▶ Мини-плеер и Плеер").size(15.0).strong());
-                ui.add_space(6.0);
-
-                if ui.checkbox(&mut self.settings.new_mini_player_design, "Новый дизайн мини-плеера").changed() {
-                    self.settings.save();
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Стиль фона мини-плеера:");
-                    let bg_styles = ["Градиент", "Чистый черный", "Сплошной"];
-                    for (i, name) in bg_styles.iter().enumerate() {
-                        if ui.selectable_label(self.settings.mini_player_bg_style == i, *name).clicked() {
-                            self.settings.mini_player_bg_style = i;
+                        if ui.checkbox(&mut self.settings.landscape_scaling, "Масштабирование в альбомной ориентации").changed() {
                             self.settings.save();
                         }
-                    }
-                });
-
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.new_player_design, "Новый дизайн плеера").changed() {
-                    self.settings.save();
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Стиль фона плеера:");
-                    let bg_styles = ["Градиент", "Чистый черный", "Сплошной"];
-                    for (i, name) in bg_styles.iter().enumerate() {
-                        if ui.selectable_label(self.settings.player_bg_style == i, *name).clicked() {
-                            self.settings.player_bg_style = i;
+                        if ui.checkbox(&mut self.settings.dynamic_icon_colors, "Динамические цвета значка").changed() {
                             self.settings.save();
                         }
-                    }
-                });
 
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.hide_player_thumbnail, "Скрыть миниатюру плеера").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.crop_album_art, "Обрезать обложку альбома (1:1)").changed() {
-                    self.settings.save();
-                }
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Цветовой стиль кнопок плеера:");
-                    let btn_styles = ["Акцентный", "Монохромный", "Адаптивный"];
-                    for (i, name) in btn_styles.iter().enumerate() {
-                        if ui.selectable_label(self.settings.player_buttons_color_style == i, *name).clicked() {
-                            self.settings.player_buttons_color_style = i;
-                            self.settings.save();
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Стиль ползунка плеера:");
-                    let slider_styles = ["Прямой", "Волнистый", "Тонкий"];
-                    for (i, name) in slider_styles.iter().enumerate() {
-                        if ui.selectable_label(self.settings.slider_style == i, *name).clicked() {
-                            self.settings.slider_style = i;
-                            self.settings.save();
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.swipe_track_switch, "Включить переключение треков свайпом").changed() {
-                    self.settings.save();
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Чувствительность свайпа мини-плеера:");
-                    let mut sens = self.settings.swipe_sensitivity;
-                    if ui.add(egui::Slider::new(&mut sens, 0.5..=2.0).text("x")).changed() {
-                        self.settings.swipe_sensitivity = sens;
-                        self.settings.save();
-                    }
-                });
-
-                if ui.checkbox(&mut self.settings.experimental_lyrics, "Экспериментальный текст").changed() {
-                    self.settings.save();
-                }
-
-                if ui.checkbox(&mut self.settings.show_remaining_time, "Отображать оставшееся время трека (-01:23)").changed() {
-                    self.settings.save();
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Скругление обложек:");
-                    let roundings = [(4.0, "4 px"), (8.0, "8 px (Metrolist)"), (16.0, "16 px"), (24.0, "Круглые")];
-                    for (r, label) in roundings {
-                        if ui.selectable_label((self.settings.album_art_rounding - r).abs() < 0.5, label).clicked() {
-                            self.settings.album_art_rounding = r;
-                            self.settings.save();
-                        }
-                    }
-                });
-            });
-
-            ui.add_space(10.0);
-
-            // 5. ТЕКСТ ПЕСНИ (photo_7, photo_8)
-            ui.group(|ui| {
-                ui.label(RichText::new("♫ Текст песни (Lyrics)").size(15.0).strong());
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Расположение текста песни:");
-                    let pos_names = ["По центру", "По левому краю"];
-                    for (i, name) in pos_names.iter().enumerate() {
-                        if ui.selectable_label(self.settings.lyrics_position == i, *name).clicked() {
-                            self.settings.lyrics_position = i;
-                            self.settings.save();
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.lyrics_respect_artist_position, "Учитывать позиционирование исполнителя").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.lyrics_change_on_tap, "Менять текст песни по касанию").changed() {
-                    self.settings.save();
-                }
-                if ui.checkbox(&mut self.settings.lyrics_auto_scroll, "Автоматическая плавная прокрутка текста").changed() {
-                    self.settings.save();
-                }
-            });
-
-            ui.add_space(10.0);
-
-            // 6. ПОЛНОЭКРАННЫЙ РЕЖИМ И НАВИГАЦИЯ (photo_8, photo_9, photo_10)
-            ui.group(|ui| {
-                ui.label(RichText::new("📱 Полноэкранный режим и Навигация").size(15.0).strong());
-                ui.add_space(6.0);
-
-                if ui.checkbox(&mut self.settings.hide_status_bar_fullscreen, "Скрывать строку состояния в полноэкранном режиме").changed() {
-                    self.settings.save();
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Вкладка навигации по умолчанию:");
-                    let nav_tabs = ["Главная", "Плейлисты", "Любимые треки", "Поиск"];
-                    for (i, name) in nav_tabs.iter().enumerate() {
-                        if ui.selectable_label(self.settings.default_nav_tab == i, *name).clicked() {
-                            self.settings.default_nav_tab = i;
-                            self.settings.save();
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.slim_nav_bar, "Тонкая панель навигации").changed() {
-                    self.settings.save();
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Размер ячейки сетки:");
-                    let grid_sizes = ["Маленький", "Средний", "Большой"];
-                    for (i, name) in grid_sizes.iter().enumerate() {
-                        if ui.selectable_label(self.settings.grid_cell_size == i, *name).clicked() {
-                            self.settings.grid_cell_size = i;
-                            self.settings.save();
-                        }
-                    }
-                });
-            });
-
-            ui.add_space(10.0);
-
-            // 3. ПЛЕЕР И АУДИО (Player & Audio)
-            ui.group(|ui| {
-                ui.label(RichText::new("♫ Плеер и Звук").size(15.0).strong());
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Качество потока:");
-                    egui::ComboBox::from_id_salt("quality")
-                        .selected_text(&self.settings.audio_quality)
-                        .show_ui(ui, |ui| {
-                            for q in ["High (320 kbps Opus)", "Standard (192 kbps)", "Low (128 kbps)"] {
-                                if ui.selectable_value(&mut self.settings.audio_quality, q.to_string(), q).clicked() {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Плотность интерфейса:");
+                            let scales = [(0.85, "Компактная (85%)"), (1.0, "Стандартная (100%)"), (1.15, "Просторная (115%)")];
+                            for (s, label) in scales {
+                                let is_sel = (self.settings.density_scale - s).abs() < 0.05;
+                                if ui.selectable_label(is_sel, label).clicked() {
+                                    self.settings.density_scale = s;
                                     self.settings.save();
                                 }
                             }
                         });
-                });
+                    });
+                ui.add_space(12.0);
+            }
 
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.audio_normalization, "Нормализация громкости (Loudness Normalization / ReplayGain)").changed() {
-                    self.settings.save();
-                }
+            // 4. МИНИ-ПЛЕЕР И ПЛЕЕР
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 4 {
+                egui::CollapsingHeader::new(RichText::new("▶ Мини-плеер и Плеер").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.new_mini_player_design, "Новый дизайн мини-плеера").changed() {
+                            self.settings.save();
+                        }
 
-                if ui.checkbox(&mut self.settings.skip_silence, "Пропуск тишины в начале и конце треков").changed() {
-                    self.settings.save();
-                }
-
-                if ui.checkbox(&mut self.settings.sponsorblock_enabled, "SponsorBlock (автоматический пропуск немузыкальных фрагментов)").changed() {
-                    self.settings.save();
-                }
-            });
-
-            ui.add_space(10.0);
-
-            // 4. ИНТЕГРАЦИЯ С DISCORD (Discord RPC)
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🎮 Discord Rich Presence").size(15.0).strong());
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("🟢 IPC подключение активно").size(11.0).color(Color32::from_rgb(16, 185, 129)));
-                });
-                ui.add_space(6.0);
-
-                let mut enabled = self.settings.discord_rpc_enabled;
-                if ui.checkbox(&mut enabled, "Отображать в Discord статус прослушивания").changed() {
-                    self.settings.discord_rpc_enabled = enabled;
-                    self.settings.save();
-                    if !enabled {
-                        self.discord.clear();
-                    } else if let Some(t) = self.current_track() {
-                        self.discord.set_activity(ActivityDetails {
-                            title: t.title.clone(),
-                            artist: t.artist.clone(),
-                            song_id: t.id.clone(),
-                            elapsed_secs: 0.0,
-                            duration_secs: 0.0,
-                            thumbnail: t.thumbnail_url.clone(),
-                            show_buttons: self.settings.discord_show_buttons,
-                            activity_type: self.settings.discord_activity_type,
+                        ui.horizontal(|ui| {
+                            ui.label("Стиль фона мини-плеера:");
+                            let bg_styles = ["Градиент", "Чистый черный", "Сплошной"];
+                            for (i, name) in bg_styles.iter().enumerate() {
+                                if ui.selectable_label(self.settings.mini_player_bg_style == i, *name).clicked() {
+                                    self.settings.mini_player_bg_style = i;
+                                    self.settings.save();
+                                }
+                            }
                         });
-                    }
-                }
 
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Тип активности:");
-                    let types = ["Слушает (Listening)", "Играет (Playing)"];
-                    for (idx, name) in types.iter().enumerate() {
-                        let is_sel = self.settings.discord_activity_type == idx;
-                        if ui.selectable_label(is_sel, *name).clicked() {
-                            self.settings.discord_activity_type = idx;
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.new_player_design, "Новый дизайн плеера").changed() {
                             self.settings.save();
                         }
-                    }
-                });
 
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.settings.discord_show_buttons, "Показывать кнопки «Слушать в YouTube Music» и «Metrolist»").changed() {
-                    self.settings.save();
-                }
+                        ui.horizontal(|ui| {
+                            ui.label("Стиль фона плеера:");
+                            let bg_styles = ["Градиент", "Чистый черный", "Сплошной"];
+                            for (i, name) in bg_styles.iter().enumerate() {
+                                if ui.selectable_label(self.settings.player_bg_style == i, *name).clicked() {
+                                    self.settings.player_bg_style = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
 
-                ui.add_space(4.0);
-                ui.label(RichText::new("В профиле Discord показывается точное название песни («Слушает <Название трека>»), исполнитель и таймкод.").size(11.0).weak());
-            });
-
-            ui.add_space(10.0);
-
-            // 5. КОНТЕНТ И ЯЗЫК (Content & Language)
-            ui.group(|ui| {
-                ui.label(RichText::new("🌐 Контент и Язык").size(15.0).strong());
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Регион контента (GL):");
-                    let countries = ["RU", "US", "DE", "GB", "JP", "KR"];
-                    for c in countries {
-                        let is_sel = self.settings.content_country == c;
-                        if ui.selectable_label(is_sel, c).clicked() {
-                            self.settings.content_country = c.to_string();
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.hide_player_thumbnail, "Скрыть миниатюру плеера").changed() {
                             self.settings.save();
                         }
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Язык интерфейса и треков (HL):");
-                    let langs = [("ru", "Русский"), ("en", "English")];
-                    for (code, name) in langs {
-                        let is_sel = self.settings.content_language == code;
-                        if ui.selectable_label(is_sel, name).clicked() {
-                            self.settings.content_language = code.to_string();
+                        if ui.checkbox(&mut self.settings.crop_album_art, "Обрезать обложку альбома (1:1)").changed() {
                             self.settings.save();
                         }
-                    }
-                });
-            });
 
-            ui.add_space(10.0);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Цветовой стиль кнопок плеера:");
+                            let btn_styles = ["Акцентный", "Монохромный", "Адаптивный"];
+                            for (i, name) in btn_styles.iter().enumerate() {
+                                if ui.selectable_label(self.settings.player_buttons_color_style == i, *name).clicked() {
+                                    self.settings.player_buttons_color_style = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
 
-            // 6. ХРАНИЛИЩЕ И ЗАГРУЗКИ (Storage)
-            ui.group(|ui| {
-                ui.label(RichText::new("💾 Хранилище и Загрузки").size(15.0).strong());
-                ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Стиль ползунка плеера:");
+                            let slider_styles = ["Прямой", "Волнистый", "Тонкий"];
+                            for (i, name) in slider_styles.iter().enumerate() {
+                                if ui.selectable_label(self.settings.slider_style == i, *name).clicked() {
+                                    self.settings.slider_style = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
 
-                ui.horizontal(|ui| {
-                    ui.label("Папка загрузок:");
-                    let edit = egui::TextEdit::singleline(&mut self.settings.download_dir).desired_width(ui.available_width() - 100.0);
-                    if ui.add(edit).lost_focus() {
-                        self.settings.save();
-                    }
-                    if ui.button("Обзор").clicked() {
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.swipe_track_switch, "Включить переключение треков свайпом").changed() {
+                            self.settings.save();
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Чувствительность свайпа мини-плеера:");
+                            let mut sens = self.settings.swipe_sensitivity;
+                            if ui.add(egui::Slider::new(&mut sens, 0.5..=2.0).text("x")).changed() {
+                                self.settings.swipe_sensitivity = sens;
+                                self.settings.save();
+                            }
+                        });
+
+                        if ui.checkbox(&mut self.settings.experimental_lyrics, "Экспериментальный текст").changed() {
+                            self.settings.save();
+                        }
+
+                        if ui.checkbox(&mut self.settings.show_remaining_time, "Отображать оставшееся время трека (-01:23)").changed() {
+                            self.settings.save();
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Скругление обложек:");
+                            let roundings = [(4.0, "4 px"), (8.0, "8 px (Metrolist)"), (16.0, "16 px"), (24.0, "Круглые")];
+                            for (r, label) in roundings {
+                                if ui.selectable_label((self.settings.album_art_rounding - r).abs() < 0.5, label).clicked() {
+                                    self.settings.album_art_rounding = r;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+                    });
+                ui.add_space(12.0);
+            }
+
+            // 5. ТЕКСТ ПЕСНИ
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 5 {
+                egui::CollapsingHeader::new(RichText::new("♫ Текст песни (Lyrics)").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Расположение текста песни:");
+                            let pos_names = ["По центру", "По левому краю"];
+                            for (i, name) in pos_names.iter().enumerate() {
+                                if ui.selectable_label(self.settings.lyrics_position == i, *name).clicked() {
+                                    self.settings.lyrics_position = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.lyrics_respect_artist_position, "Учитывать позиционирование исполнителя").changed() {
+                            self.settings.save();
+                        }
+                        if ui.checkbox(&mut self.settings.lyrics_change_on_tap, "Менять текст песни по касанию").changed() {
+                            self.settings.save();
+                        }
+                        if ui.checkbox(&mut self.settings.lyrics_auto_scroll, "Автоматическая плавная прокрутка текста").changed() {
+                            self.settings.save();
+                        }
+                    });
+                ui.add_space(12.0);
+            }
+
+            // 6. ПОЛНОЭКРАННЫЙ РЕЖИМ И НАВИГАЦИЯ
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 6 {
+                egui::CollapsingHeader::new(RichText::new("📱 Полноэкранный режим и Навигация").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.hide_status_bar_fullscreen, "Скрывать строку состояния в полноэкранном режиме").changed() {
+                            self.settings.save();
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Вкладка навигации по умолчанию:");
+                            let nav_tabs = ["Главная", "Плейлисты", "Любимые треки", "Поиск"];
+                            for (i, name) in nav_tabs.iter().enumerate() {
+                                if ui.selectable_label(self.settings.default_nav_tab == i, *name).clicked() {
+                                    self.settings.default_nav_tab = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.slim_nav_bar, "Тонкая панель навигации").changed() {
+                            self.settings.save();
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Размер ячейки сетки:");
+                            let grid_sizes = ["Маленький", "Средний", "Большой"];
+                            for (i, name) in grid_sizes.iter().enumerate() {
+                                if ui.selectable_label(self.settings.grid_cell_size == i, *name).clicked() {
+                                    self.settings.grid_cell_size = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+                    });
+                ui.add_space(12.0);
+            }
+
+            // 7. ЗВУК И КАЧЕСТВО
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 7 {
+                egui::CollapsingHeader::new(RichText::new("🔊 Звук и Воспроизведение").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Качество потока:");
+                            egui::ComboBox::from_id_salt("quality_setting")
+                                .selected_text(&self.settings.audio_quality)
+                                .show_ui(ui, |ui| {
+                                    for q in ["High (320 kbps Opus)", "Standard (192 kbps)", "Low (128 kbps)"] {
+                                        if ui.selectable_value(&mut self.settings.audio_quality, q.to_string(), q).clicked() {
+                                            self.settings.save();
+                                        }
+                                    }
+                                });
+                        });
+
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.audio_normalization, "Нормализация громкости (ReplayGain / Loudness Normalization)").changed() {
+                            self.settings.save();
+                        }
+
+                        if ui.checkbox(&mut self.settings.skip_silence, "Пропуск тишины в начале и конце треков").changed() {
+                            self.settings.save();
+                        }
+
+                        if ui.checkbox(&mut self.settings.sponsorblock_enabled, "SponsorBlock (автоматический пропуск немузыкальных фрагментов)").changed() {
+                            self.settings.save();
+                        }
+                    });
+                ui.add_space(12.0);
+            }
+
+            // 8. DISCORD RPC
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 8 {
+                egui::CollapsingHeader::new(RichText::new("🎮 Discord Rich Presence").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        let mut enabled = self.settings.discord_rpc_enabled;
+                        if ui.checkbox(&mut enabled, "Отображать статус в Discord").changed() {
+                            self.settings.discord_rpc_enabled = enabled;
+                            self.settings.save();
+                            if !enabled {
+                                self.discord.clear();
+                            } else if let Some(t) = self.current_track() {
+                                self.discord.set_activity(ActivityDetails {
+                                    title: t.title.clone(),
+                                    artist: t.artist.clone(),
+                                    song_id: t.id.clone(),
+                                    elapsed_secs: 0.0,
+                                    duration_secs: 0.0,
+                                    thumbnail: t.thumbnail_url.clone(),
+                                    show_buttons: self.settings.discord_show_buttons,
+                                    activity_type: self.settings.discord_activity_type,
+                                });
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Тип активности:");
+                            let types = ["Слушает (Listening)", "Играет (Playing)"];
+                            for (idx, name) in types.iter().enumerate() {
+                                let is_sel = self.settings.discord_activity_type == idx;
+                                if ui.selectable_label(is_sel, *name).clicked() {
+                                    self.settings.discord_activity_type = idx;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        if ui.checkbox(&mut self.settings.discord_show_buttons, "Отображать кнопку «Слушать в Metrolist» в профиле Discord").changed() {
+                            self.settings.save();
+                        }
+                    });
+                ui.add_space(12.0);
+            }
+
+            // 9. ХРАНИЛИЩЕ И ЗАГРУЗКИ
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 9 {
+                egui::CollapsingHeader::new(RichText::new("💾 Загрузки и Хранилище").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Папка для сохранения треков:");
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.download_dir).desired_width(ui.available_width() - 140.0));
+                            if ui.button("Сохранить").clicked() {
+                                self.settings.save();
+                                self.status_message = Some("Папка загрузки обновлена".to_string());
+                            }
+                        });
+
+                        ui.add_space(6.0);
                         let dir = self.settings.download_dir.clone();
-                        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.label(RichText::new("Треки скачиваются с обложками в высоком разрешении и ID3-метаданными исполнителей.").size(11.0).weak());
-            });
-
-            ui.add_space(10.0);
-
-            // 7. О ПРОГРАММЕ (About)
-            ui.group(|ui| {
-                ui.label(RichText::new("ℹ О приложении Metrolist").size(15.0).strong());
-                ui.add_space(6.0);
-                ui.label(RichText::new("Metrolist Desktop v0.2.1 (Rust / Wayland)").strong());
-                ui.label(RichText::new("Портировано с оригинального Android-клиента Metrolist:").size(12.0).weak());
-                if ui.link("github.com/metrolistgroup/metrolist").clicked() {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg("https://github.com/metrolistgroup/metrolist")
-                        .spawn();
-                }
-            });
-
-            ui.add_space(20.0);
+                        if ui.button("📂 Открыть папку загрузок в файловом менеджере").clicked() {
+                            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                        }
+                    });
+                ui.add_space(12.0);
+            }
         });
     }
-
-    fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
+fn render_now_playing_tab(&mut self, ui: &mut egui::Ui) {
         let accent = self.accent_color();
         let playback_info = self.player.info.lock().unwrap().clone();
         let current_track = self.current_track().cloned();
+
+        let avail_w = ui.available_width();
+        let avail_h = ui.available_height();
 
         // 1. Top Bar: ← Назад, "СЕЙЧАС ИГРАЕТ" / Source name, Share, Download
         ui.horizontal(|ui| {
             let back_btn = egui::Button::new(RichText::new("← Назад").size(14.0).strong().color(Color32::WHITE))
                 .fill(Color32::from_rgb(32, 32, 40))
                 .rounding(Rounding::same(8.0));
-            if ui.add_sized([90.0, 32.0], back_btn).clicked() {
+            if ui.add_sized([90.0, 34.0], back_btn).clicked() {
                 self.active_tab = self.previous_tab;
                 return;
             }
@@ -2068,24 +2056,31 @@ impl MetrolistApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(track) = &current_track {
                     let track_clone = track.clone();
-                    if ui.button(RichText::new("⬇").size(15.0)).on_hover_text("Скачать трек").clicked() {
+                    if ui.button(RichText::new("⬇").size(16.0)).on_hover_text("Скачать трек").clicked() {
                         self.download_track(track_clone);
                     }
                 }
             });
         });
 
-        ui.add_space(16.0);
+        ui.add_space(8.0);
 
-        // 2. Central content: large album art, track info, slider, controls
-        let max_content_w = 440.0;
-        let content_x = ((ui.available_width() - max_content_w) / 2.0).max(0.0);
+        // 2. Responsive dimensions: dynamically scaled with window size
+        let content_w = (avail_w * 0.85).clamp(360.0, 720.0);
+        let center_offset = ((avail_w - content_w) / 2.0).max(0.0);
+
+        // Calculate dynamic album art size so it can be BIGGER (up to 440px)
+        let bottom_controls_h = 240.0;
+        let top_bar_h = 48.0;
+        let space_for_art = (avail_h - top_bar_h - bottom_controls_h).max(180.0);
+        let art_size = space_for_art.min(content_w * 0.80).clamp(220.0, 440.0);
+        let flexible_gap = (avail_h - (top_bar_h + art_size + bottom_controls_h)).max(8.0);
 
         ui.horizontal(|ui| {
-            ui.add_space(content_x);
-            ui.allocate_ui_with_layout(Vec2::new(max_content_w, ui.available_height()), egui::Layout::top_down(egui::Align::Center), |ui| {
-                let art_size = 320.0;
-                let art_rounding = Rounding::same(16.0);
+            ui.add_space(center_offset);
+            ui.allocate_ui_with_layout(Vec2::new(content_w, ui.available_height()), egui::Layout::top_down(egui::Align::Center), |ui| {
+                // Top: Centered Large Album Art
+                let art_rounding = Rounding::same(20.0);
 
                 if !self.settings.hide_player_thumbnail {
                     if let Some(track) = &current_track {
@@ -2096,25 +2091,27 @@ impl MetrolistApp {
                         } else {
                             let (rect, _) = ui.allocate_exact_size(Vec2::new(art_size, art_size), egui::Sense::hover());
                             ui.painter().rect_filled(rect, art_rounding, Color32::from_rgb(32, 32, 40));
-                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "♫", egui::FontId::proportional(64.0), Color32::GRAY);
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "♫", egui::FontId::proportional(72.0), Color32::GRAY);
                         }
                     } else {
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(art_size, art_size), egui::Sense::hover());
                         ui.painter().rect_filled(rect, art_rounding, Color32::from_rgb(32, 32, 40));
-                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "♫", egui::FontId::proportional(64.0), Color32::GRAY);
+                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "♫", egui::FontId::proportional(72.0), Color32::GRAY);
                     }
                 }
 
-                ui.add_space(20.0);
+                // Flexible gap pushes all controls comfortably to the BOTTOM
+                ui.add_space(flexible_gap);
 
-                // Track title & artist + Share & Heart
-                ui.allocate_ui_with_layout(Vec2::new(max_content_w, 54.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.allocate_ui_with_layout(Vec2::new(max_content_w - 90.0, 50.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                // --- BOTTOM INTERFACE SECTION ---
+                // Track metadata row: Title & Artist + Share & Heart
+                ui.allocate_ui_with_layout(Vec2::new(content_w, 56.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(Vec2::new(content_w - 95.0, 52.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         if let Some(track) = &current_track {
-                            ui.label(RichText::new(&track.title).size(18.0).strong().color(Color32::WHITE));
-                            ui.label(RichText::new(&track.artist).size(13.0).weak());
+                            ui.label(RichText::new(&track.title).size(22.0).strong().color(Color32::WHITE));
+                            ui.label(RichText::new(&track.artist).size(15.0).weak());
                         } else {
-                            ui.label(RichText::new("Ничего не играет").size(16.0).weak());
+                            ui.label(RichText::new("Ничего не играет").size(18.0).weak());
                         }
                     });
 
@@ -2123,14 +2120,14 @@ impl MetrolistApp {
                             let is_liked = self.library.is_liked(&track.id);
                             let heart_color = if is_liked { Color32::from_rgb(244, 63, 94) } else { Color32::GRAY };
                             let heart_symbol = if is_liked { "♥" } else { "♡" };
-                            let heart_btn = egui::Button::new(RichText::new(heart_symbol).size(22.0).color(heart_color)).frame(false);
+                            let heart_btn = egui::Button::new(RichText::new(heart_symbol).size(24.0).color(heart_color)).frame(false);
                             if ui.add(heart_btn).clicked() {
                                 self.library.toggle_like(track.clone());
                             }
 
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
 
-                            let share_btn = egui::Button::new(RichText::new("↗").size(20.0).color(Color32::WHITE)).frame(false);
+                            let share_btn = egui::Button::new(RichText::new("↗").size(22.0).color(Color32::WHITE)).frame(false);
                             if ui.add(share_btn).on_hover_text("Копировать ссылку на трек").clicked() {
                                 let link = format!("https://music.youtube.com/watch?v={}", track.id);
                                 ui.output_mut(|o| o.copied_text = link);
@@ -2140,22 +2137,22 @@ impl MetrolistApp {
                     });
                 });
 
-                ui.add_space(14.0);
+                ui.add_space(8.0);
 
-                // Slider and Time
+                // Full-width Progress Slider & Time Labels
                 let max_d = if playback_info.duration_secs > 0.0 { playback_info.duration_secs } else { 100.0 };
                 let mut pos = playback_info.position_secs;
                 let slider = egui::Slider::new(&mut pos, 0.0..=max_d)
                     .show_value(false)
                     .trailing_fill(true);
-                let resp = ui.add_sized([max_content_w, 16.0], slider);
+                let resp = ui.add_sized([content_w, 18.0], slider);
                 if resp.dragged() || resp.clicked() {
                     self.player.seek(pos);
                 }
 
                 ui.add_space(4.0);
 
-                ui.allocate_ui_with_layout(Vec2::new(max_content_w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(Vec2::new(content_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let curr_str = Self::format_time(playback_info.position_secs);
                     let dur_str = if self.settings.show_remaining_time && playback_info.duration_secs > playback_info.position_secs {
                         format!("-{}", Self::format_time(playback_info.duration_secs - playback_info.position_secs))
@@ -2168,43 +2165,43 @@ impl MetrolistApp {
                     });
                 });
 
-                ui.add_space(20.0);
+                ui.add_space(16.0);
 
-                // Controls row: Previous pill, Play/Pause large pill with text and icon, Next pill
+                // Controls row: LARGER Buttons
                 ui.horizontal(|ui| {
-                    let prev_btn = egui::Button::new(RichText::new("⏮").size(20.0).strong().color(Color32::WHITE))
+                    let prev_btn = egui::Button::new(RichText::new("⏮").size(22.0).strong().color(Color32::WHITE))
                         .fill(Color32::from_rgb(34, 34, 44))
-                        .rounding(Rounding::same(24.0));
-                    if ui.add_sized([52.0, 48.0], prev_btn).clicked() {
+                        .rounding(Rounding::same(27.0));
+                    if ui.add_sized([58.0, 54.0], prev_btn).clicked() {
                         self.play_prev();
                     }
 
-                    ui.add_space(16.0);
+                    ui.add_space(18.0);
 
                     let (icon, text) = if playback_info.is_playing { ("⏸", "Пауза") } else { ("▶", "Играть") };
-                    let play_btn = egui::Button::new(RichText::new(format!("{}  {}", icon, text)).size(16.0).color(Color32::WHITE).strong())
+                    let play_btn = egui::Button::new(RichText::new(format!("{}  {}", icon, text)).size(17.0).color(Color32::WHITE).strong())
                         .fill(accent)
-                        .rounding(Rounding::same(24.0));
-                    if ui.add_sized([150.0, 48.0], play_btn).clicked() {
+                        .rounding(Rounding::same(28.0));
+                    if ui.add_sized([180.0, 56.0], play_btn).clicked() {
                         self.player.toggle_pause();
                     }
 
-                    ui.add_space(16.0);
+                    ui.add_space(18.0);
 
-                    let next_btn = egui::Button::new(RichText::new("⏭").size(20.0).strong().color(Color32::WHITE))
+                    let next_btn = egui::Button::new(RichText::new("⏭").size(22.0).strong().color(Color32::WHITE))
                         .fill(Color32::from_rgb(34, 34, 44))
-                        .rounding(Rounding::same(24.0));
-                    if ui.add_sized([52.0, 48.0], next_btn).clicked() {
+                        .rounding(Rounding::same(27.0));
+                    if ui.add_sized([58.0, 54.0], next_btn).clicked() {
                         self.play_next();
                     }
                 });
 
-                ui.add_space(24.0);
+                ui.add_space(20.0);
 
                 // Bottom Action Icons Row (Queue, Sleep, Shuffle, Lyrics, Repeat)
                 ui.horizontal(|ui| {
                     let queue_btn = egui::Button::new(RichText::new("☰").size(18.0).color(Color32::WHITE)).frame(false);
-                    if ui.add_sized([42.0, 36.0], queue_btn).on_hover_text("Очередь треков").clicked() {
+                    if ui.add_sized([46.0, 38.0], queue_btn).on_hover_text("Очередь треков").clicked() {
                         self.active_tab = ActiveTab::Queue;
                     }
 
@@ -2212,7 +2209,7 @@ impl MetrolistApp {
 
                     let shuffle_col = if self.shuffle_state { accent } else { Color32::GRAY };
                     let shuffle_btn = egui::Button::new(RichText::new("🔀").size(18.0).color(shuffle_col)).frame(false);
-                    if ui.add_sized([42.0, 36.0], shuffle_btn).on_hover_text("Перемешать очередь").clicked() {
+                    if ui.add_sized([46.0, 38.0], shuffle_btn).on_hover_text("Перемешать очередь").clicked() {
                         self.shuffle_state = !self.shuffle_state;
                         if self.shuffle_state {
                             self.shuffle_queue();
@@ -2223,7 +2220,7 @@ impl MetrolistApp {
                     ui.add_space(14.0);
 
                     let lyrics_btn = egui::Button::new(RichText::new("♫").size(18.0).color(Color32::WHITE)).frame(false);
-                    if ui.add_sized([42.0, 36.0], lyrics_btn).on_hover_text("Текст песни").clicked() {
+                    if ui.add_sized([46.0, 38.0], lyrics_btn).on_hover_text("Текст песни").clicked() {
                         self.active_tab = ActiveTab::Lyrics;
                     }
 
@@ -2235,7 +2232,7 @@ impl MetrolistApp {
                         _ => ("🔁", Color32::GRAY),
                     };
                     let rep_btn = egui::Button::new(RichText::new(rep_icon).size(18.0).color(rep_col)).frame(false);
-                    if ui.add_sized([42.0, 36.0], rep_btn).on_hover_text("Режим повтора").clicked() {
+                    if ui.add_sized([46.0, 38.0], rep_btn).on_hover_text("Режим повтора").clicked() {
                         self.repeat_mode = (self.repeat_mode + 1) % 3;
                     }
                 });

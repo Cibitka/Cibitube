@@ -31,14 +31,14 @@ impl AudioPlayer {
             .spawn()
             .map_err(|e| format!("Failed to start mpv: {}. Make sure mpv is installed.", e))?;
 
-        // Wait for socket to appear (fast poll 15ms)
+        // Wait for socket to appear (fast poll 5ms)
         let mut stream = None;
         for _ in 0..40 {
             if let Ok(s) = UnixStream::connect(&sock_path) {
                 stream = Some(s);
                 break;
             }
-            thread::sleep(Duration::from_millis(15));
+            thread::sleep(Duration::from_millis(5));
         }
 
         let stream = stream.ok_or_else(|| "Failed to connect to MPV IPC socket".to_string())?;
@@ -171,5 +171,14 @@ impl AudioPlayer {
         if let Ok(mut l) = self.info.lock() {
             l.volume = volume;
         }
+    }
+}
+
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        let _ = self._process.kill();
+        let _ = self._process.wait();
+        let sock_path = format!("/tmp/metrolist-mpv-{}.sock", std::process::id());
+        let _ = std::fs::remove_file(sock_path);
     }
 }
