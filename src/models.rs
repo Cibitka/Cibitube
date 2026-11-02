@@ -31,6 +31,7 @@ pub enum ActiveTab {
     Lyrics,
     Downloads,
     Settings,
+    NowPlaying,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
