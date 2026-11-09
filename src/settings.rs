@@ -61,6 +61,13 @@ pub struct AppSettings {
     pub lyrics_manual_offset_ms: i64,
 
     // 6. Навигация и экран
+    pub show_nav_search: bool,
+    pub show_nav_liked: bool,
+    pub show_nav_playlists: bool,
+    pub show_nav_queue: bool,
+    pub show_nav_lyrics: bool,
+    pub show_nav_downloads: bool,
+
     pub hide_status_bar_fullscreen: bool,
     pub default_nav_tab: usize,
     pub slim_nav_bar: bool,
@@ -170,7 +177,14 @@ impl Default for AppSettings {
             experimental_lyrics: false,
             lyrics_animation_mode: 0,
             lyrics_source_mode: 0,
-            lyrics_manual_offset_ms: 0,
+            lyrics_manual_offset_ms: 900,
+
+            show_nav_search: true,
+            show_nav_liked: true,
+            show_nav_playlists: true,
+            show_nav_queue: true,
+            show_nav_lyrics: true,
+            show_nav_downloads: true,
 
             hide_status_bar_fullscreen: true,
             default_nav_tab: 0,

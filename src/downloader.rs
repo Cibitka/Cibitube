@@ -13,6 +13,7 @@ pub struct DownloadOptions {
     pub embed_cover: bool,
     pub save_cover_file: bool,
     pub save_lyrics_lrc: bool,
+    pub google_cookie: String,
 }
 
 impl DownloadOptions {
@@ -23,6 +24,7 @@ impl DownloadOptions {
             embed_cover: s.download_embed_cover,
             save_cover_file: s.download_save_cover_file,
             save_lyrics_lrc: s.download_save_lyrics_lrc,
+            google_cookie: s.google_cookie.clone(),
         }
     }
 }
@@ -90,14 +92,29 @@ impl Downloader {
         let mut cmd = Command::new(Self::resolve_ytdl_path());
         cmd.arg("-x")
             .arg("--no-playlist")
+            .arg("-f")
+            .arg("ba/b")
             .arg("--audio-format")
             .arg(&opts.audio_format)
             .arg("--audio-quality")
             .arg("0")
             .arg("--embed-metadata")
             .arg("--no-overwrites")
+            .arg("--socket-timeout")
+            .arg("15")
+            .arg("--retries")
+            .arg("3")
+            .arg("--fragment-retries")
+            .arg("5")
+            .arg("--throttled-rate")
+            .arg("100K")
             .arg("--js-runtimes")
             .arg("node");
+
+        if !opts.google_cookie.is_empty() {
+            cmd.arg("--add-header")
+                .arg(format!("Cookie: {}", opts.google_cookie));
+        }
 
         if opts.embed_cover {
             cmd.arg("--embed-thumbnail");
@@ -109,11 +126,36 @@ impl Downloader {
         }
         cmd.arg("-o").arg(&output_template).arg(&url);
 
-        let status = cmd
-            .status()
+        let output = cmd
+            .output()
             .map_err(|e| format!("Ошибка запуска yt-dlp: {e}"))?;
-        if !status.success() {
-            return Err(format!("yt-dlp завершился с кодом: {status}"));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let meaningful_err = stderr
+                .lines()
+                .filter(|l| {
+                    let trim = l.trim();
+                    trim.contains("ERROR:") || trim.contains("timed out") || trim.contains("HTTP Error")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+
+            let err_summary = if !meaningful_err.is_empty() {
+                meaningful_err
+            } else {
+                stderr
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+
+            return Err(format!("yt-dlp error: {}", err_summary));
         }
 
         // Текст песни (.lrc), только после успешной загрузки аудио

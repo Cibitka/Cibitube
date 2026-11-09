@@ -99,6 +99,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport,
+        vsync: false,
         ..Default::default()
     };
 
