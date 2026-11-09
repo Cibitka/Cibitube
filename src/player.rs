@@ -120,6 +120,7 @@ impl AudioPlayer {
             .arg("--demuxer-max-bytes=67108864")
             .arg("--demuxer-readahead-secs=120")
             .arg("--demuxer-max-back-bytes=33554432")
+            .arg(format!("--volume={:.1}", volume))
             .arg("--ytdl-raw-options=js-runtimes=node");
 
         if let Some(ytdl) = Self::resolve_ytdl_binary() {
@@ -202,6 +203,11 @@ impl AudioPlayer {
                                     lock.is_playing = !p;
                                 }
                             }
+                            "volume" => {
+                                if let Some(v) = data.as_f64() {
+                                    lock.volume = v;
+                                }
+                            }
                             "eof-reached" if data.as_bool() == Some(true) => {
                                 finished_clone.store(true, Ordering::SeqCst);
                             }
@@ -219,6 +225,7 @@ impl AudioPlayer {
             (2, "duration"),
             (3, "pause"),
             (4, "eof-reached"),
+            (5, "volume"),
         ] {
             let _ = cmd_tx
                 .send(serde_json::json!({ "command": ["observe_property", id, prop] }).to_string());

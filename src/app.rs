@@ -1276,7 +1276,7 @@ impl eframe::App for MetrolistApp {
 
                             ui.add_space(8.0);
 
-                            let mut vol = playback_info.volume;
+                            let mut vol = self.settings.volume;
                             let vol_slider =
                                 egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
                             if ui.add_sized([60.0, 12.0], vol_slider).changed() {
@@ -2085,6 +2085,27 @@ impl MetrolistApp {
         }
     }
 
+    fn compute_line_progress(
+        line_text: &str,
+        line_start: f64,
+        next_start: f64,
+        current_time: f64,
+    ) -> f32 {
+        let lead_time = 0.22;
+        let cur = current_time + lead_time;
+        if cur <= line_start {
+            return 0.0;
+        }
+        let word_count = line_text.split_whitespace().count().max(1);
+        let char_count = line_text.chars().count().max(1);
+        let raw_gap = (next_start - line_start).max(0.4);
+        let vocal_dur = (word_count as f64 * 0.36)
+            .max(char_count as f64 * 0.075)
+            .clamp(1.0, 5.0);
+        let line_dur = raw_gap.min(vocal_dur);
+        ((cur - line_start) / line_dur).clamp(0.0, 1.0) as f32
+    }
+
     fn render_active_lyric_text(
         &self,
         ui: &mut egui::Ui,
@@ -2246,9 +2267,12 @@ impl MetrolistApp {
                     } else {
                         current_time + 4.0
                     };
-                    let line_dur = (next_sec - line.seconds).max(0.3);
-                    let progress =
-                        ((current_time - line.seconds) / line_dur).clamp(0.0, 1.0) as f32;
+                    let progress = Self::compute_line_progress(
+                        &line.text,
+                        line.seconds,
+                        next_sec,
+                        current_time,
+                    );
 
                     let active_frame = egui::Frame::none()
                         .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
@@ -3487,8 +3511,12 @@ impl MetrolistApp {
                                                             } else {
                                                                 current_time + 4.0
                                                             };
-                                                            let line_dur = (next_sec - line.seconds).max(0.3);
-                                                            let progress = ((current_time - line.seconds) / line_dur).clamp(0.0, 1.0) as f32;
+                                                            let progress = Self::compute_line_progress(
+                                                                &line.text,
+                                                                line.seconds,
+                                                                next_sec,
+                                                                current_time,
+                                                            );
 
                                                             let active_frame = egui::Frame::none()
                                                                 .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
@@ -3767,7 +3795,47 @@ impl MetrolistApp {
 
                             ui.add_space(v_gap);
 
-                            // Bottom Action Icons Row (Queue, Shuffle, Lyrics, Repeat): Responsive
+                            // 1. Volume slider row: Raised higher up, right under playback controls!
+                            let vol_slider_w = (110.0 * scale).clamp(65.0, 130.0);
+                            let vol_row_w = vol_slider_w + 64.0;
+                            let vol_pad = ((art_size - vol_row_w) / 2.0).max(0.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(vol_pad);
+                                let vol_icon = if self.settings.volume == 0.0 {
+                                    "🔇"
+                                } else if self.settings.volume < 50.0 {
+                                    "🔉"
+                                } else {
+                                    "🔊"
+                                };
+                                let mute_btn =
+                                    egui::Button::new(RichText::new(vol_icon).size((14.0 * scale).clamp(12.0, 16.0))).frame(false);
+                                if ui
+                                    .add(mute_btn)
+                                    .on_hover_text("Без звука / Включить звук")
+                                    .clicked()
+                                {
+                                    if self.settings.volume > 0.0 {
+                                        self.settings.volume = 0.0;
+                                    } else {
+                                        self.settings.volume = 80.0;
+                                    }
+                                    self.player.set_volume(self.settings.volume);
+                                    self.settings.save();
+                                }
+                                let mut vol = self.settings.volume;
+                                let vol_slider = egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
+                                if ui.add_sized([vol_slider_w, 14.0], vol_slider).changed() {
+                                    self.settings.volume = vol;
+                                    self.player.set_volume(vol);
+                                    self.settings.save();
+                                }
+                                ui.label(RichText::new(format!("{}%", vol as u32)).size((11.0 * scale).clamp(9.0, 12.0)).weak());
+                            });
+
+                            ui.add_space(v_gap);
+
+                            // 2. Bottom Action Icons Row (Queue, Shuffle, Lyrics "Aa", Repeat): Responsive
                             let act_btn_w = (38.0 * scale).clamp(26.0, 44.0);
                             let act_btn_h = (30.0 * scale).clamp(22.0, 36.0);
                             let act_font_sz = (16.0 * scale).clamp(12.0, 18.0);
@@ -3821,7 +3889,7 @@ impl MetrolistApp {
                                     Color32::WHITE
                                 };
                                 let lyrics_btn = egui::Button::new(
-                                    RichText::new("♫").size(act_font_sz).color(lyrics_col),
+                                    RichText::new("Aa").size(act_font_sz).color(lyrics_col),
                                 )
                                 .frame(false);
                                 if ui
@@ -3854,46 +3922,6 @@ impl MetrolistApp {
                                 {
                                     self.repeat_mode = (self.repeat_mode + 1) % 3;
                                 }
-                            });
-
-                            ui.add_space(v_gap);
-
-                            // Volume slider row: Guaranteed visible, never cut off
-                            let vol_slider_w = (110.0 * scale).clamp(65.0, 130.0);
-                            let vol_row_w = vol_slider_w + 64.0;
-                            let vol_pad = ((art_size - vol_row_w) / 2.0).max(0.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(vol_pad);
-                                let vol_icon = if self.settings.volume == 0.0 {
-                                    "🔇"
-                                } else if self.settings.volume < 50.0 {
-                                    "🔉"
-                                } else {
-                                    "🔊"
-                                };
-                                let mute_btn =
-                                    egui::Button::new(RichText::new(vol_icon).size((14.0 * scale).clamp(12.0, 16.0))).frame(false);
-                                if ui
-                                    .add(mute_btn)
-                                    .on_hover_text("Без звука / Включить звук")
-                                    .clicked()
-                                {
-                                    if self.settings.volume > 0.0 {
-                                        self.settings.volume = 0.0;
-                                    } else {
-                                        self.settings.volume = 80.0;
-                                    }
-                                    self.player.set_volume(self.settings.volume);
-                                    self.settings.save();
-                                }
-                                let mut vol = self.settings.volume;
-                                let vol_slider = egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
-                                if ui.add_sized([vol_slider_w, 14.0], vol_slider).changed() {
-                                    self.settings.volume = vol;
-                                    self.player.set_volume(vol);
-                                    self.settings.save();
-                                }
-                                ui.label(RichText::new(format!("{}%", vol as u32)).size((11.0 * scale).clamp(9.0, 12.0)).weak());
                             });
 
                             ui.add_space(10.0);

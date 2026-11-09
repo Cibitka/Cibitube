@@ -35,7 +35,7 @@ fn load_app_icon() -> Option<Arc<eframe::egui::IconData>> {
 fn setup_custom_fonts(ctx: &eframe::egui::Context) {
     let mut fonts = eframe::egui::FontDefinitions::default();
 
-    // Load DejaVuSans.ttf for complete unicode symbols (arrows, media buttons, hearts, musical notes)
+    // 1. DejaVuSans for complete unicode symbols (arrows, media buttons, hearts, musical notes)
     if let Ok(bytes) = std::fs::read("/usr/share/fonts/TTF/DejaVuSans.ttf") {
         fonts.font_data.insert(
             "dejavu_sans".to_owned(),
@@ -49,6 +49,34 @@ fn setup_custom_fonts(ctx: &eframe::egui::Context) {
         }
         if let Some(mono) = fonts.families.get_mut(&eframe::egui::FontFamily::Monospace) {
             mono.push("dejavu_sans".to_owned());
+        }
+    }
+
+    // 2. CJK fonts (Japanese, Chinese, Korean) to prevent square tofu glyphs
+    let cjk_paths = [
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ];
+
+    for path in cjk_paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "cjk_fallback".to_owned(),
+                std::sync::Arc::new(eframe::egui::FontData::from_owned(bytes)),
+            );
+            if let Some(prop) = fonts
+                .families
+                .get_mut(&eframe::egui::FontFamily::Proportional)
+            {
+                prop.push("cjk_fallback".to_owned());
+            }
+            if let Some(mono) = fonts.families.get_mut(&eframe::egui::FontFamily::Monospace) {
+                mono.push("cjk_fallback".to_owned());
+            }
+            break;
         }
     }
 
