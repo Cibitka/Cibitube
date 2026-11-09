@@ -1081,11 +1081,12 @@ impl eframe::App for MetrolistApp {
             let mut track_to_toggle_like = None;
 
             egui::TopBottomPanel::bottom("player_bar")
-                .exact_height(82.0)
+                .exact_height(84.0)
+                .show_separator_line(false)
                 .frame(egui::Frame::none().fill(bar_bg).inner_margin(egui::Margin {
                     left: 0.0,
                     right: 0.0,
-                    top: 0.0,
+                    top: 4.0,
                     bottom: 6.0,
                 }))
                 .show(ctx, |ui| {
@@ -2084,6 +2085,121 @@ impl MetrolistApp {
         }
     }
 
+    fn render_active_lyric_text(
+        &self,
+        ui: &mut egui::Ui,
+        text: &str,
+        progress: f32,
+        font_size: f32,
+    ) {
+        match self.settings.lyrics_animation_mode {
+            // 0 = По буквам (караоке-заливка)
+            0 => {
+                let chars: Vec<char> = text.chars().collect();
+                let total = chars.len();
+                let sung_len = ((progress * total as f32).round() as usize).min(total);
+                let sung: String = chars[..sung_len].iter().collect();
+                let unsung: String = chars[sung_len..].iter().collect();
+
+                let mut job = egui::text::LayoutJob::default();
+                if self.settings.lyrics_position == 0 {
+                    job.halign = egui::Align::Center;
+                }
+                if !sung.is_empty() {
+                    job.append(
+                        &sung,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(font_size),
+                            color: Color32::WHITE,
+                            ..Default::default()
+                        },
+                    );
+                }
+                if !unsung.is_empty() {
+                    job.append(
+                        &unsung,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(font_size),
+                            color: Color32::from_rgba_unmultiplied(210, 210, 225, 95),
+                            ..Default::default()
+                        },
+                    );
+                }
+                ui.label(job);
+            }
+            // 1 = По словам
+            1 => {
+                let mut words_with_space = Vec::new();
+                let mut cur = String::new();
+                for c in text.chars() {
+                    cur.push(c);
+                    if c.is_whitespace() {
+                        words_with_space.push(cur.clone());
+                        cur.clear();
+                    }
+                }
+                if !cur.is_empty() {
+                    words_with_space.push(cur);
+                }
+
+                let total = words_with_space.len();
+                let sung_count = ((progress * total as f32).ceil() as usize).min(total);
+                let sung: String = words_with_space[..sung_count].concat();
+                let unsung: String = words_with_space[sung_count..].concat();
+
+                let mut job = egui::text::LayoutJob::default();
+                if self.settings.lyrics_position == 0 {
+                    job.halign = egui::Align::Center;
+                }
+                if !sung.is_empty() {
+                    job.append(
+                        &sung,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(font_size),
+                            color: Color32::WHITE,
+                            ..Default::default()
+                        },
+                    );
+                }
+                if !unsung.is_empty() {
+                    job.append(
+                        &unsung,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(font_size),
+                            color: Color32::from_rgba_unmultiplied(210, 210, 225, 95),
+                            ..Default::default()
+                        },
+                    );
+                }
+                ui.label(job);
+            }
+            // 2 = По строчкам
+            2 => {
+                let pulse = (progress * std::f32::consts::PI).sin() * 0.2 + 0.8;
+                let c = (255.0 * pulse).clamp(180.0, 255.0) as u8;
+                ui.label(
+                    RichText::new(text)
+                        .size(font_size)
+                        .strong()
+                        .color(Color32::from_rgb(c, c, c)),
+                );
+            }
+            // 3 = Без анимации
+            _ => {
+                ui.label(
+                    RichText::new(text)
+                        .size(font_size)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+            }
+        }
+    }
+
     fn render_lyrics_tab(&mut self, ui: &mut egui::Ui, current_time: f64) {
         let accent = self.accent_color();
 
@@ -2101,6 +2217,12 @@ impl MetrolistApp {
         };
 
         if !lyrics.is_synced {
+            ui.label(
+                RichText::new("ℹ Для этого трека доступен только несинхронизированный текст")
+                    .size(12.0)
+                    .color(Color32::from_rgb(180, 180, 195)),
+            );
+            ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label(
                     RichText::new(&lyrics.plain)
@@ -2119,6 +2241,15 @@ impl MetrolistApp {
             for (idx, line) in lyrics.lines.iter().enumerate() {
                 let is_active = Some(idx) == current_line_idx;
                 if is_active {
+                    let next_sec = if idx + 1 < lyrics.lines.len() {
+                        lyrics.lines[idx + 1].seconds
+                    } else {
+                        current_time + 4.0
+                    };
+                    let line_dur = (next_sec - line.seconds).max(0.3);
+                    let progress =
+                        ((current_time - line.seconds) / line_dur).clamp(0.0, 1.0) as f32;
+
                     let active_frame = egui::Frame::none()
                         .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
                         .rounding(Rounding::same(8.0))
@@ -2127,12 +2258,7 @@ impl MetrolistApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("▶").size(15.0).color(accent).strong());
-                                ui.label(
-                                    RichText::new(&line.text)
-                                        .size(19.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                );
+                                self.render_active_lyric_text(ui, &line.text, progress, 18.0);
                             });
                         })
                         .response;
@@ -2759,6 +2885,18 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Анимация подсветки текста:");
+                            let anim_modes = ["По буквам", "По словам", "По строчкам", "Без анимации"];
+                            for (i, name) in anim_modes.iter().enumerate() {
+                                if ui.selectable_label(self.settings.lyrics_animation_mode == i, *name).clicked() {
+                                    self.settings.lyrics_animation_mode = i;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
                         if ui.checkbox(&mut self.settings.lyrics_respect_artist_position, "Учитывать позиционирование исполнителя").changed() {
                             self.settings.save();
                         }
@@ -3200,7 +3338,7 @@ impl MetrolistApp {
         let playback_info = self
             .player
             .info
-            .try_lock()
+            .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
         let current_track = self.current_track().cloned();
@@ -3257,486 +3395,511 @@ impl MetrolistApp {
             });
         });
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         // 2. Responsive dimensions: dynamically scaled with window size
-        // Calculate dynamic album art size (up to 440px)
-        let bottom_controls_h = 275.0;
-        let top_bar_h = 48.0;
-        let space_for_art = (avail_h - top_bar_h - bottom_controls_h).max(180.0);
-        let max_w_allowed = (avail_w - 40.0).max(180.0);
-        let art_size = space_for_art.min(max_w_allowed).clamp(220.0, 440.0);
-        let flexible_gap = (avail_h - (top_bar_h + art_size + bottom_controls_h)).clamp(6.0, 36.0);
+        let scale = ((avail_w / 460.0).min(avail_h / 620.0)).clamp(0.65, 1.15);
+        let space_for_art = (avail_h - 48.0 - (240.0 * scale)).max(120.0);
+        let max_w_allowed = (avail_w - 32.0).max(120.0);
+        let art_size = space_for_art.min(max_w_allowed).clamp(130.0, 420.0);
+        let flexible_gap = (avail_h - (48.0 + art_size + (240.0 * scale))).clamp(4.0, 24.0);
 
-        // Center the entire player column
-        let center_offset = ((avail_w - art_size) / 2.0).max(0.0);
+        // Center the entire player column inside a vertical scroll area
+        // so on smaller windows or splits nothing ever disappears!
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let center_offset = ((avail_w - art_size) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(center_offset);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(art_size, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            let art_rounding = Rounding::same(16.0);
 
-        ui.horizontal(|ui| {
-            ui.add_space(center_offset);
-            ui.allocate_ui_with_layout(
-                Vec2::new(art_size, ui.available_height()),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    let art_rounding = Rounding::same(20.0);
+                            // Top: Centered Album Art OR Synced Lyrics in-place
+                            if self.show_lyrics_in_player {
+                                let frame = egui::Frame::none()
+                                    .fill(Color32::from_rgb(20, 20, 26))
+                                    .rounding(art_rounding)
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 45, 55)))
+                                    .inner_margin(12.0);
+                                frame.show(ui, |ui| {
+                                    ui.set_width(art_size - 24.0);
+                                    ui.set_height(art_size - 24.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("♫ Текст песни")
+                                                .size(13.0)
+                                                .strong()
+                                                .color(accent),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .button(RichText::new("✕ Обложка").size(11.0))
+                                                    .clicked()
+                                                {
+                                                    self.show_lyrics_in_player = false;
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
 
-                    // Top: Centered Large Album Art OR Synced Lyrics in-place
-                    if self.show_lyrics_in_player {
-                        let frame = egui::Frame::none()
-                            .fill(Color32::from_rgb(20, 20, 26))
-                            .rounding(art_rounding)
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(45, 45, 55)))
-                            .inner_margin(14.0);
-                        frame.show(ui, |ui| {
-                            ui.set_width(art_size - 28.0);
-                            ui.set_height(art_size - 28.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("♫ Текст песни")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(accent),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .button(RichText::new("✕ Обложка").size(11.0))
-                                            .clicked()
-                                        {
-                                            self.show_lyrics_in_player = false;
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(4.0);
-                            ui.separator();
-                            ui.add_space(4.0);
-
-                            if let Some(lyrics) = &self.lyrics {
-                                if !lyrics.is_synced {
-                                    egui::ScrollArea::vertical()
-                                        .max_height(art_size - 80.0)
-                                        .show(ui, |ui| {
+                                    if let Some(lyrics) = &self.lyrics {
+                                        if !lyrics.is_synced {
                                             ui.label(
-                                                RichText::new(&lyrics.plain)
-                                                    .size(14.0)
-                                                    .line_height(Some(22.0)),
+                                                RichText::new("ℹ Доступен только несинхронизированный текст")
+                                                    .size(11.0)
+                                                    .color(Color32::from_rgb(180, 180, 195)),
+                                            );
+                                            ui.add_space(4.0);
+                                            egui::ScrollArea::vertical()
+                                                .max_height(art_size - 80.0)
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new(&lyrics.plain)
+                                                            .size(14.0)
+                                                            .line_height(Some(22.0)),
+                                                    );
+                                                });
+                                        } else {
+                                            let current_time = playback_info.position_secs;
+                                            let current_line_idx = lyrics
+                                                .lines
+                                                .iter()
+                                                .rposition(|l| l.seconds <= current_time);
+                                            let mut seek_to_sec: Option<f64> = None;
+
+                                            egui::ScrollArea::vertical()
+                                                .max_height(art_size - 80.0)
+                                                .show(ui, |ui| {
+                                                    for (idx, line) in lyrics.lines.iter().enumerate() {
+                                                        let is_active = Some(idx) == current_line_idx;
+                                                        if is_active {
+                                                            let next_sec = if idx + 1 < lyrics.lines.len() {
+                                                                lyrics.lines[idx + 1].seconds
+                                                            } else {
+                                                                current_time + 4.0
+                                                            };
+                                                            let line_dur = (next_sec - line.seconds).max(0.3);
+                                                            let progress = ((current_time - line.seconds) / line_dur).clamp(0.0, 1.0) as f32;
+
+                                                            let active_frame = egui::Frame::none()
+                                                                .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
+                                                                .rounding(Rounding::same(6.0))
+                                                                .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+                                                            let resp = active_frame
+                                                                .show(ui, |ui| {
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.label(RichText::new("▶").size(13.0).color(accent).strong());
+                                                                        self.render_active_lyric_text(ui, &line.text, progress, 15.0);
+                                                                    });
+                                                                })
+                                                                .response;
+
+                                                            if resp.clicked() {
+                                                                seek_to_sec = Some(line.seconds);
+                                                            }
+                                                            if self.settings.lyrics_auto_scroll {
+                                                                resp.scroll_to_me(Some(egui::Align::Center));
+                                                            }
+                                                        } else {
+                                                            let is_past = current_line_idx.is_some_and(|cur| idx < cur);
+                                                            let text_color = if is_past {
+                                                                Color32::from_rgb(120, 120, 130)
+                                                            } else {
+                                                                Color32::from_rgb(205, 205, 215)
+                                                            };
+                                                            let resp = ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(&line.text)
+                                                                        .size(13.0)
+                                                                        .color(text_color),
+                                                                )
+                                                                .sense(egui::Sense::click()),
+                                                            );
+                                                            if resp.clicked() {
+                                                                seek_to_sec = Some(line.seconds);
+                                                            }
+                                                        }
+                                                        ui.add_space(4.0);
+                                                    }
+                                                });
+
+                                            if let Some(sec) = seek_to_sec {
+                                                self.player.seek(sec);
+                                                self.last_auto_sync = std::time::Instant::now();
+                                                self.trigger_auto_sync(&playback_info);
+                                            }
+                                        }
+                                    } else {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space((art_size / 2.0) - 50.0);
+                                            ui.label(
+                                                RichText::new("Текст песни загружается или недоступен")
+                                                    .weak(),
                                             );
                                         });
+                                    }
+                                });
+                            } else if !self.settings.hide_player_thumbnail {
+                                if let Some(track) = &current_track {
+                                    if let Some(thumb) = &track.thumbnail_url {
+                                        let hd_thumb = InnertubeClient::upgrade_thumbnail_quality(thumb);
+                                        ui.add(
+                                            egui::Image::new(&hd_thumb)
+                                                .fit_to_exact_size(Vec2::new(art_size, art_size))
+                                                .rounding(art_rounding),
+                                        );
+                                    } else {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(art_size, art_size),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            art_rounding,
+                                            Color32::from_rgb(32, 32, 40),
+                                        );
+                                        ui.painter().text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "♫",
+                                            egui::FontId::proportional(64.0 * scale),
+                                            Color32::GRAY,
+                                        );
+                                    }
                                 } else {
-                                    let current_time = playback_info.position_secs;
-                                    let current_line_idx = lyrics
-                                        .lines
-                                        .iter()
-                                        .rposition(|l| l.seconds <= current_time);
-                                    let mut seek_to_sec: Option<f64> = None;
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(art_size, art_size),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        art_rounding,
+                                        Color32::from_rgb(32, 32, 40),
+                                    );
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "♫",
+                                        egui::FontId::proportional(64.0 * scale),
+                                        Color32::GRAY,
+                                    );
+                                }
+                            }
 
-                                    egui::ScrollArea::vertical()
-                                        .max_height(art_size - 80.0)
-                                        .show(ui, |ui| {
-                                            for (idx, line) in lyrics.lines.iter().enumerate() {
-                                                let is_active = Some(idx) == current_line_idx;
-                                                if is_active {
-                                                    let active_frame = egui::Frame::none()
-                                                        .fill(Color32::from_rgba_unmultiplied(
-                                                            29, 185, 84, 45,
-                                                        ))
-                                                        .rounding(Rounding::same(6.0))
-                                                        .inner_margin(egui::Margin::symmetric(
-                                                            10.0, 6.0,
-                                                        ));
-                                                    let resp = active_frame
-                                                        .show(ui, |ui| {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(
-                                                                    RichText::new("▶")
-                                                                        .size(13.0)
-                                                                        .color(accent)
-                                                                        .strong(),
-                                                                );
-                                                                ui.label(
-                                                                    RichText::new(&line.text)
-                                                                        .size(16.0)
-                                                                        .strong()
-                                                                        .color(Color32::WHITE),
-                                                                );
-                                                            });
-                                                        })
-                                                        .response;
+                            // Flexible gap pushes all controls comfortably to the bottom
+                            ui.add_space(flexible_gap);
 
-                                                    if resp.clicked() {
-                                                        seek_to_sec = Some(line.seconds);
-                                                    }
-                                                    if self.settings.lyrics_auto_scroll {
-                                                        resp.scroll_to_me(Some(
-                                                            egui::Align::Center,
-                                                        ));
-                                                    }
-                                                } else {
-                                                    let is_past = current_line_idx
-                                                        .is_some_and(|cur| idx < cur);
-                                                    let text_color = if is_past {
-                                                        Color32::from_rgb(120, 120, 130)
-                                                    } else {
-                                                        Color32::from_rgb(205, 205, 215)
-                                                    };
-                                                    let resp = ui.add(
-                                                        egui::Label::new(
-                                                            RichText::new(&line.text)
-                                                                .size(13.0)
-                                                                .color(text_color),
-                                                        )
-                                                        .sense(egui::Sense::click()),
-                                                    );
-                                                    if resp.clicked() {
-                                                        seek_to_sec = Some(line.seconds);
-                                                    }
-                                                }
-                                                ui.add_space(4.0);
+                            // --- BOTTOM INTERFACE SECTION ---
+                            // Track metadata row: Title & Artist + Share & Heart (width = art_size)
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(art_size, 48.0 * scale),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new((art_size - 70.0).max(60.0), 48.0 * scale),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            if let Some(track) = &current_track {
+                                                ui.label(
+                                                    RichText::new(&track.title)
+                                                        .size((18.0 * scale).clamp(14.0, 20.0))
+                                                        .strong()
+                                                        .color(Color32::WHITE),
+                                                );
+                                                ui.label(
+                                                    RichText::new(&track.artist)
+                                                        .size((13.0 * scale).clamp(10.0, 14.0))
+                                                        .weak(),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new("Ничего не играет")
+                                                        .size(14.0)
+                                                        .weak(),
+                                                );
                                             }
-                                        });
+                                        },
+                                    );
 
-                                    if let Some(sec) = seek_to_sec {
-                                        self.player.seek(sec);
-                                        self.last_auto_sync = std::time::Instant::now();
-                                        self.trigger_auto_sync(&playback_info);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if let Some(track) = &current_track {
+                                                let is_liked = self.library.is_liked(&track.id);
+                                                let heart_color = if is_liked {
+                                                    Color32::from_rgb(244, 63, 94)
+                                                } else {
+                                                    Color32::GRAY
+                                                };
+                                                let heart_symbol = if is_liked { "♥" } else { "♡" };
+                                                let heart_btn = egui::Button::new(
+                                                    RichText::new(heart_symbol)
+                                                        .size((20.0 * scale).clamp(16.0, 22.0))
+                                                        .color(heart_color),
+                                                )
+                                                .frame(false);
+                                                if ui.add(heart_btn).clicked() {
+                                                    self.library.toggle_like(track.clone());
+                                                }
+
+                                                ui.add_space(6.0);
+
+                                                let share_resp = Self::draw_share_icon(ui, accent);
+                                                if share_resp
+                                                    .on_hover_text("Поделиться: копировать ссылку на трек")
+                                                    .clicked()
+                                                {
+                                                    let link = format!(
+                                                        "https://music.youtube.com/watch?v={}",
+                                                        track.id
+                                                    );
+                                                    ui.output_mut(|o| o.copied_text = link);
+                                                    self.status_message =
+                                                        Some("Ссылка скопирована!".to_string());
+                                                }
+                                            }
+                                        },
+                                    );
+                                },
+                            );
+
+                            ui.add_space((6.0 * scale).clamp(3.0, 6.0));
+
+                            // Progress Slider across the ENTIRE artwork width
+                            self.render_playback_slider(ui, art_size, (16.0 * scale).clamp(12.0, 18.0), &playback_info);
+
+                            ui.add_space(2.0);
+
+                            // Time labels flush with slider ends
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(art_size, 16.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let curr_str = Self::format_time(playback_info.position_secs);
+                                    let dur_str = if self.settings.show_remaining_time
+                                        && playback_info.duration_secs > playback_info.position_secs
+                                    {
+                                        format!(
+                                            "-{}",
+                                            Self::format_time(
+                                                playback_info.duration_secs - playback_info.position_secs
+                                            )
+                                        )
+                                    } else {
+                                        Self::format_time(playback_info.duration_secs)
+                                    };
+                                    ui.label(RichText::new(curr_str).size((11.0 * scale).clamp(9.0, 12.0)).weak());
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(RichText::new(dur_str).size((11.0 * scale).clamp(9.0, 12.0)).weak());
+                                        },
+                                    );
+                                },
+                            );
+
+                            let v_gap = (12.0 * scale).clamp(4.0, 14.0);
+                            ui.add_space(v_gap);
+
+                            // Controls row: Dynamically scaled buttons with window resize
+                            let side_btn_w = (48.0 * scale).clamp(32.0, 56.0);
+                            let side_btn_h = (44.0 * scale).clamp(32.0, 54.0);
+                            let side_icon_sz = (19.0 * scale).clamp(13.0, 22.0);
+
+                            let play_btn_w = (130.0 * scale).clamp(80.0, 160.0);
+                            let play_font_sz = (15.0 * scale).clamp(11.0, 17.0);
+                            let gap_btn = (12.0 * scale).clamp(6.0, 16.0);
+
+                            let playback_w = side_btn_w * 2.0 + play_btn_w + gap_btn * 2.0;
+                            let playback_pad = ((art_size - playback_w) / 2.0).max(0.0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(playback_pad);
+
+                                let prev_btn = egui::Button::new(
+                                    RichText::new("⏮").size(side_icon_sz).strong().color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(34, 34, 44))
+                                .rounding(Rounding::same(side_btn_h / 2.0));
+                                if ui.add_sized([side_btn_w, side_btn_h], prev_btn).clicked() {
+                                    self.play_prev();
+                                }
+
+                                ui.add_space(gap_btn);
+
+                                let (icon, text) = if playback_info.is_playing {
+                                    ("⏸", "Пауза")
+                                } else {
+                                    ("▶", "Играть")
+                                };
+                                let play_btn = egui::Button::new(
+                                    RichText::new(format!("{}  {}", icon, text))
+                                        .size(play_font_sz)
+                                        .color(Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(accent)
+                                .rounding(Rounding::same(side_btn_h / 2.0));
+                                if ui.add_sized([play_btn_w, side_btn_h], play_btn).clicked() {
+                                    self.player.toggle_pause();
+                                }
+
+                                ui.add_space(gap_btn);
+
+                                let next_btn = egui::Button::new(
+                                    RichText::new("⏭").size(side_icon_sz).strong().color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(34, 34, 44))
+                                .rounding(Rounding::same(side_btn_h / 2.0));
+                                if ui.add_sized([side_btn_w, side_btn_h], next_btn).clicked() {
+                                    self.play_next();
+                                }
+                            });
+
+                            ui.add_space(v_gap);
+
+                            // Bottom Action Icons Row (Queue, Shuffle, Lyrics, Repeat): Responsive
+                            let act_btn_w = (38.0 * scale).clamp(26.0, 44.0);
+                            let act_btn_h = (30.0 * scale).clamp(22.0, 36.0);
+                            let act_font_sz = (16.0 * scale).clamp(12.0, 18.0);
+                            let act_gap = (12.0 * scale).clamp(6.0, 14.0);
+                            let action_w = act_btn_w * 4.0 + act_gap * 3.0;
+                            let action_pad = ((art_size - action_w) / 2.0).max(0.0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(action_pad);
+
+                                let queue_btn = egui::Button::new(
+                                    RichText::new("☰").size(act_font_sz).color(Color32::WHITE),
+                                )
+                                .frame(false);
+                                if ui
+                                    .add_sized([act_btn_w, act_btn_h], queue_btn)
+                                    .on_hover_text("Очередь треков")
+                                    .clicked()
+                                {
+                                    self.active_tab = ActiveTab::Queue;
+                                }
+
+                                ui.add_space(act_gap);
+
+                                let shuffle_col = if self.shuffle_state {
+                                    accent
+                                } else {
+                                    Color32::GRAY
+                                };
+                                let shuffle_btn = egui::Button::new(
+                                    RichText::new("🔀").size(act_font_sz).color(shuffle_col),
+                                )
+                                .frame(false);
+                                if ui
+                                    .add_sized([act_btn_w, act_btn_h], shuffle_btn)
+                                    .on_hover_text("Перемешать очередь")
+                                    .clicked()
+                                {
+                                    self.shuffle_state = !self.shuffle_state;
+                                    if self.shuffle_state {
+                                        self.shuffle_queue();
+                                        self.status_message = Some("Очередь перемешана".to_string());
                                     }
                                 }
-                            } else {
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space((art_size / 2.0) - 50.0);
-                                    ui.label(
-                                        RichText::new("Текст песни загружается или недоступен")
-                                            .weak(),
-                                    );
-                                });
-                            }
-                        });
-                    } else if !self.settings.hide_player_thumbnail {
-                        if let Some(track) = &current_track {
-                            if let Some(thumb) = &track.thumbnail_url {
-                                let hd_thumb = InnertubeClient::upgrade_thumbnail_quality(thumb);
-                                ui.add(
-                                    egui::Image::new(&hd_thumb)
-                                        .fit_to_exact_size(Vec2::new(art_size, art_size))
-                                        .rounding(art_rounding),
-                                );
-                            } else {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(art_size, art_size),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    rect,
-                                    art_rounding,
-                                    Color32::from_rgb(32, 32, 40),
-                                );
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "♫",
-                                    egui::FontId::proportional(72.0),
-                                    Color32::GRAY,
-                                );
-                            }
-                        } else {
-                            let (rect, _) = ui.allocate_exact_size(
-                                Vec2::new(art_size, art_size),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(
-                                rect,
-                                art_rounding,
-                                Color32::from_rgb(32, 32, 40),
-                            );
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "♫",
-                                egui::FontId::proportional(72.0),
-                                Color32::GRAY,
-                            );
-                        }
-                    }
 
-                    // Flexible gap pushes all controls comfortably to the BOTTOM
-                    ui.add_space(flexible_gap);
+                                ui.add_space(act_gap);
 
-                    // --- BOTTOM INTERFACE SECTION ---
-                    // Track metadata row: Title & Artist + Share & Heart (width = art_size)
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(art_size, 52.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(art_size - 80.0, 48.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    if let Some(track) = &current_track {
-                                        ui.label(
-                                            RichText::new(&track.title)
-                                                .size(20.0)
-                                                .strong()
-                                                .color(Color32::WHITE),
-                                        );
-                                        ui.label(RichText::new(&track.artist).size(14.0).weak());
-                                    } else {
-                                        ui.label(
-                                            RichText::new("Ничего не играет").size(16.0).weak(),
-                                        );
-                                    }
-                                },
-                            );
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if let Some(track) = &current_track {
-                                        let is_liked = self.library.is_liked(&track.id);
-                                        let heart_color = if is_liked {
-                                            Color32::from_rgb(244, 63, 94)
-                                        } else {
-                                            Color32::GRAY
-                                        };
-                                        let heart_symbol = if is_liked { "♥" } else { "♡" };
-                                        let heart_btn = egui::Button::new(
-                                            RichText::new(heart_symbol)
-                                                .size(22.0)
-                                                .color(heart_color),
-                                        )
-                                        .frame(false);
-                                        if ui.add(heart_btn).clicked() {
-                                            self.library.toggle_like(track.clone());
-                                        }
-
-                                        ui.add_space(8.0);
-
-                                        let share_resp = Self::draw_share_icon(ui, accent);
-                                        if share_resp
-                                            .on_hover_text("Поделиться: копировать ссылку на трек")
-                                            .clicked()
-                                        {
-                                            let link = format!(
-                                                "https://music.youtube.com/watch?v={}",
-                                                track.id
-                                            );
-                                            ui.output_mut(|o| o.copied_text = link);
-                                            self.status_message =
-                                                Some("Ссылка скопирована!".to_string());
-                                        }
-                                    }
-                                },
-                            );
-                        },
-                    );
-
-                    ui.add_space(6.0);
-
-                    // Progress Slider across the ENTIRE artwork width
-                    self.render_playback_slider(ui, art_size, 18.0, &playback_info);
-
-                    ui.add_space(3.0);
-
-                    // Time labels flush with slider ends
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(art_size, 16.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            let curr_str = Self::format_time(playback_info.position_secs);
-                            let dur_str = if self.settings.show_remaining_time
-                                && playback_info.duration_secs > playback_info.position_secs
-                            {
-                                format!(
-                                    "-{}",
-                                    Self::format_time(
-                                        playback_info.duration_secs - playback_info.position_secs
-                                    )
+                                let lyrics_col = if self.show_lyrics_in_player {
+                                    accent
+                                } else {
+                                    Color32::WHITE
+                                };
+                                let lyrics_btn = egui::Button::new(
+                                    RichText::new("♫").size(act_font_sz).color(lyrics_col),
                                 )
-                            } else {
-                                Self::format_time(playback_info.duration_secs)
-                            };
-                            ui.label(RichText::new(curr_str).size(12.0).weak());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(RichText::new(dur_str).size(12.0).weak());
-                                },
-                            );
+                                .frame(false);
+                                if ui
+                                    .add_sized([act_btn_w, act_btn_h], lyrics_btn)
+                                    .on_hover_text(if self.show_lyrics_in_player {
+                                        "Скрыть текст песни"
+                                    } else {
+                                        "Показать текст песни вместо обложки"
+                                    })
+                                    .clicked()
+                                {
+                                    self.show_lyrics_in_player = !self.show_lyrics_in_player;
+                                }
+
+                                ui.add_space(act_gap);
+
+                                let (rep_icon, rep_col) = match self.repeat_mode {
+                                    1 => ("🔁", accent),
+                                    2 => ("🔂", accent),
+                                    _ => ("🔁", Color32::GRAY),
+                                };
+                                let rep_btn = egui::Button::new(
+                                    RichText::new(rep_icon).size(act_font_sz).color(rep_col),
+                                )
+                                .frame(false);
+                                if ui
+                                    .add_sized([act_btn_w, act_btn_h], rep_btn)
+                                    .on_hover_text("Режим повтора")
+                                    .clicked()
+                                {
+                                    self.repeat_mode = (self.repeat_mode + 1) % 3;
+                                }
+                            });
+
+                            ui.add_space(v_gap);
+
+                            // Volume slider row: Guaranteed visible, never cut off
+                            let vol_slider_w = (110.0 * scale).clamp(65.0, 130.0);
+                            let vol_row_w = vol_slider_w + 64.0;
+                            let vol_pad = ((art_size - vol_row_w) / 2.0).max(0.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(vol_pad);
+                                let vol_icon = if self.settings.volume == 0.0 {
+                                    "🔇"
+                                } else if self.settings.volume < 50.0 {
+                                    "🔉"
+                                } else {
+                                    "🔊"
+                                };
+                                let mute_btn =
+                                    egui::Button::new(RichText::new(vol_icon).size((14.0 * scale).clamp(12.0, 16.0))).frame(false);
+                                if ui
+                                    .add(mute_btn)
+                                    .on_hover_text("Без звука / Включить звук")
+                                    .clicked()
+                                {
+                                    if self.settings.volume > 0.0 {
+                                        self.settings.volume = 0.0;
+                                    } else {
+                                        self.settings.volume = 80.0;
+                                    }
+                                    self.player.set_volume(self.settings.volume);
+                                    self.settings.save();
+                                }
+                                let mut vol = self.settings.volume;
+                                let vol_slider = egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
+                                if ui.add_sized([vol_slider_w, 14.0], vol_slider).changed() {
+                                    self.settings.volume = vol;
+                                    self.player.set_volume(vol);
+                                    self.settings.save();
+                                }
+                                ui.label(RichText::new(format!("{}%", vol as u32)).size((11.0 * scale).clamp(9.0, 12.0)).weak());
+                            });
+
+                            ui.add_space(10.0);
                         },
                     );
-
-                    ui.add_space(14.0);
-
-                    // Controls row: Centered directly under cover & slider
-                    let playback_w = 56.0 + 16.0 + 160.0 + 16.0 + 56.0; // 304.0
-                    let playback_pad = ((art_size - playback_w) / 2.0).max(0.0);
-
-                    ui.horizontal(|ui| {
-                        ui.add_space(playback_pad);
-
-                        let prev_btn = egui::Button::new(
-                            RichText::new("⏮").size(22.0).strong().color(Color32::WHITE),
-                        )
-                        .fill(Color32::from_rgb(34, 34, 44))
-                        .rounding(Rounding::same(27.0));
-                        if ui.add_sized([56.0, 54.0], prev_btn).clicked() {
-                            self.play_prev();
-                        }
-
-                        ui.add_space(16.0);
-
-                        let (icon, text) = if playback_info.is_playing {
-                            ("⏸", "Пауза")
-                        } else {
-                            ("▶", "Играть")
-                        };
-                        let play_btn = egui::Button::new(
-                            RichText::new(format!("{}  {}", icon, text))
-                                .size(17.0)
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(accent)
-                        .rounding(Rounding::same(27.0));
-                        if ui.add_sized([160.0, 54.0], play_btn).clicked() {
-                            self.player.toggle_pause();
-                        }
-
-                        ui.add_space(16.0);
-
-                        let next_btn = egui::Button::new(
-                            RichText::new("⏭").size(22.0).strong().color(Color32::WHITE),
-                        )
-                        .fill(Color32::from_rgb(34, 34, 44))
-                        .rounding(Rounding::same(27.0));
-                        if ui.add_sized([56.0, 54.0], next_btn).clicked() {
-                            self.play_next();
-                        }
-                    });
-
-                    ui.add_space(16.0);
-
-                    // Bottom Action Icons Row (Queue, Shuffle, Lyrics, Repeat): Centered
-                    let action_w = 44.0 * 4.0 + 14.0 * 3.0; // 218.0
-                    let action_pad = ((art_size - action_w) / 2.0).max(0.0);
-
-                    ui.horizontal(|ui| {
-                        ui.add_space(action_pad);
-
-                        let queue_btn =
-                            egui::Button::new(RichText::new("☰").size(18.0).color(Color32::WHITE))
-                                .frame(false);
-                        if ui
-                            .add_sized([44.0, 36.0], queue_btn)
-                            .on_hover_text("Очередь треков")
-                            .clicked()
-                        {
-                            self.active_tab = ActiveTab::Queue;
-                        }
-
-                        ui.add_space(14.0);
-
-                        let shuffle_col = if self.shuffle_state {
-                            accent
-                        } else {
-                            Color32::GRAY
-                        };
-                        let shuffle_btn =
-                            egui::Button::new(RichText::new("🔀").size(18.0).color(shuffle_col))
-                                .frame(false);
-                        if ui
-                            .add_sized([44.0, 36.0], shuffle_btn)
-                            .on_hover_text("Перемешать очередь")
-                            .clicked()
-                        {
-                            self.shuffle_state = !self.shuffle_state;
-                            if self.shuffle_state {
-                                self.shuffle_queue();
-                                self.status_message = Some("Очередь перемешана".to_string());
-                            }
-                        }
-
-                        ui.add_space(14.0);
-
-                        let lyrics_col = if self.show_lyrics_in_player {
-                            accent
-                        } else {
-                            Color32::WHITE
-                        };
-                        let lyrics_btn =
-                            egui::Button::new(RichText::new("♫").size(18.0).color(lyrics_col))
-                                .frame(false);
-                        if ui
-                            .add_sized([44.0, 36.0], lyrics_btn)
-                            .on_hover_text(if self.show_lyrics_in_player {
-                                "Скрыть текст песни"
-                            } else {
-                                "Показать текст песни вместо обложки"
-                            })
-                            .clicked()
-                        {
-                            self.show_lyrics_in_player = !self.show_lyrics_in_player;
-                        }
-
-                        ui.add_space(14.0);
-
-                        let (rep_icon, rep_col) = match self.repeat_mode {
-                            1 => ("🔁", accent),
-                            2 => ("🔂", accent),
-                            _ => ("🔁", Color32::GRAY),
-                        };
-                        let rep_btn =
-                            egui::Button::new(RichText::new(rep_icon).size(18.0).color(rep_col))
-                                .frame(false);
-                        if ui
-                            .add_sized([44.0, 36.0], rep_btn)
-                            .on_hover_text("Режим повтора")
-                            .clicked()
-                        {
-                            self.repeat_mode = (self.repeat_mode + 1) % 3;
-                        }
-                    });
-
-                    ui.add_space(14.0);
-
-                    // Volume slider row: Centered with mute toggle & percentage
-                    let vol_row_w = 210.0;
-                    let vol_pad = ((art_size - vol_row_w) / 2.0).max(0.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(vol_pad);
-                        let vol_icon = if self.settings.volume == 0.0 {
-                            "🔇"
-                        } else if self.settings.volume < 50.0 {
-                            "🔉"
-                        } else {
-                            "🔊"
-                        };
-                        let mute_btn =
-                            egui::Button::new(RichText::new(vol_icon).size(15.0)).frame(false);
-                        if ui
-                            .add(mute_btn)
-                            .on_hover_text("Без звука / Включить звук")
-                            .clicked()
-                        {
-                            if self.settings.volume > 0.0 {
-                                self.settings.volume = 0.0;
-                            } else {
-                                self.settings.volume = 80.0;
-                            }
-                            self.player.set_volume(self.settings.volume);
-                            self.settings.save();
-                        }
-                        let mut vol = self.settings.volume;
-                        let vol_slider = egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false);
-                        if ui.add_sized([130.0, 14.0], vol_slider).changed() {
-                            self.settings.volume = vol;
-                            self.player.set_volume(vol);
-                            self.settings.save();
-                        }
-                        ui.label(RichText::new(format!("{}%", vol as u32)).size(11.0).weak());
-                    });
-                },
-            );
-        });
+                });
+            });
     }
 }

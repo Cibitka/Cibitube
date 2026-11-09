@@ -12,74 +12,133 @@ impl LyricsClient {
         }
     }
 
-    pub async fn fetch(&self, title: &str, artist: &str) -> Option<Lyrics> {
-        let clean_title = title.split('(').next()?.split('[').next()?.trim();
-        let clean_artist = artist.split('&').next()?.split(',').next()?.trim();
+    fn clean_string(s: &str) -> String {
+        let mut text = s.to_string();
+        for marker in &[
+            "(", "[", "feat.", "ft.", "prod.", "Official", "Video", "Audio",
+        ] {
+            if let Some(pos) = text.to_lowercase().find(&marker.to_lowercase()) {
+                text = text[..pos].to_string();
+            }
+        }
+        text.trim().to_string()
+    }
 
-        let url = format!(
+    fn parse_synced(json: &Value) -> Option<Lyrics> {
+        let synced = json.get("syncedLyrics").and_then(|v| v.as_str())?;
+        let mut lines = Vec::new();
+        for line in synced.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                if let Some(end_bracket) = trimmed.find(']') {
+                    let time_str = &trimmed[1..end_bracket];
+                    let text = trimmed[end_bracket + 1..].trim().to_string();
+                    if !text.is_empty() {
+                        if let Some(secs) = Self::parse_timestamp(time_str) {
+                            lines.push(LyricsLine {
+                                seconds: secs,
+                                text,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if !lines.is_empty() {
+            lines.sort_by(|a, b| {
+                a.seconds
+                    .partial_cmp(&b.seconds)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            return Some(Lyrics {
+                is_synced: true,
+                plain: json
+                    .get("plainLyrics")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                lines,
+            });
+        }
+        None
+    }
+
+    pub async fn fetch(&self, title: &str, artist: &str) -> Option<Lyrics> {
+        let clean_t = Self::clean_string(title);
+        let clean_a = Self::clean_string(artist);
+        let search_title = if clean_t.is_empty() { title } else { &clean_t };
+        let search_artist = if clean_a.is_empty() { artist } else { &clean_a };
+
+        // 1. Попытка прямого запроса /api/get
+        let get_url = format!(
             "https://lrclib.net/api/get?track_name={}&artist_name={}",
-            urlencoding::encode(clean_title),
-            urlencoding::encode(clean_artist),
+            urlencoding::encode(search_title),
+            urlencoding::encode(search_artist),
         );
 
-        let res = self
+        let mut fallback_plain = None;
+
+        if let Ok(res) = self
             .client
-            .get(&url)
+            .get(&get_url)
             .header(
                 "User-Agent",
                 "Metrolist-Desktop/0.1 (https://github.com/metrolistgroup/metrolist)",
             )
             .send()
             .await
-            .ok()?;
-
-        if !res.status().is_success() {
-            return None;
+        {
+            if res.status().is_success() {
+                if let Ok(json) = res.json::<Value>().await {
+                    if let Some(lyrics) = Self::parse_synced(&json) {
+                        return Some(lyrics);
+                    }
+                    if let Some(plain) = json.get("plainLyrics").and_then(|v| v.as_str()) {
+                        fallback_plain = Some(plain.to_string());
+                    }
+                }
+            }
         }
 
-        let json: Value = res.json().await.ok()?;
+        // 2. Fallback: поиск через /api/search при отсутствии точного совпадения
+        let search_query = format!("{} {}", search_title, search_artist);
+        let search_url = format!(
+            "https://lrclib.net/api/search?q={}",
+            urlencoding::encode(search_query.trim())
+        );
 
-        if let Some(synced) = json.get("syncedLyrics").and_then(|v| v.as_str()) {
-            let mut lines = Vec::new();
-            for line in synced.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('[') {
-                    if let Some(end_bracket) = trimmed.find(']') {
-                        let time_str = &trimmed[1..end_bracket];
-                        let text = trimmed[end_bracket + 1..].trim().to_string();
-                        if !text.is_empty() {
-                            if let Some(secs) = Self::parse_timestamp(time_str) {
-                                lines.push(LyricsLine {
-                                    seconds: secs,
-                                    text,
-                                });
+        if let Ok(res) = self
+            .client
+            .get(&search_url)
+            .header(
+                "User-Agent",
+                "Metrolist-Desktop/0.1 (https://github.com/metrolistgroup/metrolist)",
+            )
+            .send()
+            .await
+        {
+            if res.status().is_success() {
+                if let Ok(items) = res.json::<Vec<Value>>().await {
+                    // Ищем сначала синхронизированный трек
+                    for item in &items {
+                        if let Some(lyrics) = Self::parse_synced(item) {
+                            return Some(lyrics);
+                        }
+                        if fallback_plain.is_none() {
+                            if let Some(plain) = item.get("plainLyrics").and_then(|v| v.as_str()) {
+                                fallback_plain = Some(plain.to_string());
                             }
                         }
                     }
                 }
             }
-            if !lines.is_empty() {
-                lines.sort_by(|a, b| {
-                    a.seconds
-                        .partial_cmp(&b.seconds)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                return Some(Lyrics {
-                    is_synced: true,
-                    plain: json
-                        .get("plainLyrics")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    lines,
-                });
-            }
         }
 
-        if let Some(plain) = json.get("plainLyrics").and_then(|v| v.as_str()) {
+        // 3. Если синхронизированного нет, но есть обычный текст
+        if let Some(plain) = fallback_plain {
             return Some(Lyrics {
                 is_synced: false,
-                plain: plain.to_string(),
+                plain,
                 lines: Vec::new(),
             });
         }

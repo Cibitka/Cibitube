@@ -56,6 +56,7 @@ pub struct AppSettings {
     pub lyrics_change_on_tap: bool,
     pub lyrics_auto_scroll: bool,
     pub experimental_lyrics: bool,
+    pub lyrics_animation_mode: usize, // 0 = По буквам, 1 = По словам, 2 = По строчкам, 3 = Без анимации
 
     // 6. Навигация и экран
     pub hide_status_bar_fullscreen: bool,
@@ -165,6 +166,7 @@ impl Default for AppSettings {
             lyrics_change_on_tap: true,
             lyrics_auto_scroll: true,
             experimental_lyrics: false,
+            lyrics_animation_mode: 0,
 
             hide_status_bar_fullscreen: true,
             default_nav_tab: 0,
