@@ -42,20 +42,28 @@ impl LyricsClient {
         if let Some(synced) = json.get("syncedLyrics").and_then(|v| v.as_str()) {
             let mut lines = Vec::new();
             for line in synced.lines() {
-                if line.starts_with('[') && line.len() > 10 {
-                    if let Some(end_bracket) = line.find(']') {
-                        let time_str = &line[1..end_bracket];
-                        let text = line[end_bracket + 1..].trim().to_string();
-                        if let Some(secs) = Self::parse_timestamp(time_str) {
-                            lines.push(LyricsLine {
-                                seconds: secs,
-                                text,
-                            });
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') {
+                    if let Some(end_bracket) = trimmed.find(']') {
+                        let time_str = &trimmed[1..end_bracket];
+                        let text = trimmed[end_bracket + 1..].trim().to_string();
+                        if !text.is_empty() {
+                            if let Some(secs) = Self::parse_timestamp(time_str) {
+                                lines.push(LyricsLine {
+                                    seconds: secs,
+                                    text,
+                                });
+                            }
                         }
                     }
                 }
             }
             if !lines.is_empty() {
+                lines.sort_by(|a, b| {
+                    a.seconds
+                        .partial_cmp(&b.seconds)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 return Some(Lyrics {
                     is_synced: true,
                     plain: json

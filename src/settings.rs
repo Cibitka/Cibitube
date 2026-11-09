@@ -255,7 +255,6 @@ impl AppSettings {
                 if let Ok(mut f) = options.open(&tmp_path) {
                     if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
                         let _ = fs::rename(&tmp_path, path);
-                        return;
                     }
                 }
             }

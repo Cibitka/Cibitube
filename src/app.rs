@@ -76,6 +76,7 @@ pub struct MetrolistApp {
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: mpsc::Receiver<AppEvent>,
     sync_status_message: Option<String>,
+    last_auto_sync: std::time::Instant,
 }
 
 impl MetrolistApp {
@@ -145,6 +146,7 @@ impl MetrolistApp {
             event_tx,
             event_rx,
             sync_status_message: None,
+            last_auto_sync: std::time::Instant::now(),
         };
 
         app.apply_theme(&cc.egui_ctx);
@@ -293,6 +295,7 @@ impl MetrolistApp {
             self.current_index = Some(self.queue.len() - 1);
         }
         self.lyrics = None;
+        self.last_auto_sync = std::time::Instant::now();
     }
 
     fn shuffle_slice(slice: &mut [Track]) {
@@ -461,6 +464,45 @@ impl MetrolistApp {
         format!("{:02}:{:02}", mins, secs)
     }
 
+    fn trigger_auto_sync(&self, playback_info: &PlaybackInfo) {
+        if !self.settings.cross_device_sync_enabled {
+            return;
+        }
+        let Some(track) = self.current_track().cloned() else {
+            return;
+        };
+        let folder = self.settings.google_drive_sync_folder.clone();
+        let pos = playback_info.position_secs;
+        let dur = playback_info.duration_secs;
+        let is_playing = playback_info.is_playing;
+        let speed = self.settings.playback_speed;
+        let queue = self.queue.clone();
+        let current_idx = self.current_index.unwrap_or(0);
+        let repeat_str = if self.repeat_mode == 1 {
+            "one".to_string()
+        } else if self.repeat_mode == 2 {
+            "all".to_string()
+        } else {
+            "off".to_string()
+        };
+        let shuffle = self.shuffle_state;
+
+        std::thread::spawn(move || {
+            let _ = crate::sync::SyncManager::save_state_with_queue(
+                &folder,
+                &track,
+                pos,
+                dur,
+                is_playing,
+                speed,
+                &queue,
+                current_idx,
+                &repeat_str,
+                shuffle,
+            );
+        });
+    }
+
     fn render_playback_slider(
         &mut self,
         ui: &mut egui::Ui,
@@ -489,6 +531,8 @@ impl MetrolistApp {
                 let frac = ((mouse_pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                 let seek_target = frac as f64 * max_d;
                 self.player.seek(seek_target);
+                self.last_auto_sync = std::time::Instant::now();
+                self.trigger_auto_sync(playback_info);
             }
         }
 
@@ -690,6 +734,15 @@ impl eframe::App for MetrolistApp {
             .unwrap_or_default();
         // Repaint request for smooth progress animation
         ctx.request_repaint_after(std::time::Duration::from_millis(20));
+
+        // Periodic auto-sync to Google Drive (every ~4 seconds during playback)
+        if self.settings.cross_device_sync_enabled
+            && playback_info.is_playing
+            && self.last_auto_sync.elapsed() >= std::time::Duration::from_secs(4)
+        {
+            self.last_auto_sync = std::time::Instant::now();
+            self.trigger_auto_sync(&playback_info);
+        }
 
         // Poll events
         while let Ok(event) = self.event_rx.try_recv() {
@@ -1028,12 +1081,13 @@ impl eframe::App for MetrolistApp {
             let mut track_to_toggle_like = None;
 
             egui::TopBottomPanel::bottom("player_bar")
-                .exact_height(80.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(bar_bg)
-                        .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
-                )
+                .exact_height(82.0)
+                .frame(egui::Frame::none().fill(bar_bg).inner_margin(egui::Margin {
+                    left: 0.0,
+                    right: 0.0,
+                    top: 0.0,
+                    bottom: 6.0,
+                }))
                 .show(ctx, |ui| {
                     if !self.player.is_alive() {
                         ui.horizontal(|ui| {
@@ -1052,20 +1106,28 @@ impl eframe::App for MetrolistApp {
                         });
                     }
 
+                    // 1. Линия длины трека по всей ширине окна (полная длина)
                     let total_bar_w = ui.available_width();
-                    let left_w = (total_bar_w * 0.34).clamp(180.0, 340.0);
-                    let right_w = 120.0;
-                    let center_w = (total_bar_w - left_w - right_w - 20.0).max(180.0);
+                    self.render_playback_slider(ui, total_bar_w, 10.0, &playback_info);
+
+                    ui.add_space(2.0);
+
+                    // 2. Строка управления под прогресс-баром
+                    let row_w = ui.available_width();
+                    let left_w = (row_w * 0.34).clamp(180.0, 360.0);
+                    let right_w = 180.0;
+                    let center_w = (row_w - left_w - right_w - 20.0).max(160.0);
 
                     ui.horizontal(|ui| {
-                        // Left: Track thumbnail + Title & Artist + Pill Heart button [ ❤️ ]
+                        ui.add_space(14.0);
+
+                        // Слева: Обложка + Название и Автор
                         let rounding = Rounding::same(self.settings.album_art_rounding);
                         ui.allocate_ui_with_layout(
-                            Vec2::new(left_w, 64.0),
+                            Vec2::new(left_w, 60.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 if let Some(track) = &current_track_clone {
-                                    // Clicking cover art opens Now Playing screen
                                     let img_resp = if let Some(thumb) = &track.thumbnail_url {
                                         ui.add(
                                             egui::Image::new(thumb)
@@ -1098,7 +1160,6 @@ impl eframe::App for MetrolistApp {
 
                                     ui.add_space(8.0);
 
-                                    // Clicking title or artist opens Now Playing screen
                                     let text_resp = ui
                                         .vertical(|ui| {
                                             ui.label(
@@ -1116,41 +1177,17 @@ impl eframe::App for MetrolistApp {
                                     if text_resp.clicked() {
                                         open_now_playing = true;
                                     }
-
-                                    ui.add_space(8.0);
-
-                                    // Pill Heart button [ ❤️ ] matching user screenshot!
-                                    let is_liked = self.library.is_liked(&track.id);
-                                    let heart_color = if is_liked {
-                                        Color32::from_rgb(244, 63, 94)
-                                    } else {
-                                        Color32::from_rgb(160, 160, 175)
-                                    };
-                                    let heart_symbol = if is_liked { "♥" } else { "♡" };
-                                    let heart_btn = egui::Button::new(
-                                        RichText::new(heart_symbol).size(15.0).color(heart_color),
-                                    )
-                                    .fill(Color32::from_rgb(44, 44, 52))
-                                    .rounding(Rounding::same(6.0));
-                                    if ui
-                                        .add_sized([30.0, 26.0], heart_btn)
-                                        .on_hover_text("Понравилось")
-                                        .clicked()
-                                    {
-                                        track_to_toggle_like = Some(track.clone());
-                                    }
                                 } else {
                                     ui.label(RichText::new("Ничего не воспроизводится").weak());
                                 }
                             },
                         );
 
-                        // Center: Controls row & Time Slider underneath matching screenshot!
+                        // По центру: Кнопки управления (⏮ ▶/⏸ ⏭) и тайминг под ними
                         ui.allocate_ui_with_layout(
-                            Vec2::new(center_w, 68.0),
+                            Vec2::new(center_w, 60.0),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                // Row 1: Buttons
                                 ui.horizontal(|ui| {
                                     let prev_btn = egui::Button::new(
                                         RichText::new("⏮")
@@ -1175,10 +1212,12 @@ impl eframe::App for MetrolistApp {
                                             .color(Color32::WHITE)
                                             .strong(),
                                     )
-                                    .fill(Color32::from_rgb(29, 185, 84)) // Official Metrolist Emerald Accent!
+                                    .fill(Color32::from_rgb(29, 185, 84)) // Emerald Accent
                                     .rounding(Rounding::same(20.0));
                                     if ui.add_sized([40.0, 40.0], play_btn).clicked() {
                                         self.player.toggle_pause();
+                                        self.last_auto_sync = std::time::Instant::now();
+                                        self.trigger_auto_sync(&playback_info);
                                     }
                                     ui.add_space(14.0);
 
@@ -1196,54 +1235,30 @@ impl eframe::App for MetrolistApp {
 
                                 ui.add_space(2.0);
 
-                                // Row 2: Progress Slider with times directly underneath controls
-                                ui.horizontal(|ui| {
-                                    let curr_str = Self::format_time(playback_info.position_secs);
-                                    let dur_str = if self.settings.show_remaining_time
-                                        && playback_info.duration_secs > playback_info.position_secs
-                                    {
-                                        format!(
-                                            "-{}",
-                                            Self::format_time(
-                                                playback_info.duration_secs
-                                                    - playback_info.position_secs
-                                            )
+                                let curr_str = Self::format_time(playback_info.position_secs);
+                                let dur_str = if self.settings.show_remaining_time
+                                    && playback_info.duration_secs > playback_info.position_secs
+                                {
+                                    format!(
+                                        "-{}",
+                                        Self::format_time(
+                                            playback_info.duration_secs
+                                                - playback_info.position_secs
                                         )
-                                    } else {
-                                        Self::format_time(playback_info.duration_secs)
-                                    };
-
-                                    let time_width = 38.0;
-                                    let spacing = 6.0;
-                                    let slider_width =
-                                        (center_w - time_width * 2.0 - spacing * 2.0).max(80.0);
-                                    ui.spacing_mut().slider_width = slider_width;
-
-                                    ui.add_sized(
-                                        [time_width, 14.0],
-                                        egui::Label::new(RichText::new(curr_str).size(11.0).weak()),
-                                    );
-                                    ui.add_space(spacing);
-
-                                    self.render_playback_slider(
-                                        ui,
-                                        slider_width,
-                                        14.0,
-                                        &playback_info,
-                                    );
-                                    ui.add_space(spacing);
-
-                                    ui.add_sized(
-                                        [time_width, 14.0],
-                                        egui::Label::new(RichText::new(dur_str).size(11.0).weak()),
-                                    );
-                                });
+                                    )
+                                } else {
+                                    Self::format_time(playback_info.duration_secs)
+                                };
+                                let time_text = format!("{} / {}", curr_str, dur_str);
+                                ui.label(RichText::new(time_text).size(11.0).weak());
                             },
                         );
 
-                        // Right: Volume & Expand Fullscreen button
+                        // Справа: Кнопка «Сердечко» [ ♥ ], Громкость и Разворачивание
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Expand to Now Playing button
+                            ui.add_space(14.0);
+
+                            // Кнопка разворачивания экрана воспроизведения
                             let expand_btn = egui::Button::new(
                                 RichText::new("⛶")
                                     .size(16.0)
@@ -1269,6 +1284,31 @@ impl eframe::App for MetrolistApp {
                                 self.settings.save();
                             }
                             ui.label(RichText::new("🔊").size(13.0));
+
+                            ui.add_space(10.0);
+
+                            // Перемещенная вправо кнопка «Сердечко» [ ♥ ]
+                            if let Some(track) = &current_track_clone {
+                                let is_liked = self.library.is_liked(&track.id);
+                                let heart_color = if is_liked {
+                                    Color32::from_rgb(244, 63, 94)
+                                } else {
+                                    Color32::from_rgb(160, 160, 175)
+                                };
+                                let heart_symbol = if is_liked { "♥" } else { "♡" };
+                                let heart_btn = egui::Button::new(
+                                    RichText::new(heart_symbol).size(15.0).color(heart_color),
+                                )
+                                .fill(Color32::from_rgb(44, 44, 52))
+                                .rounding(Rounding::same(6.0));
+                                if ui
+                                    .add_sized([30.0, 26.0], heart_btn)
+                                    .on_hover_text("Понравилось")
+                                    .clicked()
+                                {
+                                    track_to_toggle_like = Some(track.clone());
+                                }
+                            }
                         });
                     });
                 });
@@ -1841,12 +1881,12 @@ impl MetrolistApp {
                     let btn = egui::Button::new(RichText::new("🔥  Топ треки").strong())
                         .fill(Color32::from_rgb(32, 32, 40))
                         .rounding(Rounding::same(8.0));
-                    if ui.add_sized([160.0, 36.0], btn).clicked() {
-                        if !self.library.liked_tracks.is_empty() {
-                            self.queue = self.library.liked_tracks.clone();
-                            if let Some(first) = self.library.liked_tracks.first().cloned() {
-                                self.play_track(first);
-                            }
+                    if ui.add_sized([160.0, 36.0], btn).clicked()
+                        && !self.library.liked_tracks.is_empty()
+                    {
+                        self.queue = self.library.liked_tracks.clone();
+                        if let Some(first) = self.library.liked_tracks.first().cloned() {
+                            self.play_track(first);
                         }
                     }
                 }
@@ -2071,31 +2111,68 @@ impl MetrolistApp {
             return;
         }
 
-        // Synced lyrics with auto-scroll
+        // Synced lyrics with auto-scroll and highlight
         let current_line_idx = lyrics.lines.iter().rposition(|l| l.seconds <= current_time);
+        let mut seek_to_sec: Option<f64> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, line) in lyrics.lines.iter().enumerate() {
                 let is_active = Some(idx) == current_line_idx;
-                let text = if is_active {
-                    RichText::new(&line.text).size(18.0).strong().color(accent)
-                } else if Some(idx) < current_line_idx {
-                    RichText::new(&line.text)
-                        .size(15.0)
-                        .color(Color32::from_rgb(120, 120, 130))
-                } else {
-                    RichText::new(&line.text)
-                        .size(15.0)
-                        .color(Color32::from_rgb(200, 200, 210))
-                };
+                if is_active {
+                    let active_frame = egui::Frame::none()
+                        .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+                    let resp = active_frame
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("▶").size(15.0).color(accent).strong());
+                                ui.label(
+                                    RichText::new(&line.text)
+                                        .size(19.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                            });
+                        })
+                        .response;
 
-                let resp = ui.label(text);
-                if is_active && self.settings.lyrics_auto_scroll {
-                    resp.scroll_to_me(Some(egui::Align::Center));
+                    if resp.clicked() {
+                        seek_to_sec = Some(line.seconds);
+                    }
+                    if self.settings.lyrics_auto_scroll {
+                        resp.scroll_to_me(Some(egui::Align::Center));
+                    }
+                } else {
+                    let is_past = current_line_idx.is_some_and(|cur| idx < cur);
+                    let text_color = if is_past {
+                        Color32::from_rgb(130, 130, 140)
+                    } else {
+                        Color32::from_rgb(215, 215, 225)
+                    };
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(&line.text).size(15.0).color(text_color))
+                            .sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() {
+                        seek_to_sec = Some(line.seconds);
+                    }
                 }
-                ui.add_space(8.0);
+                ui.add_space(6.0);
             }
         });
+
+        if let Some(sec) = seek_to_sec {
+            self.player.seek(sec);
+            self.last_auto_sync = std::time::Instant::now();
+            let playback_info = self
+                .player
+                .info
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            self.trigger_auto_sync(&playback_info);
+        }
     }
 
     fn render_downloads_tab(&mut self, ui: &mut egui::Ui) {
@@ -3252,32 +3329,78 @@ impl MetrolistApp {
                                         .lines
                                         .iter()
                                         .rposition(|l| l.seconds <= current_time);
+                                    let mut seek_to_sec: Option<f64> = None;
+
                                     egui::ScrollArea::vertical()
                                         .max_height(art_size - 80.0)
                                         .show(ui, |ui| {
                                             for (idx, line) in lyrics.lines.iter().enumerate() {
                                                 let is_active = Some(idx) == current_line_idx;
-                                                let text = if is_active {
-                                                    RichText::new(&line.text)
-                                                        .size(16.0)
-                                                        .strong()
-                                                        .color(accent)
-                                                } else if Some(idx) < current_line_idx {
-                                                    RichText::new(&line.text)
-                                                        .size(13.0)
-                                                        .color(Color32::from_rgb(120, 120, 130))
+                                                if is_active {
+                                                    let active_frame = egui::Frame::none()
+                                                        .fill(Color32::from_rgba_unmultiplied(
+                                                            29, 185, 84, 45,
+                                                        ))
+                                                        .rounding(Rounding::same(6.0))
+                                                        .inner_margin(egui::Margin::symmetric(
+                                                            10.0, 6.0,
+                                                        ));
+                                                    let resp = active_frame
+                                                        .show(ui, |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(
+                                                                    RichText::new("▶")
+                                                                        .size(13.0)
+                                                                        .color(accent)
+                                                                        .strong(),
+                                                                );
+                                                                ui.label(
+                                                                    RichText::new(&line.text)
+                                                                        .size(16.0)
+                                                                        .strong()
+                                                                        .color(Color32::WHITE),
+                                                                );
+                                                            });
+                                                        })
+                                                        .response;
+
+                                                    if resp.clicked() {
+                                                        seek_to_sec = Some(line.seconds);
+                                                    }
+                                                    if self.settings.lyrics_auto_scroll {
+                                                        resp.scroll_to_me(Some(
+                                                            egui::Align::Center,
+                                                        ));
+                                                    }
                                                 } else {
-                                                    RichText::new(&line.text)
-                                                        .size(13.0)
-                                                        .color(Color32::from_rgb(200, 200, 210))
-                                                };
-                                                let resp = ui.label(text);
-                                                if is_active && self.settings.lyrics_auto_scroll {
-                                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                                    let is_past = current_line_idx
+                                                        .is_some_and(|cur| idx < cur);
+                                                    let text_color = if is_past {
+                                                        Color32::from_rgb(120, 120, 130)
+                                                    } else {
+                                                        Color32::from_rgb(205, 205, 215)
+                                                    };
+                                                    let resp = ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&line.text)
+                                                                .size(13.0)
+                                                                .color(text_color),
+                                                        )
+                                                        .sense(egui::Sense::click()),
+                                                    );
+                                                    if resp.clicked() {
+                                                        seek_to_sec = Some(line.seconds);
+                                                    }
                                                 }
-                                                ui.add_space(6.0);
+                                                ui.add_space(4.0);
                                             }
                                         });
+
+                                    if let Some(sec) = seek_to_sec {
+                                        self.player.seek(sec);
+                                        self.last_auto_sync = std::time::Instant::now();
+                                        self.trigger_auto_sync(&playback_info);
+                                    }
                                 }
                             } else {
                                 ui.vertical_centered(|ui| {

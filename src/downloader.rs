@@ -37,6 +37,7 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    #[allow(clippy::type_complexity)]
     pub fn new() -> (Self, mpsc::Receiver<(Track, Result<String, String>)>) {
         let (task_tx, task_rx) = mpsc::channel::<DownloadTask>();
         let (result_tx, result_rx) = mpsc::channel::<(Track, Result<String, String>)>();
@@ -147,7 +148,7 @@ impl Downloader {
             details.push("Обложка");
         }
         if lyrics_saved {
-            details.push("Текст .LRC");
+            details.push("Текст");
         }
         Ok(format!(
             "Скачано ({}) в {}",

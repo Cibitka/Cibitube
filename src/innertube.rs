@@ -361,7 +361,7 @@ impl InnertubeClient {
                         .and_then(|arr| arr.last())
                         .and_then(|t| t.get("url"))
                         .and_then(|u| u.as_str())
-                        .map(|s| InnertubeClient::upgrade_thumbnail_quality(s));
+                        .map(InnertubeClient::upgrade_thumbnail_quality);
 
                     if !browse_id.is_empty()
                         && !title.eq_ignore_ascii_case("новый")
@@ -558,7 +558,7 @@ impl InnertubeClient {
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))
             .and_then(|u| u.as_str())
-            .map(|s| Self::upgrade_thumbnail_quality(s));
+            .map(Self::upgrade_thumbnail_quality);
 
         Some(Track {
             id: video_id,
@@ -601,7 +601,7 @@ impl InnertubeClient {
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))
             .and_then(|u| u.as_str())
-            .map(|s| Self::upgrade_thumbnail_quality(s));
+            .map(Self::upgrade_thumbnail_quality);
 
         Some(Track {
             id: video_id,
