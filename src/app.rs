@@ -4,13 +4,19 @@ use crate::downloader::Downloader;
 use crate::innertube::InnertubeClient;
 use crate::library::Library;
 use crate::lyrics::LyricsClient;
-use crate::models::{AccountProfile, ActiveTab, Lyrics, PlaybackInfo, Playlist, Track};
+use crate::models::{AccountProfile, ActiveTab, Lyrics, LyricsLine, PlaybackInfo, Playlist, Track};
 use crate::player::AudioPlayer;
 use crate::settings::AppSettings;
-use eframe::egui::{self, Color32, Pos2, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{self, pos2, Color32, Pos2, Rect, RichText, Rounding, Stroke, Vec2};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlagKind {
+    Russia,
+    UK,
+}
 
 enum AppEvent {
     SearchResults(Result<Vec<Track>, String>),
@@ -20,7 +26,13 @@ enum AppEvent {
         playlist_id: String,
         result: Result<Vec<Track>, String>,
     },
-    LyricsLoaded(Option<Lyrics>),
+    LyricsLoaded {
+        track_id: String,
+        req_id: u64,
+        lyrics: Option<Lyrics>,
+        is_upgraded: bool,
+    },
+    LocalLyricsFileSelected(std::path::PathBuf),
     DownloadFinished {
         track: Track,
         result: Result<String, String>,
@@ -71,6 +83,7 @@ pub struct MetrolistApp {
     queue: Vec<Track>,
     current_index: Option<usize>,
     lyrics: Option<Lyrics>,
+    lyrics_req_id: u64,
 
     // Channels
     event_tx: mpsc::Sender<AppEvent>,
@@ -143,6 +156,7 @@ impl MetrolistApp {
             queue: Vec::new(),
             current_index: None,
             lyrics: None,
+            lyrics_req_id: 0,
             event_tx,
             event_rx,
             sync_status_message: None,
@@ -255,9 +269,41 @@ impl MetrolistApp {
         self.current_index.and_then(|idx| self.queue.get(idx))
     }
 
+    fn find_local_track_file(&self, track: &Track) -> Option<std::path::PathBuf> {
+        let dir = std::path::PathBuf::from(&self.settings.download_dir);
+        if !dir.exists() {
+            return None;
+        }
+
+        let safe_title =
+            Downloader::sanitize_filename(&format!("{} - {}", track.artist, track.title));
+        for ext in &["mp3", "m4a", "opus", "flac", "webm", "wav"] {
+            let p = dir.join(format!("{safe_title}.{ext}"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+
+        let safe_title_only = Downloader::sanitize_filename(&track.title);
+        for ext in &["mp3", "m4a", "opus", "flac", "webm", "wav"] {
+            let p = dir.join(format!("{safe_title_only}.{ext}"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+
+        None
+    }
+
     fn play_track(&mut self, track: Track) {
-        let url = format!("https://www.youtube.com/watch?v={}", track.id);
-        self.player.play_url(&url);
+        // Мгновенное воспроизведение локального файла, если трек уже скачан (задержка 0.0с вместо 3-5с)
+        if let Some(local_path) = self.find_local_track_file(&track) {
+            let path_str = local_path.to_string_lossy().to_string();
+            self.player.play_url(&path_str);
+        } else {
+            let url = format!("https://www.youtube.com/watch?v={}", track.id);
+            self.player.play_url(&url);
+        }
 
         // Update library history
         self.library.add_history(track.clone());
@@ -276,16 +322,33 @@ impl MetrolistApp {
             });
         }
 
-        // Fetch lyrics in background
-        let client = Arc::clone(&self.lyrics_client);
-        let title = track.title.clone();
-        let artist = track.artist.clone();
-        let tx = self.event_tx.clone();
+        // 1. Проверяем наличие локального файла .lrc или .ttml в папке загрузок
+        let mut lyrics_loaded = false;
+        let dir = std::path::PathBuf::from(&self.settings.download_dir);
+        let safe_title =
+            Downloader::sanitize_filename(&format!("{} - {}", track.artist, track.title));
+        let safe_title_only = Downloader::sanitize_filename(&track.title);
 
-        tokio::spawn(async move {
-            let res = client.fetch(&title, &artist).await;
-            let _ = tx.send(AppEvent::LyricsLoaded(res));
-        });
+        for name in &[&safe_title, &safe_title_only] {
+            for ext in &["lrc", "ttml"] {
+                let p = dir.join(format!("{}.{}", name, ext));
+                if p.exists() {
+                    if let Some(loaded) = crate::lyrics::LocalFileAdapter::load_file(&p) {
+                        self.lyrics = Some(loaded);
+                        lyrics_loaded = true;
+                        break;
+                    }
+                }
+            }
+            if lyrics_loaded {
+                break;
+            }
+        }
+
+        // 2. Если локальный файл не найден, запускаем многоисточниковый поиск
+        if !lyrics_loaded {
+            self.start_lyrics_search_for_track(&track);
+        }
 
         // Add to queue if not present
         if let Some(pos) = self.queue.iter().position(|t| t.id == track.id) {
@@ -294,8 +357,139 @@ impl MetrolistApp {
             self.queue.push(track);
             self.current_index = Some(self.queue.len() - 1);
         }
-        self.lyrics = None;
         self.last_auto_sync = std::time::Instant::now();
+    }
+
+    fn start_lyrics_search_for_track(&mut self, track: &Track) {
+        self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
+        let req_id = self.lyrics_req_id;
+        let track_id = track.id.clone();
+        let title = track.title.clone();
+        let artist = track.artist.clone();
+        let mode = self.settings.lyrics_source_mode;
+        let client = Arc::clone(&self.lyrics_client);
+        let tx = self.event_tx.clone();
+        let dur_secs =
+            crate::lyrics::LrcParser::parse_timestamp(&track.duration_text).map(|ms| ms / 1000);
+
+        tokio::spawn(async move {
+            // 1. Проверяем локальный кэш
+            if let Some(cached) = client.get_cached(&title, &artist, dur_secs).await {
+                let has_word_sync = cached.is_word_synced();
+                let _ = tx.send(AppEvent::LyricsLoaded {
+                    track_id: track_id.clone(),
+                    req_id,
+                    lyrics: Some(cached),
+                    is_upgraded: false,
+                });
+                if has_word_sync || mode != 0 {
+                    return;
+                }
+            }
+
+            // 2. Если выбран конкретный источник вручную
+            if mode != 0 {
+                let res = client
+                    .fetch_direct_source(mode, &title, &artist, None, dur_secs)
+                    .await;
+                if let Some(ref l) = res {
+                    client.save_to_cache(&title, &artist, dur_secs, l).await;
+                }
+                let _ = tx.send(AppEvent::LyricsLoaded {
+                    track_id,
+                    req_id,
+                    lyrics: res,
+                    is_upgraded: false,
+                });
+                return;
+            }
+
+            // 3. Автоматический режим: сначала быстрый LRCLIB
+            let primary = client.fetch(&title, &artist).await;
+            let mut had_primary = false;
+            if let Some(ref l) = primary {
+                had_primary = true;
+                let _ = tx.send(AppEvent::LyricsLoaded {
+                    track_id: track_id.clone(),
+                    req_id,
+                    lyrics: Some(l.clone()),
+                    is_upgraded: false,
+                });
+                if l.is_word_synced() {
+                    client.save_to_cache(&title, &artist, dur_secs, l).await;
+                    return;
+                }
+            }
+
+            // 4. В фоне: ищем более подробную пословную/слоговую синхронизацию (TTML, QQ, LrcMux)
+            if let Some(richer) = client
+                .fetch_richer_sync(&title, &artist, None, dur_secs)
+                .await
+            {
+                client
+                    .save_to_cache(&title, &artist, dur_secs, &richer)
+                    .await;
+                let _ = tx.send(AppEvent::LyricsLoaded {
+                    track_id,
+                    req_id,
+                    lyrics: Some(richer),
+                    is_upgraded: true,
+                });
+            } else if !had_primary {
+                // Если LRCLIB и пословные не нашли, пробуем KuGou как резерв построчного текста
+                if let Some(fallback) = client
+                    .fetch_direct_source(4, &title, &artist, None, dur_secs)
+                    .await
+                {
+                    client
+                        .save_to_cache(&title, &artist, dur_secs, &fallback)
+                        .await;
+                    let _ = tx.send(AppEvent::LyricsLoaded {
+                        track_id,
+                        req_id,
+                        lyrics: Some(fallback),
+                        is_upgraded: false,
+                    });
+                } else {
+                    let _ = tx.send(AppEvent::LyricsLoaded {
+                        track_id,
+                        req_id,
+                        lyrics: None,
+                        is_upgraded: false,
+                    });
+                }
+            }
+        });
+        self.lyrics = None;
+    }
+
+    fn trigger_lyrics_search(&mut self) {
+        if let Some(track) = self.current_track().cloned() {
+            self.start_lyrics_search_for_track(&track);
+        }
+    }
+
+    fn pick_and_load_local_lyrics_file(&self) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let output = std::process::Command::new("zenity")
+                .args([
+                    "--file-selection",
+                    "--title=Выберите файл текста песни (.lrc, .ttml)",
+                    "--file-filter=Тексты песен (*.lrc *.ttml) | *.lrc *.ttml",
+                ])
+                .output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !path_str.is_empty() {
+                        let _ = tx.send(AppEvent::LocalLyricsFileSelected(
+                            std::path::PathBuf::from(path_str),
+                        ));
+                    }
+                }
+            }
+        });
     }
 
     fn shuffle_slice(slice: &mut [Track]) {
@@ -807,8 +1001,39 @@ impl eframe::App for MetrolistApp {
                         }
                     }
                 }
-                AppEvent::LyricsLoaded(lyrics) => {
-                    self.lyrics = lyrics;
+                AppEvent::LyricsLoaded {
+                    track_id,
+                    req_id,
+                    lyrics,
+                    is_upgraded,
+                } => {
+                    if req_id == self.lyrics_req_id
+                        && self.current_track().is_some_and(|t| t.id == track_id)
+                    {
+                        if let Some(mut new_lyrics) = lyrics {
+                            // Preserve manual user delay offset if one was set for current session
+                            if let Some(existing) = &self.lyrics {
+                                if existing.offset_ms != 0 {
+                                    new_lyrics.offset_ms = existing.offset_ms;
+                                }
+                            }
+                            self.lyrics = Some(new_lyrics);
+                        } else if !is_upgraded && self.lyrics.is_none() {
+                            self.lyrics = None;
+                        }
+                    }
+                }
+                AppEvent::LocalLyricsFileSelected(path) => {
+                    if let Some(lyrics) = crate::lyrics::LocalFileAdapter::load_file(&path) {
+                        self.status_message = Some(format!(
+                            "✓ Загружен текст: {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                        self.lyrics = Some(lyrics);
+                    } else {
+                        self.status_message =
+                            Some("Не удалось разобрать файл текста (.lrc или .ttml)".to_string());
+                    }
                 }
                 AppEvent::DownloadFinished { track, result } => match result {
                     Ok(msg) => {
@@ -2085,147 +2310,206 @@ impl MetrolistApp {
         }
     }
 
-    fn compute_line_progress(
-        line_text: &str,
-        line_start: f64,
-        next_start: f64,
-        current_time: f64,
-    ) -> f32 {
-        let lead_time = 0.22;
-        let cur = current_time + lead_time;
-        if cur <= line_start {
-            return 0.0;
-        }
-        let word_count = line_text.split_whitespace().count().max(1);
-        let char_count = line_text.chars().count().max(1);
-        let raw_gap = (next_start - line_start).max(0.4);
-        let vocal_dur = (word_count as f64 * 0.36)
-            .max(char_count as f64 * 0.075)
-            .clamp(1.0, 5.0);
-        let line_dur = raw_gap.min(vocal_dur);
-        ((cur - line_start) / line_dur).clamp(0.0, 1.0) as f32
-    }
-
-    fn render_active_lyric_text(
+    fn render_active_lyric_line(
         &self,
         ui: &mut egui::Ui,
-        text: &str,
-        progress: f32,
+        line: &LyricsLine,
+        current_ms: i64,
         font_size: f32,
     ) {
-        match self.settings.lyrics_animation_mode {
-            // 0 = По буквам (караоке-заливка)
-            0 => {
-                let chars: Vec<char> = text.chars().collect();
-                let total = chars.len();
-                let sung_len = ((progress * total as f32).round() as usize).min(total);
-                let sung: String = chars[..sung_len].iter().collect();
-                let unsung: String = chars[sung_len..].iter().collect();
+        let mut job = egui::text::LayoutJob::default();
+        if self.settings.lyrics_position == 0 {
+            job.halign = egui::Align::Center;
+        }
+        job.wrap.max_width = ui.available_width().max(100.0);
 
-                let mut job = egui::text::LayoutJob::default();
-                if self.settings.lyrics_position == 0 {
-                    job.halign = egui::Align::Center;
-                }
-                if !sung.is_empty() {
+        let color_sung = Color32::WHITE;
+        let color_unsung = Color32::from_rgb(175, 175, 185); // Solid readable light silver!
+
+        if let Some(ref words) = line.words {
+            for word in words {
+                let is_fully_sung = (current_ms as u64) >= word.end_ms;
+                let is_unsung = (current_ms as u64) < word.start_ms;
+
+                if is_fully_sung {
                     job.append(
-                        &sung,
+                        &word.text,
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(font_size),
-                            color: Color32::WHITE,
+                            color: color_sung,
                             ..Default::default()
                         },
                     );
-                }
-                if !unsung.is_empty() {
+                } else if is_unsung {
                     job.append(
-                        &unsung,
+                        &word.text,
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(font_size),
-                            color: Color32::from_rgba_unmultiplied(210, 210, 225, 95),
+                            color: color_unsung,
                             ..Default::default()
                         },
                     );
-                }
-                ui.label(job);
-            }
-            // 1 = По словам
-            1 => {
-                let mut words_with_space = Vec::new();
-                let mut cur = String::new();
-                for c in text.chars() {
-                    cur.push(c);
-                    if c.is_whitespace() {
-                        words_with_space.push(cur.clone());
-                        cur.clear();
+                } else {
+                    match self.settings.lyrics_animation_mode {
+                        // 0 = По буквам (караоке-заливка внутри текущего слова)
+                        0 => {
+                            let dur = (word.end_ms - word.start_ms).max(1);
+                            let frac = ((current_ms as u64 - word.start_ms) as f32 / dur as f32)
+                                .clamp(0.0, 1.0);
+                            let chars: Vec<char> = word.text.chars().collect();
+                            let sung_len =
+                                ((frac * chars.len() as f32).round() as usize).min(chars.len());
+                            let sung_part: String = chars[..sung_len].iter().collect();
+                            let unsung_part: String = chars[sung_len..].iter().collect();
+
+                            if !sung_part.is_empty() {
+                                job.append(
+                                    &sung_part,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::proportional(font_size),
+                                        color: color_sung,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            if !unsung_part.is_empty() {
+                                job.append(
+                                    &unsung_part,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::proportional(font_size),
+                                        color: color_unsung,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
+                        // 1 = По словам (текущее слово сразу белое)
+                        _ => {
+                            job.append(
+                                &word.text,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::proportional(font_size),
+                                    color: color_sung,
+                                    ..Default::default()
+                                },
+                            );
+                        }
                     }
                 }
-                if !cur.is_empty() {
-                    words_with_space.push(cur);
-                }
-
-                let total = words_with_space.len();
-                let sung_count = ((progress * total as f32).ceil() as usize).min(total);
-                let sung: String = words_with_space[..sung_count].concat();
-                let unsung: String = words_with_space[sung_count..].concat();
-
-                let mut job = egui::text::LayoutJob::default();
-                if self.settings.lyrics_position == 0 {
-                    job.halign = egui::Align::Center;
-                }
-                if !sung.is_empty() {
-                    job.append(
-                        &sung,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(font_size),
-                            color: Color32::WHITE,
-                            ..Default::default()
-                        },
-                    );
-                }
-                if !unsung.is_empty() {
-                    job.append(
-                        &unsung,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(font_size),
-                            color: Color32::from_rgba_unmultiplied(210, 210, 225, 95),
-                            ..Default::default()
-                        },
-                    );
-                }
-                ui.label(job);
             }
-            // 2 = По строчкам
-            2 => {
-                let pulse = (progress * std::f32::consts::PI).sin() * 0.2 + 0.8;
-                let c = (255.0 * pulse).clamp(180.0, 255.0) as u8;
-                ui.label(
-                    RichText::new(text)
-                        .size(font_size)
-                        .strong()
-                        .color(Color32::from_rgb(c, c, c)),
-                );
-            }
-            // 3 = Без анимации
-            _ => {
-                ui.label(
-                    RichText::new(text)
-                        .size(font_size)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-            }
+        } else {
+            // Построчный LRC без пословных тегов: строка подсвечивается целиком без выдуманных делений
+            job.append(
+                &line.text,
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(font_size),
+                    color: Color32::WHITE,
+                    ..Default::default()
+                },
+            );
         }
+        ui.label(job);
     }
 
     fn render_lyrics_tab(&mut self, ui: &mut egui::Ui, current_time: f64) {
         let accent = self.accent_color();
 
-        ui.label(RichText::new("♫ Текст песни").size(18.0).strong());
-        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("♫ Текст песни").size(18.0).strong());
+            if let Some(lyrics) = &self.lyrics {
+                let badge_text = format!("{} • {}", lyrics.source_name, lyrics.sync_type);
+                ui.label(
+                    RichText::new(badge_text)
+                        .size(11.0)
+                        .color(accent)
+                        .background_color(Color32::from_rgba_unmultiplied(29, 185, 84, 25)),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let current_source_name = match self.settings.lyrics_source_mode {
+                    0 => "Авто",
+                    1 => "LRCLIB",
+                    2 => "QQ",
+                    3 => "TTML",
+                    4 => "KuGou",
+                    5 => "LrcMux",
+                    _ => "Авто",
+                };
+                egui::ComboBox::from_id_salt("lyrics_source_combo_tab")
+                    .selected_text(current_source_name)
+                    .show_ui(ui, |ui| {
+                        let options = [
+                            (0, "Автоматически"),
+                            (1, "LRCLIB"),
+                            (2, "Better Lyrics (QQ)"),
+                            (3, "Better Lyrics (TTML)"),
+                            (4, "Better Lyrics (KuGou)"),
+                            (5, "LrcMux"),
+                        ];
+                        for (val, label) in options {
+                            if ui
+                                .selectable_label(self.settings.lyrics_source_mode == val, label)
+                                .clicked()
+                            {
+                                self.settings.lyrics_source_mode = val;
+                                self.settings.save();
+                                self.trigger_lyrics_search();
+                            }
+                        }
+                    });
+
+                if ui.button(RichText::new("↻ Повторить").size(11.0)).clicked() {
+                    self.trigger_lyrics_search();
+                }
+
+                if ui
+                    .button(RichText::new("📁 Загрузить файл").size(11.0))
+                    .clicked()
+                {
+                    self.pick_and_load_local_lyrics_file();
+                }
+            });
+        });
+
+        // Блок ручной регулировки задержки синхронизации
+        if let Some(ref mut lyrics) = self.lyrics {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Задержка текста:").size(11.0).weak());
+                if ui.small_button("-500мс").clicked() {
+                    lyrics.offset_ms -= 500;
+                }
+                if ui.small_button("-100мс").clicked() {
+                    lyrics.offset_ms -= 100;
+                }
+                let off_str = format!("{:+}", lyrics.offset_ms);
+                ui.label(RichText::new(off_str).size(11.0).strong().color(
+                    if lyrics.offset_ms == 0 {
+                        Color32::GRAY
+                    } else {
+                        accent
+                    },
+                ));
+                if ui.small_button("+100мс").clicked() {
+                    lyrics.offset_ms += 100;
+                }
+                if ui.small_button("+500мс").clicked() {
+                    lyrics.offset_ms += 500;
+                }
+                if lyrics.offset_ms != 0 && ui.small_button("0 (сброс)").clicked() {
+                    lyrics.offset_ms = 0;
+                }
+            });
+        }
+
+        ui.add_space(10.0);
 
         let Some(lyrics) = &self.lyrics else {
             ui.vertical_centered(|ui| {
@@ -2254,36 +2538,38 @@ impl MetrolistApp {
             return;
         }
 
-        // Synced lyrics with auto-scroll and highlight
-        let current_line_idx = lyrics.lines.iter().rposition(|l| l.seconds <= current_time);
+        let current_time_ms = ((current_time * 1000.0) as i64 + lyrics.offset_ms).max(0);
+        let current_line_idx = lyrics
+            .lines
+            .iter()
+            .rposition(|l| (l.start_ms as i64) <= current_time_ms);
         let mut seek_to_sec: Option<f64> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, line) in lyrics.lines.iter().enumerate() {
                 let is_active = Some(idx) == current_line_idx;
                 if is_active {
-                    let next_sec = if idx + 1 < lyrics.lines.len() {
-                        lyrics.lines[idx + 1].seconds
-                    } else {
-                        current_time + 4.0
-                    };
-                    let progress = Self::compute_line_progress(
-                        &line.text,
-                        line.seconds,
-                        next_sec,
-                        current_time,
-                    );
-
                     let active_frame = egui::Frame::none()
                         .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
                         .rounding(Rounding::same(8.0))
                         .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+
+                    let main_align = if self.settings.lyrics_position == 0 {
+                        egui::Align::Center
+                    } else {
+                        egui::Align::Min
+                    };
+
                     let resp = active_frame
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("▶").size(15.0).color(accent).strong());
-                                self.render_active_lyric_text(ui, &line.text, progress, 18.0);
-                            });
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center)
+                                    .with_main_align(main_align),
+                                |ui| {
+                                    ui.label(RichText::new("▶").size(15.0).color(accent).strong());
+                                    self.render_active_lyric_line(ui, line, current_time_ms, 18.0);
+                                },
+                            );
                         })
                         .response;
 
@@ -2300,10 +2586,14 @@ impl MetrolistApp {
                     } else {
                         Color32::from_rgb(215, 215, 225)
                     };
-                    let resp = ui.add(
-                        egui::Label::new(RichText::new(&line.text).size(15.0).color(text_color))
-                            .sense(egui::Sense::click()),
-                    );
+                    let label_widget =
+                        egui::Label::new(RichText::new(&line.text).size(15.0).color(text_color));
+                    let resp = if self.settings.lyrics_position == 0 {
+                        ui.vertical_centered(|ui| ui.add(label_widget.sense(egui::Sense::click())))
+                            .inner
+                    } else {
+                        ui.add(label_widget.sense(egui::Sense::click()))
+                    };
                     if resp.clicked() {
                         seek_to_sec = Some(line.seconds);
                     }
@@ -2410,6 +2700,147 @@ impl MetrolistApp {
         });
     }
 
+    fn draw_flag_button(
+        ui: &mut egui::Ui,
+        label: &str,
+        is_selected: bool,
+        flag: FlagKind,
+    ) -> egui::Response {
+        let desired_size = Vec2::new(76.0, 26.0);
+        let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            let rounding = Rounding::same(6.0);
+
+            // 1. Draw flag background
+            match flag {
+                FlagKind::Russia => {
+                    let h_third = rect.height() / 3.0;
+                    // White stripe
+                    let r1 = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + h_third));
+                    painter.rect_filled(
+                        r1,
+                        Rounding {
+                            nw: 6.0,
+                            ne: 6.0,
+                            sw: 0.0,
+                            se: 0.0,
+                        },
+                        Color32::from_rgb(255, 255, 255),
+                    );
+                    // Blue stripe (#0039A6)
+                    let r2 = Rect::from_min_max(
+                        pos2(rect.min.x, rect.min.y + h_third),
+                        pos2(rect.max.x, rect.min.y + 2.0 * h_third),
+                    );
+                    painter.rect_filled(r2, Rounding::ZERO, Color32::from_rgb(0, 57, 166));
+                    // Red stripe (#D52B1E)
+                    let r3 =
+                        Rect::from_min_max(pos2(rect.min.x, rect.min.y + 2.0 * h_third), rect.max);
+                    painter.rect_filled(
+                        r3,
+                        Rounding {
+                            nw: 0.0,
+                            ne: 0.0,
+                            sw: 6.0,
+                            se: 6.0,
+                        },
+                        Color32::from_rgb(213, 43, 30),
+                    );
+                }
+                FlagKind::UK => {
+                    // Navy blue base (#012169)
+                    painter.rect_filled(rect, rounding, Color32::from_rgb(1, 33, 105));
+
+                    // Diagonals (White)
+                    let stroke_white_diag = Stroke::new(4.0_f32, Color32::WHITE);
+                    painter.line_segment([rect.left_top(), rect.right_bottom()], stroke_white_diag);
+                    painter.line_segment([rect.left_bottom(), rect.right_top()], stroke_white_diag);
+
+                    // Diagonals (Red #C8102E)
+                    let stroke_red_diag = Stroke::new(2.0_f32, Color32::from_rgb(200, 16, 46));
+                    painter.line_segment([rect.left_top(), rect.right_bottom()], stroke_red_diag);
+                    painter.line_segment([rect.left_bottom(), rect.right_top()], stroke_red_diag);
+
+                    // Cross (White)
+                    let stroke_white_cross = Stroke::new(7.0_f32, Color32::WHITE);
+                    painter.line_segment(
+                        [
+                            pos2(rect.min.x, rect.center().y),
+                            pos2(rect.max.x, rect.center().y),
+                        ],
+                        stroke_white_cross,
+                    );
+                    painter.line_segment(
+                        [
+                            pos2(rect.center().x, rect.min.y),
+                            pos2(rect.center().x, rect.max.y),
+                        ],
+                        stroke_white_cross,
+                    );
+
+                    // Cross (Red #C8102E)
+                    let stroke_red_cross = Stroke::new(4.0_f32, Color32::from_rgb(200, 16, 46));
+                    painter.line_segment(
+                        [
+                            pos2(rect.min.x, rect.center().y),
+                            pos2(rect.max.x, rect.center().y),
+                        ],
+                        stroke_red_cross,
+                    );
+                    painter.line_segment(
+                        [
+                            pos2(rect.center().x, rect.min.y),
+                            pos2(rect.center().x, rect.max.y),
+                        ],
+                        stroke_red_cross,
+                    );
+                }
+            }
+
+            // 2. Glass pill overlay for label readability
+            let pill_size = Vec2::new(38.0, 18.0);
+            let pill_rect = Rect::from_center_size(rect.center(), pill_size);
+            painter.rect_filled(
+                pill_rect,
+                Rounding::same(4.0),
+                Color32::from_rgba_unmultiplied(10, 10, 15, 210),
+            );
+
+            // Text: RU or EN
+            painter.text(
+                pill_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+
+            // 3. Selection border / Hover
+            if is_selected {
+                painter.rect_stroke(
+                    rect,
+                    rounding,
+                    Stroke::new(2.5_f32, Color32::from_rgb(29, 185, 84)),
+                );
+            } else if resp.hovered() {
+                painter.rect_stroke(
+                    rect,
+                    rounding,
+                    Stroke::new(1.5_f32, Color32::from_rgb(220, 220, 230)),
+                );
+            } else {
+                painter.rect_filled(rect, rounding, Color32::from_rgba_unmultiplied(0, 0, 0, 70));
+                painter.rect_stroke(
+                    rect,
+                    rounding,
+                    Stroke::new(1.0_f32, Color32::from_rgb(60, 60, 70)),
+                );
+            }
+        }
+        resp
+    }
+
     fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let accent = self.accent_color();
         let strings = crate::i18n::tr(&self.settings.ui_language);
@@ -2425,12 +2856,12 @@ impl MetrolistApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let is_en = self.settings.ui_language == "en";
-                if ui.selectable_label(is_en, "🇬🇧 English").clicked() {
+                if Self::draw_flag_button(ui, "EN", is_en, FlagKind::UK).clicked() {
                     self.settings.ui_language = "en".to_string();
                     self.settings.save();
                 }
                 let is_ru = self.settings.ui_language == "ru";
-                if ui.selectable_label(is_ru, "🇷🇺 Русский").clicked() {
+                if Self::draw_flag_button(ui, "RU", is_ru, FlagKind::Russia).clicked() {
                     self.settings.ui_language = "ru".to_string();
                     self.settings.save();
                 }
@@ -2916,6 +3347,29 @@ impl MetrolistApp {
                                 if ui.selectable_label(self.settings.lyrics_animation_mode == i, *name).clicked() {
                                     self.settings.lyrics_animation_mode = i;
                                     self.settings.save();
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Источник текстов по умолчанию:");
+                            let sources = [
+                                (0, "Автоматически"),
+                                (1, "LRCLIB"),
+                                (2, "QQ"),
+                                (3, "TTML"),
+                                (4, "KuGou"),
+                                (5, "LrcMux"),
+                            ];
+                            for (val, name) in sources {
+                                if ui
+                                    .selectable_label(self.settings.lyrics_source_mode == val, name)
+                                    .clicked()
+                                {
+                                    self.settings.lyrics_source_mode = val;
+                                    self.settings.save();
+                                    self.trigger_lyrics_search();
                                 }
                             }
                         });
@@ -3459,6 +3913,14 @@ impl MetrolistApp {
                                                 .strong()
                                                 .color(accent),
                                         );
+                                        if let Some(lyrics) = &self.lyrics {
+                                            let badge_text = format!("{} • {}", lyrics.source_name, lyrics.sync_type);
+                                            ui.label(
+                                                RichText::new(badge_text)
+                                                    .size(10.0)
+                                                    .color(Color32::from_rgb(29, 185, 84)),
+                                            );
+                                        }
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -3467,6 +3929,13 @@ impl MetrolistApp {
                                                     .clicked()
                                                 {
                                                     self.show_lyrics_in_player = false;
+                                                }
+                                                if ui
+                                                    .button(RichText::new("↻").size(11.0))
+                                                    .on_hover_text("Повторить поиск текста")
+                                                    .clicked()
+                                                {
+                                                    self.trigger_lyrics_search();
                                                 }
                                             },
                                         );
@@ -3493,11 +3962,11 @@ impl MetrolistApp {
                                                     );
                                                 });
                                         } else {
-                                            let current_time = playback_info.position_secs;
+                                            let current_time_ms = ((playback_info.position_secs * 1000.0) as i64 + lyrics.offset_ms).max(0);
                                             let current_line_idx = lyrics
                                                 .lines
                                                 .iter()
-                                                .rposition(|l| l.seconds <= current_time);
+                                                .rposition(|l| (l.start_ms as i64) <= current_time_ms);
                                             let mut seek_to_sec: Option<f64> = None;
 
                                             egui::ScrollArea::vertical()
@@ -3506,28 +3975,27 @@ impl MetrolistApp {
                                                     for (idx, line) in lyrics.lines.iter().enumerate() {
                                                         let is_active = Some(idx) == current_line_idx;
                                                         if is_active {
-                                                            let next_sec = if idx + 1 < lyrics.lines.len() {
-                                                                lyrics.lines[idx + 1].seconds
-                                                            } else {
-                                                                current_time + 4.0
-                                                            };
-                                                            let progress = Self::compute_line_progress(
-                                                                &line.text,
-                                                                line.seconds,
-                                                                next_sec,
-                                                                current_time,
-                                                            );
-
                                                             let active_frame = egui::Frame::none()
                                                                 .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
                                                                 .rounding(Rounding::same(6.0))
                                                                 .inner_margin(egui::Margin::symmetric(10.0, 6.0));
+
+                                                            let main_align = if self.settings.lyrics_position == 0 {
+                                                                egui::Align::Center
+                                                            } else {
+                                                                egui::Align::Min
+                                                            };
+
                                                             let resp = active_frame
                                                                 .show(ui, |ui| {
-                                                                    ui.horizontal(|ui| {
-                                                                        ui.label(RichText::new("▶").size(13.0).color(accent).strong());
-                                                                        self.render_active_lyric_text(ui, &line.text, progress, 15.0);
-                                                                    });
+                                                                    ui.with_layout(
+                                                                        egui::Layout::left_to_right(egui::Align::Center)
+                                                                            .with_main_align(main_align),
+                                                                        |ui| {
+                                                                            ui.label(RichText::new("▶").size(13.0).color(accent).strong());
+                                                                            self.render_active_lyric_line(ui, line, current_time_ms, 15.0);
+                                                                        },
+                                                                    );
                                                                 })
                                                                 .response;
 
@@ -3544,14 +4012,17 @@ impl MetrolistApp {
                                                             } else {
                                                                 Color32::from_rgb(205, 205, 215)
                                                             };
-                                                            let resp = ui.add(
-                                                                egui::Label::new(
-                                                                    RichText::new(&line.text)
-                                                                        .size(13.0)
-                                                                        .color(text_color),
-                                                                )
-                                                                .sense(egui::Sense::click()),
+                                                            let label_widget = egui::Label::new(
+                                                                RichText::new(&line.text)
+                                                                    .size(13.0)
+                                                                    .color(text_color),
                                                             );
+                                                            let resp = if self.settings.lyrics_position == 0 {
+                                                                ui.vertical_centered(|ui| ui.add(label_widget.sense(egui::Sense::click())))
+                                                                    .inner
+                                                            } else {
+                                                                ui.add(label_widget.sense(egui::Sense::click()))
+                                                            };
                                                             if resp.clicked() {
                                                                 seek_to_sec = Some(line.seconds);
                                                             }

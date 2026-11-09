@@ -57,6 +57,8 @@ pub struct AppSettings {
     pub lyrics_auto_scroll: bool,
     pub experimental_lyrics: bool,
     pub lyrics_animation_mode: usize, // 0 = По буквам, 1 = По словам, 2 = По строчкам, 3 = Без анимации
+    pub lyrics_source_mode: usize, // 0 = Автоматически, 1 = LRCLIB, 2 = Better Lyrics (QQ), 3 = Better Lyrics (TTML), 4 = Better Lyrics (KuGou), 5 = LrcMux
+    pub lyrics_manual_offset_ms: i64,
 
     // 6. Навигация и экран
     pub hide_status_bar_fullscreen: bool,
@@ -167,6 +169,8 @@ impl Default for AppSettings {
             lyrics_auto_scroll: true,
             experimental_lyrics: false,
             lyrics_animation_mode: 0,
+            lyrics_source_mode: 0,
+            lyrics_manual_offset_ms: 0,
 
             hide_status_bar_fullscreen: true,
             default_nav_tab: 0,
