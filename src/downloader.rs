@@ -94,7 +94,9 @@ impl Downloader {
             .arg("--audio-quality")
             .arg("0")
             .arg("--embed-metadata")
-            .arg("--no-overwrites");
+            .arg("--no-overwrites")
+            .arg("--js-runtimes")
+            .arg("node");
 
         if opts.embed_cover {
             cmd.arg("--embed-thumbnail");
