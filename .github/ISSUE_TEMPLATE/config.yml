@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Идеи и вопросы / Ideas and questions
+    url: https://github.com/Cibitka/Cibitube/discussions
+    about: Предложения, вопросы и обсуждения / Suggestions, questions and discussions
+  - name: Уязвимость безопасности / Security vulnerability
+    url: https://github.com/Cibitka/Cibitube/security/advisories/new
+    about: Сообщайте об уязвимостях приватно, не в публичных issues / Report vulnerabilities privately, not in public issues

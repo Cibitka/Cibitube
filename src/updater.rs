@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -11,15 +13,20 @@ pub struct ReleaseAsset {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
+    pub html_url: Option<String>,
     pub name: Option<String>,
     pub body: Option<String>,
     pub assets: Vec<ReleaseAsset>,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct UpdateInfo {
     pub version: String,
+    pub release_page_url: String,
+    /// Ссылка на бинарник для автообновления (только Linux; на других ОС None)
     pub download_url: Option<String>,
+    pub apk_download_url: Option<String>,
     pub notes: String,
 }
 
@@ -27,179 +34,234 @@ pub struct Updater;
 
 impl Updater {
     pub const REPO: &'static str = "Cibitka/Cibitube";
+    pub const RELEASES_URL: &'static str = "https://github.com/Cibitka/Cibitube/releases";
     pub const CURRENT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    /// Checks if a newer version exists on GitHub
-    pub async fn check_for_update() -> Result<Option<UpdateInfo>, String> {
-        let client = reqwest::Client::builder()
+    fn http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
             .user_agent("Cibitube-Updater")
-            .timeout(std::time::Duration::from_secs(6))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn check_for_update() -> Result<Option<UpdateInfo>, String> {
+        let client = Self::http_client(8)?;
+        let url = format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            Self::REPO
+        );
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
             .map_err(|e| e.to_string())?;
 
-        let url = format!("https://api.github.com/repos/{}/releases/latest", Self::REPO);
-        let resp = client.get(&url).send().await;
-
-        if let Ok(res) = resp {
-            if res.status().is_success() {
-                if let Ok(release) = res.json::<GitHubRelease>().await {
-                    let remote_ver = release.tag_name.trim_start_matches('v');
-                    if Self::is_newer(remote_ver, Self::CURRENT_VERSION) {
-                        let dl_url = release.assets.iter()
-                            .find(|a| a.name == "metrolist" || a.name == "cibitube" || a.name.contains("linux"))
-                            .map(|a| a.browser_download_url.clone());
-
-                        return Ok(Some(UpdateInfo {
-                            version: release.tag_name,
-                            download_url: dl_url,
-                            notes: release.body.unwrap_or_default(),
-                        }));
-                    } else {
-                        return Ok(None);
-                    }
-                }
-            }
+        let status = resp.status();
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Err(
+                "Лимит запросов к GitHub API исчерпан. Откройте страницу релизов в браузере."
+                    .to_string(),
+            );
+        }
+        if !status.is_success() {
+            return Err(format!("GitHub API вернул статус: {status}"));
         }
 
-        // Fallback for private repo or rate limit: query remote tags via git ls-remote (uses SSH key)
-        let output = tokio::task::spawn_blocking(|| {
-            Command::new("git")
-                .args(["ls-remote", "--tags", "origin"])
-                .output()
-        }).await.map_err(|e| e.to_string())?;
-
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let mut latest_tag: Option<String> = None;
-                for line in stdout.lines() {
-                    if let Some(tag_ref) = line.split_whitespace().nth(1) {
-                        if let Some(tag) = tag_ref.strip_prefix("refs/tags/") {
-                            let clean_tag = tag.trim_end_matches("^{}");
-                            if clean_tag.starts_with('v') {
-                                let ver = clean_tag.trim_start_matches('v');
-                                if Self::is_newer(ver, Self::CURRENT_VERSION) {
-                                    latest_tag = Some(clean_tag.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(tag) = latest_tag {
-                    let dl_url = format!("https://github.com/{}/releases/download/{}/metrolist", Self::REPO, tag);
-                    return Ok(Some(UpdateInfo {
-                        version: tag,
-                        download_url: Some(dl_url),
-                        notes: "Свежий релиз из GitHub".to_string(),
-                    }));
-                }
-            }
+        let release = resp
+            .json::<GitHubRelease>()
+            .await
+            .map_err(|e| e.to_string())?;
+        let remote_ver = release.tag_name.trim_start_matches('v');
+        if !Self::is_newer(remote_ver, Self::CURRENT_VERSION) {
+            return Ok(None);
         }
 
-        Ok(None)
-    }
-
-    /// Compare semver-like versions
-    fn is_newer(remote: &str, current: &str) -> bool {
-        let parse_ver = |s: &str| -> Vec<u32> {
-            s.split('.')
-                .filter_map(|p| p.parse::<u32>().ok())
-                .collect()
+        // Автообновление бинарника поддерживается только на Linux (raw-файл "cibitube").
+        // На Windows/macOS в релизе лежат архивы: пользователь скачивает их вручную.
+        let download_url = if cfg!(target_os = "linux") {
+            release
+                .assets
+                .iter()
+                .find(|a| a.name == "cibitube")
+                .map(|a| a.browser_download_url.clone())
+        } else {
+            None
         };
-        let r = parse_ver(remote);
-        let c = parse_ver(current);
-        r > c
+
+        let apk_download_url = release
+            .assets
+            .iter()
+            .find(|a| a.name.ends_with(".apk"))
+            .map(|a| a.browser_download_url.clone());
+
+        Ok(Some(UpdateInfo {
+            version: release.tag_name,
+            release_page_url: release
+                .html_url
+                .unwrap_or_else(|| Self::RELEASES_URL.to_string()),
+            download_url,
+            apk_download_url,
+            notes: release.body.unwrap_or_default(),
+        }))
     }
 
-    /// Performs update: downloads new binary, sets +x, replaces current binary atomically
-    pub async fn apply_update(download_url: Option<String>) -> Result<(), String> {
-        let install_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/home/cibitka"))
-            .join(".local/bin/metrolist");
+    pub fn is_newer(remote: &str, current: &str) -> bool {
+        // Берём числовой префикс каждой части ("9-beta" -> 9) и выравниваем до 3 чисел
+        let parse_ver = |s: &str| -> Vec<u32> {
+            let mut v: Vec<u32> = s
+                .split('.')
+                .map(|p| {
+                    p.chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse::<u32>()
+                        .unwrap_or(0)
+                })
+                .collect();
+            if v.len() < 3 {
+                v.resize(3, 0);
+            }
+            v
+        };
+        parse_ver(remote) > parse_ver(current)
+    }
 
-        let symlink_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/home/cibitka"))
-            .join(".local/bin/cibitube");
-
-        let tmp_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/home/cibitka"))
-            .join(".local/bin/metrolist.download");
-
-        let mut downloaded = false;
-        if let Some(url) = download_url {
-            let client = reqwest::Client::builder()
-                .user_agent("Cibitube-Updater")
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .map_err(|e| e.to_string())?;
-
-            if let Ok(res) = client.get(&url).send().await {
-                if res.status().is_success() {
-                    if let Ok(bytes) = res.bytes().await {
-                        if bytes.len() > 1_000_000 {
-                            std::fs::write(&tmp_path, &bytes).map_err(|e| e.to_string())?;
-                            downloaded = true;
-                        }
-                    }
+    /// Сверка SHA-256 с файлом SHA256SUMS (формат `sha256sum`: "<hash>  <name>")
+    pub fn verify_sha256(bytes: &[u8], sums_file: &str, asset_name: &str) -> bool {
+        let computed = hex::encode(Sha256::digest(bytes));
+        for line in sums_file.lines() {
+            let mut parts = line.split_whitespace();
+            if let (Some(hash), Some(name)) = (parts.next(), parts.next()) {
+                if name.trim_start_matches('*') == asset_name {
+                    return hash.eq_ignore_ascii_case(&computed);
                 }
             }
         }
+        false
+    }
 
-        // If direct HTTP download was blocked (private repo), build via git & cargo
-        if !downloaded {
-            let tmp_dest = tmp_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let repo_dir = PathBuf::from("/home/cibitka/metrolist-desktop");
-                let pull = Command::new("git")
-                    .current_dir(&repo_dir)
-                    .args(["pull", "origin", "main"])
-                    .status();
-                if pull.is_err() || !pull.unwrap().success() {
-                    return Err("Не удалось загрузить изменения через git pull".to_string());
-                }
-                let build = Command::new("cargo")
-                    .current_dir(&repo_dir)
-                    .args(["build", "--release"])
-                    .status();
-                if build.is_err() || !build.unwrap().success() {
-                    return Err("Ошибка при компиляции новой версии".to_string());
-                }
-                let built_bin = repo_dir.join("target/release/metrolist-desktop");
-                if built_bin.exists() {
-                    let _ = std::fs::copy(&built_bin, &tmp_dest);
-                    let _ = Command::new("cargo").current_dir(&repo_dir).arg("clean").status();
-                    Ok(())
-                } else {
-                    Err("Скомпилированный бинарник не найден".to_string())
-                }
-            }).await.map_err(|e| e.to_string())??;
+    async fn get_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+        let res = client.get(url).send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("HTTP {}", res.status()));
+        }
+        res.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Путь к текущему исполняемому файлу (без суффикса " (deleted)" после замены на Linux)
+    fn exe_path() -> Result<PathBuf, String> {
+        let p = std::env::current_exe().map_err(|e| e.to_string())?;
+        let s = p.to_string_lossy();
+        Ok(PathBuf::from(s.trim_end_matches(" (deleted)")))
+    }
+
+    /// Скачивает новый бинарник, проверяет SHA-256 и ELF-заголовок, заменяет текущий файл
+    /// (с резервной копией `.bak`). Только Linux.
+    pub async fn apply_update(download_url: Option<String>) -> Result<(), String> {
+        if !cfg!(target_os = "linux") {
+            return Err(
+                "Автообновление доступно только на Linux. Скачайте новую версию со страницы релизов."
+                    .to_string(),
+            );
+        }
+        let url = download_url.ok_or_else(|| "URL для скачивания релиза не найден".to_string())?;
+        let (base, asset_name) = url
+            .rsplit_once('/')
+            .ok_or_else(|| "Некорректный URL релиза".to_string())?;
+
+        let client = Self::http_client(120)?;
+        let bytes = Self::get_bytes(&client, &url)
+            .await
+            .map_err(|e| format!("Ошибка скачивания: {e}"))?;
+
+        let sums = Self::get_bytes(&client, &format!("{base}/SHA256SUMS"))
+            .await
+            .map_err(|e| format!("Не удалось получить SHA256SUMS (обновление отменено): {e}"))?;
+        let sums_text = String::from_utf8_lossy(&sums);
+        if !Self::verify_sha256(&bytes, &sums_text, asset_name) {
+            return Err("Контрольная сумма SHA-256 не совпадает: обновление отменено".to_string());
         }
 
-        // Set executable permission (chmod +x)
+        if bytes.len() < 500_000 || !bytes.starts_with(b"\x7fELF") {
+            return Err("Скачанный файл не является исполняемым бинарником Linux".to_string());
+        }
+
+        Self::install_binary(&bytes)
+    }
+
+    fn install_binary(bytes: &[u8]) -> Result<(), String> {
+        let exe = Self::exe_path()?;
+        let backup = exe.with_extension("bak");
+        let tmp = exe.with_extension("new");
+
+        fs::write(&tmp, bytes)
+            .map_err(|e| format!("Не удалось записать {}: {e}", tmp.display()))?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("Не удалось выставить права: {e}"))?;
         }
 
-        // Atomically replace existing binary
-        std::fs::rename(&tmp_path, &install_path).map_err(|e| format!("Не удалось заменить файл: {}", e))?;
-
-        // Update symlink
-        let _ = std::fs::remove_file(&symlink_path);
-        #[cfg(unix)]
-        let _ = std::os::unix::fs::symlink(&install_path, &symlink_path);
-
-        Ok(())
+        let _ = fs::copy(&exe, &backup);
+        fs::rename(&tmp, &exe).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("Не удалось заменить бинарник {}: {e}", exe.display())
+        })
     }
 
-    /// Restarts application with new binary
+    pub fn open_releases_page() {
+        #[cfg(target_os = "linux")]
+        let _ = Command::new("xdg-open").arg(Self::RELEASES_URL).spawn();
+        #[cfg(target_os = "macos")]
+        let _ = Command::new("open").arg(Self::RELEASES_URL).spawn();
+        #[cfg(target_os = "windows")]
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", Self::RELEASES_URL])
+            .spawn();
+    }
+
     pub fn restart() {
-        let bin = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/home/cibitka"))
-            .join(".local/bin/metrolist");
-        let _ = Command::new(bin).spawn();
+        if let Ok(exe) = Self::exe_path() {
+            let _ = Command::new(exe).spawn();
+        }
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_newer() {
+        assert!(Updater::is_newer("0.2.10", "0.2.9"));
+        assert!(Updater::is_newer("0.3", "0.2.9"));
+        assert!(Updater::is_newer("0.3.0", "0.2.9"));
+        assert!(!Updater::is_newer("0.2.9", "0.2.9"));
+        assert!(!Updater::is_newer("0.2.8", "0.2.9"));
+        assert!(Updater::is_newer("0.2.10-beta", "0.2.9"));
+    }
+
+    #[test]
+    fn test_verify_sha256() {
+        let content = b"cibitube update binary test";
+        let hash = hex::encode(Sha256::digest(content));
+        let sums_file = format!("{}  cibitube\notherhash  otherfile", hash);
+        assert!(Updater::verify_sha256(content, &sums_file, "cibitube"));
+        assert!(!Updater::verify_sha256(
+            b"wrong bytes",
+            &sums_file,
+            "cibitube"
+        ));
+        assert!(!Updater::verify_sha256(content, &sums_file, "unknown"));
     }
 }

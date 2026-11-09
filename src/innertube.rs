@@ -1,6 +1,6 @@
 use crate::models::{AccountProfile, Playlist, Track};
 use serde_json::Value;
-use sha1::{Sha1, Digest};
+use sha1::{Digest, Sha1};
 
 pub struct InnertubeClient {
     client: reqwest::Client,
@@ -34,17 +34,15 @@ impl InnertubeClient {
 
     /// Helper to compute SAPISIDHASH auth header if SAPISID or __Secure-3PAPISID cookie exists
     fn get_sapisid_auth(cookie: &str) -> Option<(String, &'static str, &'static str)> {
-        let sapisid = cookie.split(';')
-            .map(|s| s.trim())
-            .find_map(|s| {
-                if let Some(val) = s.strip_prefix("SAPISID=") {
-                    Some(val)
-                } else if let Some(val) = s.strip_prefix("__Secure-3PAPISID=") {
-                    Some(val)
-                } else {
-                    None
-                }
-            })?;
+        let sapisid = cookie.split(';').map(|s| s.trim()).find_map(|s| {
+            if let Some(val) = s.strip_prefix("SAPISID=") {
+                Some(val)
+            } else if let Some(val) = s.strip_prefix("__Secure-3PAPISID=") {
+                Some(val)
+            } else {
+                None
+            }
+        })?;
 
         let origin = "https://music.youtube.com";
         let now = std::time::SystemTime::now()
@@ -89,16 +87,22 @@ impl InnertubeClient {
                 .json(&payload);
 
             if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                req = req.header("Authorization", auth)
-                         .header("Origin", origin)
-                         .header("Referer", referer);
+                req = req
+                    .header("Authorization", auth)
+                    .header("Origin", origin)
+                    .header("Referer", referer);
             }
 
             if let Ok(res) = req.send().await {
                 if let Ok(json) = res.json::<Value>().await {
                     let header = json.pointer("/actions/0/openPopupAction/popup/multiPageMenuRenderer/header/activeAccountHeaderRenderer");
-                    let name = header.and_then(|h| h.pointer("/accountName/runs/0/text")).and_then(|t| t.as_str());
-                    let email = header.and_then(|h| h.pointer("/email/runs/0/text")).and_then(|t| t.as_str()).unwrap_or("");
+                    let name = header
+                        .and_then(|h| h.pointer("/accountName/runs/0/text"))
+                        .and_then(|t| t.as_str());
+                    let email = header
+                        .and_then(|h| h.pointer("/email/runs/0/text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
 
                     if let Some(n) = name {
                         if !n.trim().is_empty() {
@@ -121,7 +125,13 @@ impl InnertubeClient {
         list
     }
 
-    pub async fn search(&self, query: &str, country: &str, cookie: &str, auth_user: usize) -> Result<Vec<Track>, String> {
+    pub async fn search(
+        &self,
+        query: &str,
+        country: &str,
+        cookie: &str,
+        auth_user: usize,
+    ) -> Result<Vec<Track>, String> {
         let payload = serde_json::json!({
             "context": {
                 "client": {
@@ -134,42 +144,52 @@ impl InnertubeClient {
             "query": query
         });
 
-        let mut req = self.client
-            .post(format!("https://music.youtube.com/youtubei/v1/search?prettyPrint=false&authuser={}", auth_user))
+        let mut req = self
+            .client
+            .post(format!(
+                "https://music.youtube.com/youtubei/v1/search?prettyPrint=false&authuser={}",
+                auth_user
+            ))
             .header("X-Goog-AuthUser", auth_user.to_string())
             .json(&payload);
 
         if !cookie.is_empty() {
             req = req.header("Cookie", cookie);
             if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                req = req.header("Authorization", auth)
-                         .header("Origin", origin)
-                         .header("Referer", referer);
+                req = req
+                    .header("Authorization", auth)
+                    .header("Origin", origin)
+                    .header("Referer", referer);
             }
         }
 
-        let res = req.send()
+        let res = req
+            .send()
             .await
             .map_err(|e| format!("Сетевая ошибка: {}", e))?;
 
-        let json: Value = res.json()
+        let json: Value = res
+            .json()
             .await
             .map_err(|e| format!("Ошибка парсинга ответа: {}", e))?;
 
         let mut tracks = Vec::new();
 
-        let tabs = json.pointer("/contents/tabbedSearchResultsRenderer/tabs")
+        let tabs = json
+            .pointer("/contents/tabbedSearchResultsRenderer/tabs")
             .and_then(|v| v.as_array());
 
         if let Some(tabs) = tabs {
             if let Some(tab0) = tabs.first() {
-                let sections = tab0.pointer("/tabRenderer/content/sectionListRenderer/contents")
+                let sections = tab0
+                    .pointer("/tabRenderer/content/sectionListRenderer/contents")
                     .and_then(|v| v.as_array());
 
                 if let Some(sections) = sections {
                     for section in sections {
                         if let Some(shelf) = section.get("musicShelfRenderer") {
-                            if let Some(contents) = shelf.get("contents").and_then(|v| v.as_array()) {
+                            if let Some(contents) = shelf.get("contents").and_then(|v| v.as_array())
+                            {
                                 for item in contents {
                                     if let Some(track) = Self::parse_item(item) {
                                         tracks.push(track);
@@ -189,9 +209,16 @@ impl InnertubeClient {
         Ok(tracks)
     }
 
-    pub async fn fetch_liked_music(&self, cookie: &str, auth_user: usize) -> Result<Vec<Track>, String> {
+    pub async fn fetch_liked_music(
+        &self,
+        cookie: &str,
+        auth_user: usize,
+    ) -> Result<Vec<Track>, String> {
         if cookie.is_empty() {
-            return Err("Для загрузки любимых треков с YouTube войдите в аккаунт во вкладке Настройки".to_string());
+            return Err(
+                "Для загрузки любимых треков с YouTube войдите в аккаунт во вкладке Настройки"
+                    .to_string(),
+            );
         }
 
         let payload = serde_json::json!({
@@ -206,8 +233,12 @@ impl InnertubeClient {
             "browseId": "FEmusic_liked_videos"
         });
 
-        let mut req = self.client
-            .post(format!("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}", auth_user))
+        let mut req = self
+            .client
+            .post(format!(
+                "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
+                auth_user
+            ))
             .header("Cookie", cookie)
             .header("X-YouTube-Client-Name", "67")
             .header("X-YouTube-Client-Version", "1.20240101.01.00")
@@ -215,25 +246,35 @@ impl InnertubeClient {
             .json(&payload);
 
         if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-            req = req.header("Authorization", auth)
-                     .header("Origin", origin)
-                     .header("Referer", referer);
+            req = req
+                .header("Authorization", auth)
+                .header("Origin", origin)
+                .header("Referer", referer);
         }
 
-        let res = req.send()
+        let res = req
+            .send()
             .await
             .map_err(|e| format!("Ошибка загрузки: {}", e))?;
 
         let json: Value = res.json().await.map_err(|e| e.to_string())?;
         let mut tracks = Vec::new();
 
-        if let Some(tabs) = json.pointer("/contents/singleColumnBrowseResultsRenderer/tabs").and_then(|v| v.as_array()) {
+        if let Some(tabs) = json
+            .pointer("/contents/singleColumnBrowseResultsRenderer/tabs")
+            .and_then(|v| v.as_array())
+        {
             for tab in tabs {
-                if let Some(sections) = tab.pointer("/tabRenderer/content/sectionListRenderer/contents").and_then(|v| v.as_array()) {
+                if let Some(sections) = tab
+                    .pointer("/tabRenderer/content/sectionListRenderer/contents")
+                    .and_then(|v| v.as_array())
+                {
                     for sec in sections {
-                        if let Some(items) = sec.pointer("/musicPlaylistShelfRenderer/contents")
+                        if let Some(items) = sec
+                            .pointer("/musicPlaylistShelfRenderer/contents")
                             .or_else(|| sec.pointer("/musicShelfRenderer/contents"))
-                            .and_then(|v| v.as_array()) {
+                            .and_then(|v| v.as_array())
+                        {
                             for item in items {
                                 if let Some(t) = Self::parse_item(item) {
                                     tracks.push(t);
@@ -248,7 +289,11 @@ impl InnertubeClient {
         Ok(tracks)
     }
 
-    pub async fn fetch_user_playlists(&self, cookie: &str, auth_user: usize) -> Result<Vec<Playlist>, String> {
+    pub async fn fetch_user_playlists(
+        &self,
+        cookie: &str,
+        auth_user: usize,
+    ) -> Result<Vec<Playlist>, String> {
         if cookie.is_empty() {
             return Err("Для загрузки плейлистов требуется войти в аккаунт".to_string());
         }
@@ -265,8 +310,12 @@ impl InnertubeClient {
             "browseId": "FEmusic_liked_playlists"
         });
 
-        let mut req = self.client
-            .post(format!("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}", auth_user))
+        let mut req = self
+            .client
+            .post(format!(
+                "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
+                auth_user
+            ))
             .header("Cookie", cookie)
             .header("X-YouTube-Client-Name", "67")
             .header("X-YouTube-Client-Version", "1.20240101.01.00")
@@ -274,9 +323,10 @@ impl InnertubeClient {
             .json(&payload);
 
         if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-            req = req.header("Authorization", auth)
-                     .header("Origin", origin)
-                     .header("Referer", referer);
+            req = req
+                .header("Authorization", auth)
+                .header("Origin", origin)
+                .header("Referer", referer);
         }
 
         let res = req.send().await.map_err(|e| e.to_string())?;
@@ -287,25 +337,37 @@ impl InnertubeClient {
         fn extract_playlists(val: &Value, out: &mut Vec<Playlist>) {
             if let Some(obj) = val.as_object() {
                 if let Some(it) = obj.get("musicTwoRowItemRenderer") {
-                    let title = it.pointer("/title/runs/0/text").and_then(|t| t.as_str()).unwrap_or("");
-                    let subtitle = it.pointer("/subtitle/runs")
+                    let title = it
+                        .pointer("/title/runs/0/text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let subtitle = it
+                        .pointer("/subtitle/runs")
                         .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|x| x.pointer("/text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(""))
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.pointer("/text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
                         .unwrap_or_default();
-                    let browse_id = it.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                    let browse_id = it
+                        .pointer("/navigationEndpoint/browseEndpoint/browseId")
                         .and_then(|b| b.as_str())
                         .unwrap_or("");
-                    let thumbnail = it.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
+                    let thumbnail = it
+                        .pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
                         .and_then(|v| v.as_array())
                         .and_then(|arr| arr.last())
                         .and_then(|t| t.get("url"))
                         .and_then(|u| u.as_str())
                         .map(|s| InnertubeClient::upgrade_thumbnail_quality(s));
 
-                    if !browse_id.is_empty() 
-                        && !title.eq_ignore_ascii_case("новый") 
+                    if !browse_id.is_empty()
+                        && !title.eq_ignore_ascii_case("новый")
                         && !title.eq_ignore_ascii_case("new playlist")
-                        && !out.iter().any(|p| p.id == browse_id) {
+                        && !out.iter().any(|p| p.id == browse_id)
+                    {
                         out.push(Playlist {
                             id: browse_id.to_string(),
                             title: title.to_string(),
@@ -340,8 +402,12 @@ impl InnertubeClient {
                 "browseId": "FEmusic_library_landing"
             });
 
-            let mut l_req = self.client
-                .post(format!("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}", auth_user))
+            let mut l_req = self
+                .client
+                .post(format!(
+                    "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
+                    auth_user
+                ))
                 .header("Cookie", cookie)
                 .header("X-YouTube-Client-Name", "67")
                 .header("X-YouTube-Client-Version", "1.20240101.01.00")
@@ -349,9 +415,10 @@ impl InnertubeClient {
                 .json(&landing_payload);
 
             if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                l_req = l_req.header("Authorization", auth)
-                             .header("Origin", origin)
-                             .header("Referer", referer);
+                l_req = l_req
+                    .header("Authorization", auth)
+                    .header("Origin", origin)
+                    .header("Referer", referer);
             }
 
             if let Ok(l_res) = l_req.send().await {
@@ -364,7 +431,12 @@ impl InnertubeClient {
         Ok(playlists)
     }
 
-    pub async fn fetch_playlist_tracks(&self, browse_id: &str, cookie: &str, auth_user: usize) -> Result<Vec<Track>, String> {
+    pub async fn fetch_playlist_tracks(
+        &self,
+        browse_id: &str,
+        cookie: &str,
+        auth_user: usize,
+    ) -> Result<Vec<Track>, String> {
         let actual_id = if browse_id.starts_with("VL") || browse_id.starts_with("FE") {
             browse_id.to_string()
         } else {
@@ -383,8 +455,12 @@ impl InnertubeClient {
             "browseId": actual_id
         });
 
-        let mut req = self.client
-            .post(format!("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}", auth_user))
+        let mut req = self
+            .client
+            .post(format!(
+                "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
+                auth_user
+            ))
             .header("Cookie", cookie)
             .header("X-YouTube-Client-Name", "67")
             .header("X-YouTube-Client-Version", "1.20240101.01.00")
@@ -393,9 +469,10 @@ impl InnertubeClient {
 
         if !cookie.is_empty() {
             if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                req = req.header("Authorization", auth)
-                         .header("Origin", origin)
-                         .header("Referer", referer);
+                req = req
+                    .header("Authorization", auth)
+                    .header("Origin", origin)
+                    .header("Referer", referer);
             }
         }
 
@@ -432,9 +509,12 @@ impl InnertubeClient {
 
         let flex = r.get("flexColumns")?.as_array()?;
         let col0 = flex.first()?;
-        let runs0 = col0.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")?.as_array()?;
-        
-        let title = runs0.iter()
+        let runs0 = col0
+            .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")?
+            .as_array()?;
+
+        let title = runs0
+            .iter()
             .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join("");
@@ -443,8 +523,12 @@ impl InnertubeClient {
         let mut duration = String::new();
 
         if flex.len() > 1 {
-            if let Some(runs1) = flex[1].pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs").and_then(|v| v.as_array()) {
-                let parts: Vec<&str> = runs1.iter()
+            if let Some(runs1) = flex[1]
+                .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")
+                .and_then(|v| v.as_array())
+            {
+                let parts: Vec<&str> = runs1
+                    .iter()
                     .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
                     .filter(|&t| t != " • ")
                     .collect();
@@ -468,7 +552,8 @@ impl InnertubeClient {
                     .map(|s| s.to_string())
             })?;
 
-        let thumbnail = r.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+        let thumbnail = r
+            .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))
@@ -478,23 +563,30 @@ impl InnertubeClient {
         Some(Track {
             id: video_id,
             title,
-            artist: if artist.is_empty() { "Неизвестный исполнитель".to_string() } else { artist },
+            artist: if artist.is_empty() {
+                "Неизвестный исполнитель".to_string()
+            } else {
+                artist
+            },
             duration_text: duration,
             thumbnail_url: thumbnail,
         })
     }
 
     fn parse_card(card: &Value) -> Option<Track> {
-        let title = card.pointer("/title/runs/0/text")
+        let title = card
+            .pointer("/title/runs/0/text")
             .and_then(|v| v.as_str())?
             .to_string();
 
-        let artist = card.pointer("/subtitle/runs/0/text")
+        let artist = card
+            .pointer("/subtitle/runs/0/text")
             .and_then(|v| v.as_str())
             .unwrap_or("Неизвестный")
             .to_string();
 
-        let video_id = card.pointer("/buttons/0/buttonRenderer/command/watchEndpoint/videoId")
+        let video_id = card
+            .pointer("/buttons/0/buttonRenderer/command/watchEndpoint/videoId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| {
@@ -503,7 +595,8 @@ impl InnertubeClient {
                     .map(|s| s.to_string())
             })?;
 
-        let thumbnail = card.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+        let thumbnail = card
+            .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))
@@ -534,7 +627,10 @@ mod tests {
 
         for authuser in [0, 1] {
             let res = client.fetch_user_playlists(&cookie, authuser).await;
-            println!("Fetch user playlists result (authuser={}): {:?}", authuser, res);
+            println!(
+                "Fetch user playlists result (authuser={}): {:?}",
+                authuser, res
+            );
             assert!(res.is_ok());
         }
     }

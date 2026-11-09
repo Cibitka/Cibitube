@@ -49,14 +49,17 @@ impl DiscordRpc {
                             let handshake = json!({
                                 "v": 1,
                                 "client_id": METROLIST_CLIENT_ID
-                            }).to_string();
+                            })
+                            .to_string();
 
                             if send_packet(&mut stream, 0, &handshake).is_ok() {
                                 let _ = read_response(&mut stream);
                                 current_stream = Some(stream);
 
                                 // Resend last activity if any
-                                if let (Some(s), Some(act)) = (current_stream.as_mut(), &last_activity) {
+                                if let (Some(s), Some(act)) =
+                                    (current_stream.as_mut(), &last_activity)
+                                {
                                     send_activity(s, act);
                                 }
                             }
@@ -83,7 +86,8 @@ impl DiscordRpc {
                                     "pid": std::process::id()
                                 },
                                 "nonce": "clear"
-                            }).to_string();
+                            })
+                            .to_string();
                             let _ = send_packet(stream, 1, &payload);
                             let _ = read_response(stream);
                         }
@@ -173,7 +177,8 @@ fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
             "activity": activity_obj
         },
         "nonce": "metrolist-update"
-    }).to_string();
+    })
+    .to_string();
 
     if send_packet(stream, 1, &payload).is_err() {
         return false;
@@ -183,7 +188,8 @@ fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
 }
 
 fn get_socket_path() -> Option<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
+    let runtime_dir =
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
     for i in 0..10 {
         let path = PathBuf::from(format!("{}/discord-ipc-{}", runtime_dir, i));
         if path.exists() {

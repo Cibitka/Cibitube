@@ -22,8 +22,13 @@ impl LyricsClient {
             urlencoding::encode(clean_artist),
         );
 
-        let res = self.client.get(&url)
-            .header("User-Agent", "Metrolist-Desktop/0.1 (https://github.com/metrolistgroup/metrolist)")
+        let res = self
+            .client
+            .get(&url)
+            .header(
+                "User-Agent",
+                "Metrolist-Desktop/0.1 (https://github.com/metrolistgroup/metrolist)",
+            )
             .send()
             .await
             .ok()?;
@@ -42,7 +47,10 @@ impl LyricsClient {
                         let time_str = &line[1..end_bracket];
                         let text = line[end_bracket + 1..].trim().to_string();
                         if let Some(secs) = Self::parse_timestamp(time_str) {
-                            lines.push(LyricsLine { seconds: secs, text });
+                            lines.push(LyricsLine {
+                                seconds: secs,
+                                text,
+                            });
                         }
                     }
                 }
@@ -50,7 +58,11 @@ impl LyricsClient {
             if !lines.is_empty() {
                 return Some(Lyrics {
                     is_synced: true,
-                    plain: json.get("plainLyrics").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    plain: json
+                        .get("plainLyrics")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     lines,
                 });
             }

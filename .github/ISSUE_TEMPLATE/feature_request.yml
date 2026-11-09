@@ -1,0 +1,32 @@
+name: Предложить идею / Feature request
+description: Что можно добавить или улучшить / What could be added or improved
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу вы хотите решить / What problem do you want to solve
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы работать / How could it work
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Альтернативы / Alternatives you considered
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Платформа / Platform
+      options:
+        - Linux
+        - Windows
+        - macOS
+        - Android
+        - Любая / Any
+    validations:
+      required: true

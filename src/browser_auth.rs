@@ -48,7 +48,12 @@ impl BrowserAuth {
             .arg("|||")
             .arg(query)
             .output()
-            .map_err(|e| format!("Ошибка вызова sqlite3: {}. Убедитесь, что пакет sqlite3 установлен.", e))?;
+            .map_err(|e| {
+                format!(
+                    "Ошибка вызова sqlite3: {}. Убедитесь, что пакет sqlite3 установлен.",
+                    e
+                )
+            })?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -56,7 +61,8 @@ impl BrowserAuth {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut cookie_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut cookie_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         for line in stdout.lines() {
             let parts: Vec<&str> = line.split("|||").collect();
@@ -94,7 +100,11 @@ mod tests {
     #[test]
     fn test_extract_firefox_cookies() {
         let res = BrowserAuth::extract_firefox_cookies();
-        assert!(res.is_ok(), "Expected cookies extraction to succeed: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "Expected cookies extraction to succeed: {:?}",
+            res.err()
+        );
         let cookies = res.unwrap();
         assert!(cookies.contains("SAPISID") || cookies.contains("LOGIN_INFO"));
     }

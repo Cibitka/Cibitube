@@ -1,0 +1,51 @@
+name: Сообщить об ошибке / Bug report
+description: Что-то работает неправильно / Something does not work as expected
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо, что сообщаете об ошибке! / Thanks for reporting a bug!
+
+        **Важно / Important:** НЕ прикладывайте `settings.json`, куки, токены, скриншоты с вашим аккаунтом. Do NOT attach `settings.json`, cookies, tokens or screenshots showing your account.
+  - type: input
+    id: version
+    attributes:
+      label: Версия Cibitube / Cibitube version
+      description: Настройки → О приложении, или `cibitube --version` / Settings → About
+      placeholder: "0.2.9"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Система / OS
+      description: Например / e.g. Arch Linux, Hyprland (Wayland)
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Что произошло / What happened
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как воспроизвести / Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что ожидалось / Expected behavior
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Диагностика / Diagnostics
+      description: Настройки → Обратная связь → «Скопировать диагностику», затем вставьте сюда / Settings → Feedback → "Copy diagnostics", then paste here
+      render: text

@@ -1,4 +1,4 @@
-name: Build & Release
+name: Build & Release Cibitube
 
 on:
   push:
@@ -10,8 +10,32 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            bin_name: cibitube
+            archive_name: cibitube-linux-x86_64.tar.gz
+            is_linux: true
+            experimental: false
+          - os: windows-latest
+            target: windows-x86_64
+            bin_name: cibitube.exe
+            archive_name: cibitube-windows-x86_64.zip
+            is_linux: false
+            experimental: true
+          - os: macos-latest
+            target: macos-arm64
+            bin_name: cibitube
+            archive_name: cibitube-macos-arm64.tar.gz
+            is_linux: false
+            experimental: true
+
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
 
     steps:
       - name: Checkout code
@@ -20,7 +44,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install system dependencies
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libssl-dev pkg-config
@@ -28,23 +53,108 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package binary
+      - name: Package desktop binary
+        shell: bash
         run: |
           mkdir -p dist
-          BIN_PATH="target/release/cibitube"
-          if [ ! -f "$BIN_PATH" ]; then
-            BIN_PATH="target/release/metrolist-desktop"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/release/cibitube.exe" "dist/cibitube.exe"
+            7z a "dist/${{ matrix.archive_name }}" "./dist/cibitube.exe"
+            rm -f "dist/cibitube.exe"
+          elif [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            # Загружаем raw-бинарник 'cibitube' ТОЛЬКО из Linux-джобы, чтобы не перезаписать его Mach-O бинарником macOS!
+            cp "target/release/cibitube" "dist/cibitube"
+            chmod +x "dist/cibitube"
+            tar -czvf "dist/${{ matrix.archive_name }}" -C dist cibitube
+          else
+            # macOS: упаковываем в архив, raw файл не выкладываем во избежание коллизии имен с Linux
+            mkdir -p dist-mac
+            cp "target/release/cibitube" "dist-mac/cibitube"
+            chmod +x "dist-mac/cibitube"
+            tar -czvf "dist/${{ matrix.archive_name }}" -C dist-mac cibitube
+            rm -rf dist-mac
           fi
-          cp "$BIN_PATH" dist/metrolist
-          cp "$BIN_PATH" dist/cibitube
-          chmod +x dist/metrolist dist/cibitube
-          tar -czvf dist/cibitube-linux-x86_64.tar.gz -C dist cibitube metrolist
+
+      - name: Upload Desktop Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/*
+
+  build-android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        if: hashFiles('android/gradlew') != ''
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build Release Android APK
+        if: hashFiles('android/gradlew') != ''
+        shell: bash
+        run: |
+          mkdir -p dist-apk
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+          RAW_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          cd ..
+          if [ -n "$RAW_APK" ] && [ -f "$RAW_APK" ]; then
+            BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+            "$BUILD_TOOLS_DIR/zipalign" -p -f -v 4 "$RAW_APK" "dist-apk/cibitube-aligned.apk"
+            # Если в Secrets настроен Android Keystore — подписываем релиз
+            if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+              echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > cibitube-release.keystore
+              "$BUILD_TOOLS_DIR/apksigner" sign                 --ks cibitube-release.keystore                 --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}"                 --ks-pass pass:"${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"                 --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}"                 --v1-signing-enabled true                 --v2-signing-enabled true                 --v3-signing-enabled true                 --out "dist-apk/cibitube-android.apk"                 "dist-apk/cibitube-aligned.apk"
+              rm -f cibitube-release.keystore "dist-apk/cibitube-aligned.apk"
+            else
+              echo "::warning::ANDROID_KEYSTORE_BASE64 secret is not set. Publishing unsigned aligned APK."
+              mv "dist-apk/cibitube-aligned.apk" "dist-apk/cibitube-android.apk"
+            fi
+          fi
+
+      - name: Upload Signed Android APK Artifact
+        if: hashFiles('android/gradlew') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist-apk/cibitube-android.apk
+          if-no-files-found: ignore
+
+  publish-release:
+    # Зависим от build-desktop; если android нет, релиз публикуется без сбоя
+    needs: [build-desktop]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download android artifact (optional)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: android-apk
+          path: release-assets
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: |
-            dist/cibitube-linux-x86_64.tar.gz
-            dist/cibitube
-            dist/metrolist
+          files: release-assets/*
+

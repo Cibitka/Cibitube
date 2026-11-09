@@ -1,9 +1,15 @@
 [package]
 name = "cibitube"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
+description = "Fast native YouTube Music client written in Rust"
+license = "MIT"
+repository = "https://github.com/Cibitka/Cibitube"
+readme = "README.md"
+keywords = ["youtube-music", "player", "egui", "rust", "audio"]
 
 [dependencies]
+# --- Исходные зависимости 0.2.8 (не удалять: на них опирается app.rs и остальной код) ---
 eframe = "0.30"
 egui_extras = { version = "0.30", features = ["all_loaders"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -14,3 +20,14 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "sync", "macros", "ti
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2.1"
 dirs = "5.0"
+
+# --- Новое в 0.2.9 ---
+sha2 = "0.10"   # проверка SHA-256 в апдейтере
+hex = "0.4"     # hex-кодирование хэша
+chrono = "0.4"  # метки времени в sync.rs
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
