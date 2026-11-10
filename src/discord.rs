@@ -204,7 +204,10 @@ fn connect_rpc_stream(path: &Path) -> std::io::Result<RpcStream> {
 
 #[cfg(windows)]
 fn connect_rpc_stream(path: &Path) -> std::io::Result<RpcStream> {
-    std::fs::OpenOptions::new().read(true).write(true).open(path)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
 }
 
 #[cfg(not(any(unix, windows)))]

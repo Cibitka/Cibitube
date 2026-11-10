@@ -84,6 +84,7 @@ pub struct MetrolistApp {
     current_index: Option<usize>,
     lyrics: Option<Lyrics>,
     lyrics_req_id: u64,
+    is_local_lyrics: bool,
 
     // Channels
     event_tx: mpsc::Sender<AppEvent>,
@@ -159,6 +160,7 @@ impl MetrolistApp {
             current_index: None,
             lyrics: None,
             lyrics_req_id: 0,
+            is_local_lyrics: false,
             event_tx,
             event_rx,
             sync_status_message: None,
@@ -171,7 +173,9 @@ impl MetrolistApp {
         app.player.set_volume(app.settings.volume);
 
         // Восстановление последнего сеанса (очередь, трек, точная секунда, повтор/шаффл)
-        if let Some(state) = crate::sync::SyncManager::load_state(&app.settings.google_drive_sync_folder) {
+        if let Some(state) =
+            crate::sync::SyncManager::load_state(&app.settings.google_drive_sync_folder)
+        {
             let restored_queue: Vec<Track> = state
                 .queue
                 .iter()
@@ -209,7 +213,7 @@ impl MetrolistApp {
                     app.player.play_url(&track_target);
                     app.player.toggle_pause(); // оставляем на паузе при старте
                     app.player.seek(state.position_secs); // перематываем на сохраненную секунду
-                    app.start_lyrics_search_for_track(&track);
+                    app.start_lyrics_search_for_track(&track, false);
                 }
             }
         }
@@ -381,7 +385,9 @@ impl MetrolistApp {
                 let p = dir.join(format!("{}.{}", name, ext));
                 if p.exists() {
                     if let Some(loaded) = crate::lyrics::LocalFileAdapter::load_file(&p) {
+                        self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
                         self.lyrics = Some(loaded);
+                        self.is_local_lyrics = true;
                         lyrics_loaded = true;
                         break;
                     }
@@ -394,7 +400,8 @@ impl MetrolistApp {
 
         // 2. Если локальный файл не найден, запускаем многоисточниковый поиск
         if !lyrics_loaded {
-            self.start_lyrics_search_for_track(&track);
+            self.is_local_lyrics = false;
+            self.start_lyrics_search_for_track(&track, false);
         }
 
         // Add to queue if not present
@@ -407,7 +414,8 @@ impl MetrolistApp {
         self.last_auto_sync = std::time::Instant::now();
     }
 
-    fn start_lyrics_search_for_track(&mut self, track: &Track) {
+    fn start_lyrics_search_for_track(&mut self, track: &Track, bypass_cache: bool) {
+        self.is_local_lyrics = false;
         self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
         let req_id = self.lyrics_req_id;
         let track_id = track.id.clone();
@@ -420,17 +428,19 @@ impl MetrolistApp {
             crate::lyrics::LrcParser::parse_timestamp(&track.duration_text).map(|ms| ms / 1000);
 
         tokio::spawn(async move {
-            // 1. Проверяем локальный кэш
-            if let Some(cached) = client.get_cached(&title, &artist, dur_secs).await {
-                let has_word_sync = cached.is_word_synced();
-                let _ = tx.send(AppEvent::LyricsLoaded {
-                    track_id: track_id.clone(),
-                    req_id,
-                    lyrics: Some(cached),
-                    is_upgraded: false,
-                });
-                if has_word_sync || mode != 0 {
-                    return;
+            // 1. Проверяем локальный кэш соответствующего режима (если поиск не принудительно без кэша)
+            if !bypass_cache {
+                if let Some(cached) = client.get_cached(mode, &title, &artist, dur_secs).await {
+                    let has_word_sync = cached.is_word_synced();
+                    let _ = tx.send(AppEvent::LyricsLoaded {
+                        track_id: track_id.clone(),
+                        req_id,
+                        lyrics: Some(cached),
+                        is_upgraded: false,
+                    });
+                    if has_word_sync || mode != 0 {
+                        return;
+                    }
                 }
             }
 
@@ -440,7 +450,9 @@ impl MetrolistApp {
                     .fetch_direct_source(mode, &title, &artist, None, dur_secs)
                     .await;
                 if let Some(ref l) = res {
-                    client.save_to_cache(&title, &artist, dur_secs, l).await;
+                    client
+                        .save_to_cache(mode, &title, &artist, dur_secs, l)
+                        .await;
                 }
                 let _ = tx.send(AppEvent::LyricsLoaded {
                     track_id,
@@ -451,8 +463,10 @@ impl MetrolistApp {
                 return;
             }
 
-            // 3. Автоматический режим: сначала быстрый LRCLIB
-            let primary = client.fetch(&title, &artist).await;
+            // 3. Автоматический режим: сначала LRCLIB с переданной длительностью и метаданными
+            let primary = client
+                .fetch_with_meta(&title, &artist, None, dur_secs)
+                .await;
             let mut had_primary = false;
             if let Some(ref l) = primary {
                 had_primary = true;
@@ -463,7 +477,7 @@ impl MetrolistApp {
                     is_upgraded: false,
                 });
                 if l.is_word_synced() {
-                    client.save_to_cache(&title, &artist, dur_secs, l).await;
+                    client.save_to_cache(0, &title, &artist, dur_secs, l).await;
                     return;
                 }
             }
@@ -474,7 +488,7 @@ impl MetrolistApp {
                 .await
             {
                 client
-                    .save_to_cache(&title, &artist, dur_secs, &richer)
+                    .save_to_cache(0, &title, &artist, dur_secs, &richer)
                     .await;
                 let _ = tx.send(AppEvent::LyricsLoaded {
                     track_id,
@@ -482,14 +496,18 @@ impl MetrolistApp {
                     lyrics: Some(richer),
                     is_upgraded: true,
                 });
-            } else if !had_primary {
+            } else if had_primary {
+                if let Some(ref l) = primary {
+                    client.save_to_cache(0, &title, &artist, dur_secs, l).await;
+                }
+            } else {
                 // Если LRCLIB и пословные не нашли, пробуем KuGou как резерв построчного текста
                 if let Some(fallback) = client
                     .fetch_direct_source(4, &title, &artist, None, dur_secs)
                     .await
                 {
                     client
-                        .save_to_cache(&title, &artist, dur_secs, &fallback)
+                        .save_to_cache(0, &title, &artist, dur_secs, &fallback)
                         .await;
                     let _ = tx.send(AppEvent::LyricsLoaded {
                         track_id,
@@ -510,9 +528,10 @@ impl MetrolistApp {
         self.lyrics = None;
     }
 
-    fn trigger_lyrics_search(&mut self) {
+    fn trigger_lyrics_search(&mut self, bypass_cache: bool) {
+        self.is_local_lyrics = false;
         if let Some(track) = self.current_track().cloned() {
-            self.start_lyrics_search_for_track(&track);
+            self.start_lyrics_search_for_track(&track, bypass_cache);
         }
     }
 
@@ -691,7 +710,12 @@ impl MetrolistApp {
 
     fn download_track(&mut self, track: Track) {
         // Проверка: трек уже есть в списке скачанных
-        if self.library.downloaded_tracks.iter().any(|t| t.id == track.id) {
+        if self
+            .library
+            .downloaded_tracks
+            .iter()
+            .any(|t| t.id == track.id)
+        {
             self.status_message = Some(format!("Трек «{}» уже скачан!", track.title));
             return;
         }
@@ -700,7 +724,12 @@ impl MetrolistApp {
 
         // Проверка: файл трека уже существует на диске в папке загрузок
         if self.find_local_track_file(&track).is_some() {
-            if !self.library.downloaded_tracks.iter().any(|t| t.id == track.id) {
+            if !self
+                .library
+                .downloaded_tracks
+                .iter()
+                .any(|t| t.id == track.id)
+            {
                 self.library.add_downloaded(track.clone());
             }
             self.status_message = Some(format!("Трек «{}» уже скачан на диск!", track.title));
@@ -1047,23 +1076,28 @@ impl MetrolistApp {
             Pos2::new(center.x + w * 0.04, center.y + h * 0.34),
             Pos2::new(body_rect.right() - 1.0, body_rect.bottom()),
         ];
-        painter.add(egui::Shape::convex_polygon(cone_points, color, Stroke::NONE));
+        painter.add(egui::Shape::convex_polygon(
+            cone_points,
+            color,
+            Stroke::NONE,
+        ));
 
         let effective_vol = if is_muted { 0.0 } else { volume };
 
         // Helper: draw a smooth rounded circular arc wave
-        let draw_arc = |painter: &egui::Painter, cx_arc: f32, half_h: f32, bulge: f32, stroke: Stroke| {
-            let n = 14;
-            let mut pts = Vec::with_capacity(n + 1);
-            for i in 0..=n {
-                let t = i as f32 / n as f32;
-                let angle = std::f32::consts::PI * (t - 0.5); // -PI/2 to PI/2
-                let x = cx_arc + bulge * angle.cos();
-                let y = center.y + half_h * angle.sin();
-                pts.push(Pos2::new(x, y));
-            }
-            painter.add(egui::Shape::line(pts, stroke));
-        };
+        let draw_arc =
+            |painter: &egui::Painter, cx_arc: f32, half_h: f32, bulge: f32, stroke: Stroke| {
+                let n = 14;
+                let mut pts = Vec::with_capacity(n + 1);
+                for i in 0..=n {
+                    let t = i as f32 / n as f32;
+                    let angle = std::f32::consts::PI * (t - 0.5); // -PI/2 to PI/2
+                    let x = cx_arc + bulge * angle.cos();
+                    let y = center.y + half_h * angle.sin();
+                    pts.push(Pos2::new(x, y));
+                }
+                painter.add(egui::Shape::line(pts, stroke));
+            };
 
         if effective_vol <= 0.5 {
             // Muted: draw an 'X'
@@ -1087,16 +1121,34 @@ impl MetrolistApp {
         } else {
             let wave_stroke = Stroke::new(1.6_f32, color);
             // 1st arc (low volume: > 0%)
-            draw_arc(painter, center.x + w * 0.14, h * 0.17, w * 0.09, wave_stroke);
+            draw_arc(
+                painter,
+                center.x + w * 0.14,
+                h * 0.17,
+                w * 0.09,
+                wave_stroke,
+            );
 
             // 2nd arc (mid: > 33%)
             if effective_vol > 33.0 {
-                draw_arc(painter, center.x + w * 0.24, h * 0.27, w * 0.12, wave_stroke);
+                draw_arc(
+                    painter,
+                    center.x + w * 0.24,
+                    h * 0.27,
+                    w * 0.12,
+                    wave_stroke,
+                );
             }
 
             // 3rd arc (high: > 66%)
             if effective_vol > 66.0 {
-                draw_arc(painter, center.x + w * 0.34, h * 0.37, w * 0.15, wave_stroke);
+                draw_arc(
+                    painter,
+                    center.x + w * 0.34,
+                    h * 0.37,
+                    w * 0.15,
+                    wave_stroke,
+                );
             }
         }
     }
@@ -1117,7 +1169,9 @@ impl MetrolistApp {
             let t = std::f32::consts::TAU * (i as f32) / (n as f32);
             let sin_t = t.sin();
             let x = 16.0 * sin_t * sin_t * sin_t;
-            let y = -(13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos()) - 2.6;
+            let y =
+                -(13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos())
+                    - 2.6;
             pts.push(Pos2::new(cx + x * s, cy + y * s));
         }
 
@@ -1234,9 +1288,14 @@ impl eframe::App for MetrolistApp {
                     lyrics,
                     is_upgraded,
                 } => {
-                    if req_id == self.lyrics_req_id
-                        && self.current_track().is_some_and(|t| t.id == track_id)
-                    {
+                    let cur_id = self.current_track().map(|t| t.id.as_str());
+                    if crate::lyrics::is_lyrics_response_valid(
+                        self.is_local_lyrics,
+                        self.lyrics_req_id,
+                        req_id,
+                        cur_id,
+                        &track_id,
+                    ) {
                         if let Some(mut new_lyrics) = lyrics {
                             // Preserve manual user delay offset if one was set for current session
                             if let Some(existing) = &self.lyrics {
@@ -1251,7 +1310,9 @@ impl eframe::App for MetrolistApp {
                     }
                 }
                 AppEvent::LocalLyricsFileSelected(path) => {
+                    self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
                     if let Some(lyrics) = crate::lyrics::LocalFileAdapter::load_file(&path) {
+                        self.is_local_lyrics = true;
                         self.status_message = Some(format!(
                             "✓ Загружен текст: {}",
                             path.file_name().unwrap_or_default().to_string_lossy()
@@ -1436,16 +1497,10 @@ impl eframe::App for MetrolistApp {
                         ));
                     }
                     if self.settings.show_nav_lyrics {
-                        tabs.push((
-                            ActiveTab::Lyrics,
-                            strings.player_lyrics_tab.to_string(),
-                        ));
+                        tabs.push((ActiveTab::Lyrics, strings.player_lyrics_tab.to_string()));
                     }
                     if self.settings.show_nav_downloads {
-                        tabs.push((
-                            ActiveTab::Downloads,
-                            strings.nav_downloads.to_string(),
-                        ));
+                        tabs.push((ActiveTab::Downloads, strings.nav_downloads.to_string()));
                     }
                     // Пункт «Настройки» отображается ВСЕГДА и ни при каких условиях не скрывается!
                     tabs.push((ActiveTab::Settings, strings.nav_settings.to_string()));
@@ -1521,11 +1576,7 @@ impl eframe::App for MetrolistApp {
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("Cibitube")
-                                .size(10.0)
-                                .weak(),
-                        );
+                        ui.label(RichText::new("Cibitube").size(10.0).weak());
                     });
                 });
         }
@@ -1615,7 +1666,10 @@ impl eframe::App for MetrolistApp {
                                         );
                                         Self::draw_vector_logo(
                                             ui.painter(),
-                                            Rect::from_center_size(rect.center(), Vec2::new(24.0, 24.0)),
+                                            Rect::from_center_size(
+                                                rect.center(),
+                                                Vec2::new(24.0, 24.0),
+                                            ),
                                             Color32::GRAY,
                                         );
                                         resp
@@ -1668,7 +1722,10 @@ impl eframe::App for MetrolistApp {
                                     }
                                     ui.add_space(14.0);
 
-                                    let (play_rect, play_resp) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::click());
+                                    let (play_rect, play_resp) = ui.allocate_exact_size(
+                                        Vec2::splat(38.0),
+                                        egui::Sense::click(),
+                                    );
                                     if ui.is_rect_visible(play_rect) {
                                         let p_center = play_rect.center();
                                         ui.painter().circle_filled(p_center, 19.0, accent);
@@ -1678,10 +1735,30 @@ impl eframe::App for MetrolistApp {
                                             let bar_w = 3.6_f32;
                                             let bar_h = 13.0_f32;
                                             let gap = 4.2_f32;
-                                            let b1 = Rect::from_center_size(Pos2::new(p_center.x - gap / 2.0 - bar_w / 2.0, p_center.y), Vec2::new(bar_w, bar_h));
-                                            let b2 = Rect::from_center_size(Pos2::new(p_center.x + gap / 2.0 + bar_w / 2.0, p_center.y), Vec2::new(bar_w, bar_h));
-                                            ui.painter().rect_filled(b1, Rounding::same(1.0), Color32::WHITE);
-                                            ui.painter().rect_filled(b2, Rounding::same(1.0), Color32::WHITE);
+                                            let b1 = Rect::from_center_size(
+                                                Pos2::new(
+                                                    p_center.x - gap / 2.0 - bar_w / 2.0,
+                                                    p_center.y,
+                                                ),
+                                                Vec2::new(bar_w, bar_h),
+                                            );
+                                            let b2 = Rect::from_center_size(
+                                                Pos2::new(
+                                                    p_center.x + gap / 2.0 + bar_w / 2.0,
+                                                    p_center.y,
+                                                ),
+                                                Vec2::new(bar_w, bar_h),
+                                            );
+                                            ui.painter().rect_filled(
+                                                b1,
+                                                Rounding::same(1.0),
+                                                Color32::WHITE,
+                                            );
+                                            ui.painter().rect_filled(
+                                                b2,
+                                                Rounding::same(1.0),
+                                                Color32::WHITE,
+                                            );
                                         } else {
                                             // Воспроизведение: треугольник с оптической центровкой (+1px вправо)
                                             let tri = vec![
@@ -1689,7 +1766,11 @@ impl eframe::App for MetrolistApp {
                                                 Pos2::new(p_center.x + 6.5, p_center.y),
                                                 Pos2::new(p_center.x - 4.5, p_center.y + 7.0),
                                             ];
-                                            ui.painter().add(egui::Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
+                                            ui.painter().add(egui::Shape::convex_polygon(
+                                                tri,
+                                                Color32::WHITE,
+                                                Stroke::NONE,
+                                            ));
                                         }
                                     }
                                     if play_resp.clicked() {
@@ -1802,7 +1883,10 @@ impl eframe::App for MetrolistApp {
                                             .show(ui.ctx(), |ui| {
                                                 egui::Frame::popup(ui.style())
                                                     .fill(Color32::from_rgb(20, 20, 26))
-                                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(50, 50, 65)))
+                                                    .stroke(Stroke::new(
+                                                        1.0_f32,
+                                                        Color32::from_rgb(50, 50, 65),
+                                                    ))
                                                     .rounding(Rounding::same(8.0))
                                                     .inner_margin(6.0)
                                                     .show(ui, |ui| {
@@ -1825,7 +1909,9 @@ impl eframe::App for MetrolistApp {
                                                             )
                                                             .vertical()
                                                             .show_value(false);
-                                                            if ui.add_sized([18.0, 95.0], slider).changed()
+                                                            if ui
+                                                                .add_sized([18.0, 95.0], slider)
+                                                                .changed()
                                                             {
                                                                 self.player.set_volume(vol);
                                                                 self.settings.volume = vol;
@@ -1849,14 +1935,16 @@ impl eframe::App for MetrolistApp {
                                     };
                                     let heart_symbol = if is_liked { "♥" } else { "♡" };
                                     let heart_btn = egui::Button::new(
-                                        RichText::new(heart_symbol)
-                                            .size(19.0)
-                                            .color(heart_color),
+                                        RichText::new(heart_symbol).size(19.0).color(heart_color),
                                     )
                                     .frame(false);
                                     if ui
                                         .add_sized([28.0, 28.0], heart_btn)
-                                        .on_hover_text(if is_liked { "Удалить из любимых" } else { "Добавить в любимые" })
+                                        .on_hover_text(if is_liked {
+                                            "Удалить из любимых"
+                                        } else {
+                                            "Добавить в любимые"
+                                        })
                                         .clicked()
                                     {
                                         track_to_toggle_like = Some(track.clone());
@@ -1913,7 +2001,12 @@ impl eframe::App for MetrolistApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let playback_info = self.player.info.try_lock().map(|g| g.clone()).unwrap_or_default();
+        let playback_info = self
+            .player
+            .info
+            .try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         self.trigger_auto_sync(&playback_info);
     }
 }
@@ -2277,9 +2370,7 @@ impl MetrolistApp {
                     ui.horizontal(|ui| {
                         if !self.playlist_tracks.is_empty() {
                             let play_all_btn = egui::Button::new(
-                                RichText::new("Слушать всё")
-                                    .color(Color32::WHITE)
-                                    .strong(),
+                                RichText::new("Слушать всё").color(Color32::WHITE).strong(),
                             )
                             .fill(accent)
                             .rounding(Rounding::same(6.0));
@@ -2316,11 +2407,10 @@ impl MetrolistApp {
                             }
 
                             // Download whole playlist button
-                            let dl_all_btn = egui::Button::new(
-                                RichText::new("Скачать весь плейлист").strong(),
-                            )
-                            .fill(Color32::from_rgb(32, 45, 58))
-                            .rounding(Rounding::same(6.0));
+                            let dl_all_btn =
+                                egui::Button::new(RichText::new("Скачать весь плейлист").strong())
+                                    .fill(Color32::from_rgb(32, 45, 58))
+                                    .rounding(Rounding::same(6.0));
                             if ui
                                 .add(dl_all_btn)
                                 .on_hover_text(
@@ -2489,11 +2579,7 @@ impl MetrolistApp {
 
         // 3. User playlists from YouTube Music
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Плейлисты YouTube Music")
-                    .size(18.0)
-                    .strong(),
-            );
+            ui.label(RichText::new("Плейлисты YouTube Music").size(18.0).strong());
             ui.add_space(16.0);
             if ui
                 .button(RichText::new("Синхронизировать плейлисты").strong())
@@ -2587,11 +2673,7 @@ impl MetrolistApp {
         let accent = self.accent_color();
 
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Очередь воспроизведения")
-                    .size(18.0)
-                    .strong(),
-            );
+            ui.label(RichText::new("Очередь воспроизведения").size(18.0).strong());
             ui.add_space(16.0);
             if ui.button("Перемешать очередь").clicked() {
                 self.shuffle_queue();
@@ -2912,13 +2994,13 @@ impl MetrolistApp {
                             {
                                 self.settings.lyrics_source_mode = val;
                                 self.settings.save();
-                                self.trigger_lyrics_search();
+                                self.trigger_lyrics_search(false);
                             }
                         }
                     });
 
                 if ui.button(RichText::new("↻ Повторить").size(11.0)).clicked() {
-                    self.trigger_lyrics_search();
+                    self.trigger_lyrics_search(true);
                 }
 
                 if ui
@@ -2964,18 +3046,21 @@ impl MetrolistApp {
                             ];
                             for (val, label) in options {
                                 if ui
-                                    .selectable_label(self.settings.lyrics_source_mode == val, label)
+                                    .selectable_label(
+                                        self.settings.lyrics_source_mode == val,
+                                        label,
+                                    )
                                     .clicked()
                                 {
                                     self.settings.lyrics_source_mode = val;
                                     self.settings.save();
-                                    self.trigger_lyrics_search();
+                                    self.trigger_lyrics_search(false);
                                 }
                             }
                         });
 
                     if ui.button(RichText::new("↻ Повторить").size(11.0)).clicked() {
-                        self.trigger_lyrics_search();
+                        self.trigger_lyrics_search(true);
                     }
 
                     if ui
@@ -3062,8 +3147,10 @@ impl MetrolistApp {
             return;
         }
 
-        let current_time_ms =
-            ((current_time * 1000.0) as i64 + lyrics.offset_ms + self.settings.lyrics_manual_offset_ms).max(0);
+        let current_time_ms = ((current_time * 1000.0) as i64
+            + lyrics.offset_ms
+            + self.settings.lyrics_manual_offset_ms)
+            .max(0);
         let current_line_idx = lyrics
             .lines
             .iter()
@@ -3221,8 +3308,8 @@ impl MetrolistApp {
                                     .rounding(rounding),
                             );
                         } else {
-                            let (rect, _) = ui
-                                .allocate_exact_size(Vec2::new(52.0, 52.0), egui::Sense::hover());
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::new(52.0, 52.0), egui::Sense::hover());
                             ui.painter()
                                 .rect_filled(rect, rounding, Color32::from_rgb(38, 38, 48));
                             Self::draw_vector_logo(
@@ -3261,7 +3348,11 @@ impl MetrolistApp {
                                     .color(Color32::from_rgb(244, 63, 94)),
                             )
                             .frame(false);
-                            if ui.add(del_btn).on_hover_text("Удалить из загрузок").clicked() {
+                            if ui
+                                .add(del_btn)
+                                .on_hover_text("Удалить из загрузок")
+                                .clicked()
+                            {
                                 track_to_delete = Some(track.id.clone());
                             }
 
@@ -3332,10 +3423,8 @@ impl MetrolistApp {
                     );
                     painter.rect_filled(r2, Rounding::ZERO, Color32::from_rgb(0, 57, 166));
                     // Red stripe (#D52B1E, bottom rounded)
-                    let r3 = Rect::from_min_max(
-                        pos2(rect.min.x, rect.min.y + 2.0 * h_third),
-                        rect.max,
-                    );
+                    let r3 =
+                        Rect::from_min_max(pos2(rect.min.x, rect.min.y + 2.0 * h_third), rect.max);
                     painter.rect_filled(
                         r3,
                         Rounding {
@@ -3370,15 +3459,18 @@ impl MetrolistApp {
                     painter.line_segment([p_bl, p_tr], stroke_red_diag);
 
                     // White Cross
-                    let white_h = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+                    let white_h =
+                        Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
                     painter.rect_filled(white_h, Rounding::ZERO, Color32::WHITE);
-                    let white_v = Rect::from_center_size(rect.center(), Vec2::new(8.0, rect.height()));
+                    let white_v =
+                        Rect::from_center_size(rect.center(), Vec2::new(8.0, rect.height()));
                     painter.rect_filled(white_v, Rounding::ZERO, Color32::WHITE);
 
                     // Red Cross
                     let red_h = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 3.2));
                     painter.rect_filled(red_h, Rounding::ZERO, Color32::from_rgb(200, 16, 46));
-                    let red_v = Rect::from_center_size(rect.center(), Vec2::new(4.5, rect.height()));
+                    let red_v =
+                        Rect::from_center_size(rect.center(), Vec2::new(4.5, rect.height()));
                     painter.rect_filled(red_v, Rounding::ZERO, Color32::from_rgb(200, 16, 46));
                 }
             }
@@ -3419,11 +3511,7 @@ impl MetrolistApp {
         let strings = crate::i18n::tr(&self.settings.ui_language);
 
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(strings.nav_settings)
-                    .size(22.0)
-                    .strong(),
-            );
+            ui.label(RichText::new(strings.nav_settings).size(22.0).strong());
             ui.add_space(12.0);
             ui.label(RichText::new("Cibitube v0.2.9").size(12.0).weak());
 
@@ -3972,7 +4060,7 @@ impl MetrolistApp {
                                 {
                                     self.settings.lyrics_source_mode = val;
                                     self.settings.save();
-                                    self.trigger_lyrics_search();
+                                    self.trigger_lyrics_search(false);
                                 }
                             }
                         });
@@ -4558,7 +4646,7 @@ impl MetrolistApp {
                                                     .on_hover_text("Повторить поиск текста")
                                                     .clicked()
                                                 {
-                                                    self.trigger_lyrics_search();
+                                                    self.trigger_lyrics_search(true);
                                                 }
                                             },
                                         );

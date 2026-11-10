@@ -34,25 +34,25 @@ impl LrcParser {
             while rest.starts_with('[') {
                 if let Some(close) = rest.find(']') {
                     let tag = &rest[1..close];
-                    if tag.starts_with("offset:") {
-                        if let Ok(off) = tag[7..].trim().parse::<i64>() {
+                    if let Some(stripped) = tag.strip_prefix("offset:") {
+                        if let Ok(off) = stripped.trim().parse::<i64>() {
                             offset_ms = off;
                         }
                         rest = rest[close + 1..].trim_start();
                         continue;
                     }
-                    if tag.starts_with("ti:") {
-                        title = Some(tag[3..].trim().to_string());
+                    if let Some(stripped) = tag.strip_prefix("ti:") {
+                        title = Some(stripped.trim().to_string());
                         rest = rest[close + 1..].trim_start();
                         continue;
                     }
-                    if tag.starts_with("ar:") {
-                        artist = Some(tag[3..].trim().to_string());
+                    if let Some(stripped) = tag.strip_prefix("ar:") {
+                        artist = Some(stripped.trim().to_string());
                         rest = rest[close + 1..].trim_start();
                         continue;
                     }
-                    if tag.starts_with("al:") {
-                        album = Some(tag[3..].trim().to_string());
+                    if let Some(stripped) = tag.strip_prefix("al:") {
+                        album = Some(stripped.trim().to_string());
                         rest = rest[close + 1..].trim_start();
                         continue;
                     }
@@ -659,7 +659,7 @@ impl TtmlParser {
         }
         for seg in segments {
             let st = seg.text.trim();
-            if !st.is_empty() && !words.iter().any(|w| *w == st) {
+            if !st.is_empty() && !words.contains(&st) {
                 return true;
             }
         }
@@ -674,16 +674,32 @@ impl TtmlParser {
 
         // Offset-time format
         if let Some(ms_str) = s.strip_suffix("ms") {
-            return ms_str.trim().parse::<f64>().ok().map(|ms| ms.round().max(0.0) as u64);
+            return ms_str
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|ms| ms.round().max(0.0) as u64);
         }
         if let Some(s_str) = s.strip_suffix('s') {
-            return s_str.trim().parse::<f64>().ok().map(|secs| (secs * 1000.0).round().max(0.0) as u64);
+            return s_str
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|secs| (secs * 1000.0).round().max(0.0) as u64);
         }
         if let Some(m_str) = s.strip_suffix('m') {
-            return m_str.trim().parse::<f64>().ok().map(|mins| (mins * 60.0 * 1000.0).round().max(0.0) as u64);
+            return m_str
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|mins| (mins * 60.0 * 1000.0).round().max(0.0) as u64);
         }
         if let Some(h_str) = s.strip_suffix('h') {
-            return h_str.trim().parse::<f64>().ok().map(|hrs| (hrs * 3600.0 * 1000.0).round().max(0.0) as u64);
+            return h_str
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|hrs| (hrs * 3600.0 * 1000.0).round().max(0.0) as u64);
         }
 
         // Clock-time format: [hh:]mm:ss[.frac]
@@ -697,7 +713,11 @@ impl TtmlParser {
                 let hrs: f64 = parts[0].trim().parse().ok()?;
                 let mins: f64 = parts[1].trim().parse().ok()?;
                 let secs: f64 = parts[2].trim().parse().ok()?;
-                return Some((((hrs * 3600.0) + (mins * 60.0) + secs) * 1000.0).round().max(0.0) as u64);
+                return Some(
+                    (((hrs * 3600.0) + (mins * 60.0) + secs) * 1000.0)
+                        .round()
+                        .max(0.0) as u64,
+                );
             } else {
                 return None;
             }
@@ -957,6 +977,38 @@ impl BetterLyricsAdapter {
 // 6. LRCLIB Adapter (https://lrclib.net)
 // ============================================================================
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackVersionMeta {
+    pub is_remix: bool,
+    pub is_live: bool,
+    pub is_cover: bool,
+    pub is_acoustic: bool,
+    pub is_instrumental: bool,
+}
+
+impl TrackVersionMeta {
+    pub fn from_title(title: &str) -> Self {
+        let lower = title.to_lowercase();
+        Self {
+            is_remix: lower.contains("remix")
+                || lower.contains(" club mix")
+                || lower.contains(" dance mix"),
+            is_live: lower.contains("live"),
+            is_cover: lower.contains("cover"),
+            is_acoustic: lower.contains("acoustic") || lower.contains("unplugged"),
+            is_instrumental: lower.contains("instrumental") || lower.contains("karaoke version"),
+        }
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        self.is_remix == other.is_remix
+            && self.is_live == other.is_live
+            && self.is_cover == other.is_cover
+            && self.is_acoustic == other.is_acoustic
+            && self.is_instrumental == other.is_instrumental
+    }
+}
+
 pub struct LrclibAdapter;
 
 impl LrclibAdapter {
@@ -967,8 +1019,8 @@ impl LrclibAdapter {
         album: Option<&str>,
         duration_secs: Option<u64>,
     ) -> Option<Lyrics> {
-        let clean_t = Self::clean_string(title);
-        let clean_a = Self::clean_string(artist);
+        let clean_t = Self::clean_title(title);
+        let clean_a = Self::clean_artist(artist);
         let search_title = if clean_t.is_empty() { title } else { &clean_t };
         let search_artist = if clean_a.is_empty() { artist } else { &clean_a };
 
@@ -1001,8 +1053,10 @@ impl LrclibAdapter {
         {
             if res.status().is_success() {
                 if let Ok(json) = res.json::<Value>().await {
-                    if let Some(lyrics) = Self::parse_lrclib_json(&json) {
-                        return Some(lyrics);
+                    if Self::is_match_eligible(&json, title, artist, duration_secs) {
+                        if let Some(lyrics) = Self::parse_lrclib_json(&json) {
+                            return Some(lyrics);
+                        }
                     }
                 }
             }
@@ -1026,8 +1080,7 @@ impl LrclibAdapter {
         {
             if res.status().is_success() {
                 if let Ok(items) = res.json::<Vec<Value>>().await {
-                    let best =
-                        Self::select_best_match(items, search_title, search_artist, duration_secs);
+                    let best = Self::select_best_match(items, title, artist, album, duration_secs);
                     if let Some(item) = best {
                         if let Some(lyrics) = Self::parse_lrclib_json(&item) {
                             return Some(lyrics);
@@ -1040,57 +1093,317 @@ impl LrclibAdapter {
         None
     }
 
-    fn select_best_match(
+    pub fn clean_title(s: &str) -> String {
+        let text = s.trim();
+        let junk_patterns = [
+            "official music video",
+            "official video",
+            "music video",
+            "official audio",
+            "lyric video",
+            "official lyric video",
+            "visualizer",
+            "official visualizer",
+            "video",
+            "audio",
+            "4k",
+            "hd",
+            "mv",
+            "m/v",
+            "clip officiel",
+            "video clip",
+        ];
+
+        let mut cleaned = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '(' || c == '[' {
+                let closing = if c == '(' { ')' } else { ']' };
+                let mut inner = String::new();
+                let mut found_closing = false;
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    if ch == closing {
+                        found_closing = true;
+                        break;
+                    }
+                    inner.push(ch);
+                }
+                let inner_lower = inner.to_lowercase();
+                let is_junk = junk_patterns
+                    .iter()
+                    .any(|&p| inner_lower == p || inner_lower.starts_with(p));
+                let is_feat = inner_lower.starts_with("feat")
+                    || inner_lower.starts_with("ft.")
+                    || inner_lower.starts_with("prod.");
+                if is_junk || is_feat {
+                    continue;
+                }
+                cleaned.push(c);
+                cleaned.push_str(&inner);
+                if found_closing {
+                    cleaned.push(closing);
+                }
+            } else {
+                cleaned.push(c);
+            }
+        }
+
+        let lower = cleaned.to_lowercase();
+        for marker in &["feat.", "ft.", "prod."] {
+            if let Some(pos) = lower.find(marker) {
+                if pos > 0 {
+                    cleaned = cleaned[..pos].to_string();
+                }
+            }
+        }
+
+        cleaned.trim().trim_end_matches('-').trim().to_string()
+    }
+
+    pub fn clean_artist(s: &str) -> String {
+        let mut artist = s.trim().to_string();
+        let lower = artist.to_lowercase();
+        for marker in &["feat.", "ft.", "feat", "prod.", " - Topic"] {
+            if let Some(pos) = lower.find(marker) {
+                if pos > 0 {
+                    artist = artist[..pos].to_string();
+                }
+            }
+        }
+        artist.trim().trim_end_matches('-').trim().to_string()
+    }
+
+    pub fn normalize_for_comparison(s: &str) -> String {
+        s.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn artist_matches(norm_target: &str, norm_cand: &str) -> bool {
+        if norm_target.is_empty() || norm_cand.is_empty() {
+            return false;
+        }
+        if norm_target == norm_cand {
+            return true;
+        }
+        if norm_target.contains(norm_cand) || norm_cand.contains(norm_target) {
+            return true;
+        }
+        let target_tokens: Vec<&str> = norm_target.split_whitespace().collect();
+        let cand_tokens: Vec<&str> = norm_cand.split_whitespace().collect();
+        for tt in &target_tokens {
+            if tt.len() >= 3 && cand_tokens.contains(tt) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn title_matches(norm_target: &str, norm_cand: &str) -> bool {
+        if norm_target.is_empty() || norm_cand.is_empty() {
+            return false;
+        }
+        if norm_target == norm_cand {
+            return true;
+        }
+        if norm_target.contains(norm_cand) || norm_cand.contains(norm_target) {
+            return true;
+        }
+        let target_words: std::collections::HashSet<&str> =
+            norm_target.split_whitespace().collect();
+        let cand_words: std::collections::HashSet<&str> = norm_cand.split_whitespace().collect();
+        let common = target_words.intersection(&cand_words).count();
+        let total = target_words.len().min(cand_words.len());
+        if total > 0 && (common as f64 / total as f64) >= 0.6 {
+            return true;
+        }
+        false
+    }
+
+    pub fn is_match_eligible(
+        item: &Value,
+        target_title: &str,
+        target_artist: &str,
+        target_duration: Option<u64>,
+    ) -> bool {
+        let item_title = item.get("trackName").and_then(|v| v.as_str()).unwrap_or("");
+        let item_artist = item
+            .get("artistName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let target_ver = TrackVersionMeta::from_title(target_title);
+        let item_ver = TrackVersionMeta::from_title(item_title);
+        if !target_ver.matches(&item_ver) {
+            return false;
+        }
+
+        let clean_t = Self::clean_title(target_title);
+        let clean_a = Self::clean_artist(target_artist);
+        let norm_t = Self::normalize_for_comparison(&clean_t);
+        let norm_a = Self::normalize_for_comparison(&clean_a);
+
+        let clean_cand_a = Self::clean_artist(item_artist);
+        let norm_cand_a = Self::normalize_for_comparison(&clean_cand_a);
+        if !Self::artist_matches(&norm_a, &norm_cand_a) {
+            return false;
+        }
+
+        let clean_cand_t = Self::clean_title(item_title);
+        let norm_cand_t = Self::normalize_for_comparison(&clean_cand_t);
+        if !Self::title_matches(&norm_t, &norm_cand_t) {
+            return false;
+        }
+
+        if let (Some(td), Some(cd)) = (
+            target_duration,
+            item.get("duration")
+                .and_then(|v| v.as_f64())
+                .map(|d| d.round() as u64),
+        ) {
+            if (td as i64 - cd as i64).abs() > 15 {
+                return false;
+            }
+        }
+
+        let has_synced = item
+            .get("syncedLyrics")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_plain = item
+            .get("plainLyrics")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        has_synced || has_plain
+    }
+
+    pub fn select_best_match(
         items: Vec<Value>,
         target_title: &str,
-        _target_artist: &str,
+        target_artist: &str,
+        target_album: Option<&str>,
         target_duration: Option<u64>,
     ) -> Option<Value> {
-        let target_lower = target_title.to_lowercase();
-        let target_is_remix = target_lower.contains("remix");
-        let target_is_live = target_lower.contains("live");
-        let target_is_cover = target_lower.contains("cover");
+        let clean_t = Self::clean_title(target_title);
+        let clean_a = Self::clean_artist(target_artist);
+        let norm_t = Self::normalize_for_comparison(&clean_t);
+        let norm_a = Self::normalize_for_comparison(&clean_a);
+        let target_ver = TrackVersionMeta::from_title(target_title);
 
-        let mut scored_items = Vec::new();
+        let mut eligible_items = Vec::new();
 
+        // Stage 1: Filter out ineligible candidates
         for item in items {
-            let item_title = item
-                .get("trackName")
+            let item_title = item.get("trackName").and_then(|v| v.as_str()).unwrap_or("");
+            let item_artist = item
+                .get("artistName")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            // Version mismatch check: Do not substitute cover/remix/live for original!
-            if !target_is_remix && item_title.contains("remix") {
-                continue;
-            }
-            if !target_is_live && item_title.contains("live") {
-                continue;
-            }
-            if !target_is_cover && item_title.contains("cover") {
+                .unwrap_or("");
+
+            // 1. Version check: do not mix original with remix, live, cover, acoustic
+            let item_ver = TrackVersionMeta::from_title(item_title);
+            if !target_ver.matches(&item_ver) {
                 continue;
             }
 
+            // 2. Artist check: artist must match
+            let clean_cand_a = Self::clean_artist(item_artist);
+            let norm_cand_a = Self::normalize_for_comparison(&clean_cand_a);
+            if !Self::artist_matches(&norm_a, &norm_cand_a) {
+                continue;
+            }
+
+            // 3. Title check: title must match
+            let clean_cand_t = Self::clean_title(item_title);
+            let norm_cand_t = Self::normalize_for_comparison(&clean_cand_t);
+            if !Self::title_matches(&norm_t, &norm_cand_t) {
+                continue;
+            }
+
+            // 4. Duration check: candidate must be within 15 seconds if target duration is known
+            let item_duration = item
+                .get("duration")
+                .and_then(|v| v.as_f64())
+                .map(|d| d.round() as u64);
+            let mut dur_diff = None;
+            if let (Some(td), Some(cd)) = (target_duration, item_duration) {
+                let diff = (td as i64 - cd as i64).abs();
+                if diff > 15 {
+                    continue; // Incompatible duration!
+                }
+                dur_diff = Some(diff);
+            }
+
+            // 5. Must have lyrics
+            let has_synced = item
+                .get("syncedLyrics")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let has_plain = item
+                .get("plainLyrics")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_synced && !has_plain {
+                continue;
+            }
+
+            eligible_items.push((item, has_synced, dur_diff, norm_cand_t, norm_cand_a));
+        }
+
+        if eligible_items.is_empty() {
+            return None;
+        }
+
+        // Stage 2: Score eligible candidates
+        let mut scored_items = Vec::new();
+        for (item, has_synced, dur_diff, cand_t, cand_a) in eligible_items {
             let mut score = 0i32;
 
-            if item.get("syncedLyrics").and_then(|v| v.as_str()).is_some() {
+            // Prefer detailed sync among verified matching candidates
+            if has_synced {
                 score += 500;
-            } else if item.get("plainLyrics").and_then(|v| v.as_str()).is_some() {
+            } else {
                 score += 100;
             }
 
-            if let (Some(target_d), Some(item_d)) = (
-                target_duration,
-                item.get("duration")
-                    .and_then(|v| v.as_f64())
-                    .map(|d| d.round() as u64),
-            ) {
-                let diff = (target_d as i64 - item_d as i64).abs();
+            // Duration closeness
+            if let Some(diff) = dur_diff {
                 if diff <= 2 {
                     score += 150;
-                } else if diff <= 6 {
-                    score += 50;
-                } else {
-                    score -= 100;
+                } else if diff <= 5 {
+                    score += 80;
+                } else if diff <= 10 {
+                    score += 30;
+                }
+            }
+
+            // Exact title match bonus
+            if norm_t == cand_t {
+                score += 100;
+            }
+
+            // Exact artist match bonus
+            if norm_a == cand_a {
+                score += 100;
+            }
+
+            // Album bonus
+            if let Some(target_alb) = target_album {
+                if let Some(cand_alb) = item.get("albumName").and_then(|v| v.as_str()) {
+                    if Self::normalize_for_comparison(target_alb)
+                        == Self::normalize_for_comparison(cand_alb)
+                    {
+                        score += 50;
+                    }
                 }
             }
 
@@ -1146,18 +1459,6 @@ impl LrclibAdapter {
         }
 
         None
-    }
-
-    fn clean_string(s: &str) -> String {
-        let mut text = s.to_string();
-        for marker in &[
-            "(", "[", "feat.", "ft.", "prod.", "Official", "Video", "Audio",
-        ] {
-            if let Some(pos) = text.to_lowercase().find(&marker.to_lowercase()) {
-                text = text[..pos].to_string();
-            }
-        }
-        text.trim().to_string()
     }
 }
 
@@ -1223,14 +1524,36 @@ impl LyricsCache {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("cibitube")
             .join("lyrics");
-        let _ = std::fs::create_dir_all(&dir);
+        Self::new_with_dir(dir)
+    }
+
+    pub fn new_with_dir(cache_dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&cache_dir);
         Self {
             memory: RwLock::new(HashMap::new()),
-            cache_dir: dir,
+            cache_dir,
         }
     }
 
-    fn make_key(title: &str, artist: &str, duration_secs: Option<u64>) -> String {
+    fn make_key(
+        title: &str,
+        artist: &str,
+        duration_secs: Option<u64>,
+        source_mode: usize,
+    ) -> String {
+        let clean = format!(
+            "{}_{}_{}_mode{}",
+            title.trim().to_lowercase(),
+            artist.trim().to_lowercase(),
+            duration_secs.unwrap_or(0),
+            source_mode
+        );
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(clean.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn legacy_key(title: &str, artist: &str, duration_secs: Option<u64>) -> String {
         let clean = format!(
             "{}_{}_{}",
             title.trim().to_lowercase(),
@@ -1242,13 +1565,28 @@ impl LyricsCache {
         format!("{:x}", hasher.finalize())
     }
 
+    pub fn matches_source_mode(source_mode: usize, lyrics: &Lyrics) -> bool {
+        match source_mode {
+            0 => true,
+            1 => lyrics.source_name.contains("LRCLIB"),
+            2 => lyrics.source_name.contains("QQ") || lyrics.provider.as_deref() == Some("qq"),
+            3 => lyrics.source_name.contains("TTML") || lyrics.provider.as_deref() == Some("ttml"),
+            4 => {
+                lyrics.source_name.contains("KuGou") || lyrics.provider.as_deref() == Some("kugou")
+            }
+            5 => lyrics.source_name.contains("LrcMux"),
+            _ => false,
+        }
+    }
+
     pub async fn get(
         &self,
+        source_mode: usize,
         title: &str,
         artist: &str,
         duration_secs: Option<u64>,
     ) -> Option<Lyrics> {
-        let key = Self::make_key(title, artist, duration_secs);
+        let key = Self::make_key(title, artist, duration_secs, source_mode);
         {
             let mem = self.memory.read().await;
             if let Some(l) = mem.get(&key) {
@@ -1266,17 +1604,34 @@ impl LyricsCache {
                 }
             }
         }
+
+        // Backward compatibility: inspect unkeyed legacy file
+        let leg_key = Self::legacy_key(title, artist, duration_secs);
+        let leg_path = self.cache_dir.join(format!("{}.json", leg_key));
+        if leg_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&leg_path) {
+                if let Ok(lyrics) = serde_json::from_str::<Lyrics>(&content) {
+                    if Self::matches_source_mode(source_mode, &lyrics) {
+                        let mut mem = self.memory.write().await;
+                        mem.insert(key, lyrics.clone());
+                        return Some(lyrics);
+                    }
+                }
+            }
+        }
+
         None
     }
 
     pub async fn put(
         &self,
+        source_mode: usize,
         title: &str,
         artist: &str,
         duration_secs: Option<u64>,
         lyrics: &Lyrics,
     ) {
-        let key = Self::make_key(title, artist, duration_secs);
+        let key = Self::make_key(title, artist, duration_secs, source_mode);
         {
             let mut mem = self.memory.write().await;
             mem.insert(key.clone(), lyrics.clone());
@@ -1316,21 +1671,27 @@ impl LyricsClient {
 
     pub async fn get_cached(
         &self,
+        source_mode: usize,
         title: &str,
         artist: &str,
         duration_secs: Option<u64>,
     ) -> Option<Lyrics> {
-        self.cache.get(title, artist, duration_secs).await
+        self.cache
+            .get(source_mode, title, artist, duration_secs)
+            .await
     }
 
     pub async fn save_to_cache(
         &self,
+        source_mode: usize,
         title: &str,
         artist: &str,
         duration_secs: Option<u64>,
         lyrics: &Lyrics,
     ) {
-        self.cache.put(title, artist, duration_secs, lyrics).await;
+        self.cache
+            .put(source_mode, title, artist, duration_secs, lyrics)
+            .await;
     }
 
     pub async fn fetch_direct_source(
@@ -1410,6 +1771,16 @@ impl LyricsClient {
     ) -> Option<Lyrics> {
         LrclibAdapter::fetch(&self.client, title, artist, album, duration_secs).await
     }
+}
+
+pub fn is_lyrics_response_valid(
+    is_local: bool,
+    current_req_id: u64,
+    incoming_req_id: u64,
+    current_track_id: Option<&str>,
+    incoming_track_id: &str,
+) -> bool {
+    !is_local && current_req_id == incoming_req_id && current_track_id == Some(incoming_track_id)
 }
 
 // ============================================================================
@@ -1497,7 +1868,8 @@ mod tests {
     </div>
   </body>
 </tt>";
-        let parsed = TtmlParser::parse(sample, Some("ttml")).expect("Failed to parse TTML syllables");
+        let parsed =
+            TtmlParser::parse(sample, Some("ttml")).expect("Failed to parse TTML syllables");
         assert_eq!(parsed.lines.len(), 2);
         assert_eq!(parsed.lines[0].text, "Hello, world!");
         assert_eq!(parsed.sync_type, LyricsSyncType::Syllable);
@@ -1511,7 +1883,8 @@ mod tests {
 <p begin=\"00:01.200\" end=\"00:04.500\">Построчный текст без слогов</p>
 <p begin=\"00:05.000\" end=\"00:08.000\">Вторая строка</p>
 </div></body></tt>";
-        let parsed = TtmlParser::parse(sample, Some("ttml")).expect("Failed to parse line-only TTML");
+        let parsed =
+            TtmlParser::parse(sample, Some("ttml")).expect("Failed to parse line-only TTML");
         assert_eq!(parsed.lines.len(), 2);
         assert_eq!(parsed.sync_type, LyricsSyncType::Line);
         assert!(parsed.lines[0].words.is_none());
@@ -1555,9 +1928,15 @@ mod tests {
         assert_eq!(parsed.offset_ms, 500);
         assert_eq!(parsed.lines.len(), 3);
         assert_eq!(parsed.lines[0].start_ms, 10000);
-        assert_eq!(parsed.lines[0].text, "Chorus line with (ooh yeah) non-timing brackets");
+        assert_eq!(
+            parsed.lines[0].text,
+            "Chorus line with (ooh yeah) non-timing brackets"
+        );
         assert_eq!(parsed.lines[1].start_ms, 30000);
-        assert_eq!(parsed.lines[1].text, "Chorus line with (ooh yeah) non-timing brackets");
+        assert_eq!(
+            parsed.lines[1].text,
+            "Chorus line with (ooh yeah) non-timing brackets"
+        );
         assert_eq!(parsed.lines[2].start_ms, 50000);
     }
 
@@ -1630,5 +2009,246 @@ mod tests {
         lyrics.offset_ms = -1500;
         // At 2.0s -> effective time 500ms (before line 1 at 1000ms) -> None
         assert_eq!(lyrics.find_active_line_idx(2.0), None);
+    }
+
+    #[test]
+    fn test_clean_title_preserves_version() {
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name (Official Video)"),
+            "Song Name"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name [Official Music Video]"),
+            "Song Name"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name (feat. Drake)"),
+            "Song Name"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name (Remix)"),
+            "Song Name (Remix)"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name [Live in Tokyo]"),
+            "Song Name [Live in Tokyo]"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name (Acoustic Version)"),
+            "Song Name (Acoustic Version)"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name (Cover)"),
+            "Song Name (Cover)"
+        );
+        assert_eq!(
+            LrclibAdapter::clean_title("Song Name (Instrumental)"),
+            "Song Name (Instrumental)"
+        );
+    }
+
+    #[test]
+    fn test_select_best_match_different_artists() {
+        // Target: "Hello" by "Adele", 295s
+        let lionel = serde_json::json!({
+            "trackName": "Hello",
+            "artistName": "Lionel Richie",
+            "duration": 295,
+            "syncedLyrics": "[00:10.00]Hello, is it me you're looking for?",
+            "plainLyrics": "Hello, is it me you're looking for?"
+        });
+        let adele = serde_json::json!({
+            "trackName": "Hello",
+            "artistName": "Adele",
+            "duration": 295,
+            "plainLyrics": "Hello from the other side"
+        });
+
+        let items = vec![lionel, adele];
+        let best = LrclibAdapter::select_best_match(items, "Hello", "Adele", None, Some(295));
+        assert!(best.is_some());
+        let selected = best.unwrap();
+        assert_eq!(selected["artistName"], "Adele");
+        // Must choose Adele's plain lyrics over Lionel Richie's synced lyrics!
+        assert_eq!(selected["plainLyrics"], "Hello from the other side");
+    }
+
+    #[test]
+    fn test_select_best_match_version_mismatch() {
+        // Target: "Levitating" by "Dua Lipa" (Original studio version, 203s)
+        let remix = serde_json::json!({
+            "trackName": "Levitating (The Blessed Madonna Remix)",
+            "artistName": "Dua Lipa",
+            "duration": 203,
+            "syncedLyrics": "[00:05.00]Levitating remix beat"
+        });
+        let studio = serde_json::json!({
+            "trackName": "Levitating",
+            "artistName": "Dua Lipa",
+            "duration": 203,
+            "plainLyrics": "If you wanna run away with me, I know a galaxy"
+        });
+
+        let items = vec![remix, studio];
+        let best =
+            LrclibAdapter::select_best_match(items, "Levitating", "Dua Lipa", None, Some(203));
+        assert!(best.is_some());
+        let selected = best.unwrap();
+        // Remix should be rejected because original is requested
+        assert_eq!(selected["trackName"], "Levitating");
+        assert_eq!(
+            selected["plainLyrics"],
+            "If you wanna run away with me, I know a galaxy"
+        );
+
+        // Now reverse: target is explicitly a remix
+        let items2 = vec![
+            serde_json::json!({
+                "trackName": "Levitating",
+                "artistName": "Dua Lipa",
+                "duration": 203,
+                "syncedLyrics": "[00:05.00]Original synced"
+            }),
+            serde_json::json!({
+                "trackName": "Levitating (Remix)",
+                "artistName": "Dua Lipa",
+                "duration": 203,
+                "plainLyrics": "Remix plain"
+            }),
+        ];
+        let best_remix = LrclibAdapter::select_best_match(
+            items2,
+            "Levitating (Remix)",
+            "Dua Lipa",
+            None,
+            Some(203),
+        );
+        assert!(best_remix.is_some());
+        assert_eq!(best_remix.unwrap()["trackName"], "Levitating (Remix)");
+    }
+
+    #[test]
+    fn test_select_best_match_incompatible_duration() {
+        // Target: 240s
+        let shortened = serde_json::json!({
+            "trackName": "My Song",
+            "artistName": "My Artist",
+            "duration": 180, // diff = 60s > 15s max threshold
+            "syncedLyrics": "[00:10.00]Short version"
+        });
+        let items = vec![shortened];
+        let best = LrclibAdapter::select_best_match(items, "My Song", "My Artist", None, Some(240));
+        assert!(
+            best.is_none(),
+            "Should reject candidate with incompatible duration"
+        );
+    }
+
+    #[test]
+    fn test_select_best_match_correct_plain_over_wrong_synced() {
+        let wrong_artist_synced = serde_json::json!({
+            "trackName": "Yesterday",
+            "artistName": "Boyz II Men",
+            "duration": 125,
+            "syncedLyrics": "[00:05.00]Yesterday..."
+        });
+        let correct_plain = serde_json::json!({
+            "trackName": "Yesterday",
+            "artistName": "The Beatles",
+            "duration": 125,
+            "plainLyrics": "Yesterday, all my troubles seemed so far away"
+        });
+
+        let items = vec![wrong_artist_synced, correct_plain];
+        let best =
+            LrclibAdapter::select_best_match(items, "Yesterday", "The Beatles", None, Some(125));
+        assert!(best.is_some());
+        let selected = best.unwrap();
+        assert_eq!(selected["artistName"], "The Beatles");
+    }
+
+    #[tokio::test]
+    async fn test_cache_provider_isolation() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cibitube_cache_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = LyricsCache::new_with_dir(temp_dir.clone());
+
+        let lrc_lib_lyrics = Lyrics {
+            source_name: "LRCLIB".to_string(),
+            provider: Some("lrclib".to_string()),
+            title: Some("Song".to_string()),
+            artist: Some("Artist".to_string()),
+            album: None,
+            duration_ms: Some(180000),
+            sync_type: LyricsSyncType::Line,
+            is_synced: true,
+            plain: "Lyrics from LRCLIB".to_string(),
+            lines: vec![],
+            offset_ms: 0,
+        };
+
+        // Put into cache under mode 1 (LRCLIB)
+        cache
+            .put(1, "Song", "Artist", Some(180), &lrc_lib_lyrics)
+            .await;
+
+        // Query under mode 2 (QQ) - must be None
+        let qq_cached = cache.get(2, "Song", "Artist", Some(180)).await;
+        assert!(
+            qq_cached.is_none(),
+            "Cache for QQ must not return LRCLIB lyrics"
+        );
+
+        // Query under mode 1 (LRCLIB) - must be Some
+        let lrclib_cached = cache.get(1, "Song", "Artist", Some(180)).await;
+        assert!(lrclib_cached.is_some());
+        assert_eq!(lrclib_cached.unwrap().plain, "Lyrics from LRCLIB");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_stale_request_handling_and_local_protection() {
+        // Normal matching response: valid
+        assert!(is_lyrics_response_valid(
+            false,
+            5,
+            5,
+            Some("track_123"),
+            "track_123"
+        ));
+
+        // Stale response from previous request ID (e.g. song was changed or search refreshed)
+        assert!(!is_lyrics_response_valid(
+            false,
+            6,
+            5,
+            Some("track_123"),
+            "track_123"
+        ));
+
+        // Stale response for previous track
+        assert!(!is_lyrics_response_valid(
+            false,
+            5,
+            5,
+            Some("track_456"),
+            "track_123"
+        ));
+
+        // Local lyrics file selected by user: must protect against any incoming network responses!
+        assert!(!is_lyrics_response_valid(
+            true,
+            5,
+            5,
+            Some("track_123"),
+            "track_123"
+        ));
     }
 }
