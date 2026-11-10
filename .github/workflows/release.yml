@@ -10,7 +10,11 @@ permissions:
   contents: write
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build-desktop:
+    needs: [ci]
     strategy:
       fail-fast: false
       matrix:
@@ -127,8 +131,8 @@ jobs:
           if-no-files-found: ignore
 
   publish-release:
-    # Зависим от build-desktop; если android нет, релиз публикуется без сбоя
-    needs: [build-desktop]
+    # Зависим от обязательного прохождения CI и сборки desktop
+    needs: [ci, build-desktop]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -146,15 +150,19 @@ jobs:
           name: android-apk
           path: release-assets
 
-      - name: Generate SHA256SUMS
+      - name: Generate SHA-256 checksums section for Release Notes
         shell: bash
         run: |
           cd release-assets
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
+          rm -f SHA256SUMS
+          CHECKSUMS=$(sha256sum * | sort)
+          printf "\n### Контрольные суммы SHA-256\n\`\`\`\n%s\n\`\`\`\n" "$CHECKSUMS" > ../release-notes.md
+          cat ../release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
+          body_path: release-notes.md
+          append_body: true
 

@@ -4354,9 +4354,11 @@ impl MetrolistApp {
                                             self.show_update_confirm = false;
                                             self.update_status = Some("Загрузка обновления...".to_string());
                                             let dl = info.download_url.clone();
+                                            let expected_hash = info.expected_sha256.clone();
                                             let tx = self.event_tx.clone();
                                             tokio::spawn(async move {
-                                                let res = crate::updater::Updater::apply_update(dl).await;
+                                                let res =
+                                                    crate::updater::Updater::apply_update(dl, expected_hash).await;
                                                 let _ = tx.send(AppEvent::UpdateApplied(res));
                                             });
                                         }

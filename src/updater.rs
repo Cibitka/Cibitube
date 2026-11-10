@@ -28,6 +28,7 @@ pub struct UpdateInfo {
     pub download_url: Option<String>,
     pub apk_download_url: Option<String>,
     pub notes: String,
+    pub expected_sha256: Option<String>,
 }
 
 pub struct Updater;
@@ -98,6 +99,12 @@ impl Updater {
             .find(|a| a.name.ends_with(".apk"))
             .map(|a| a.browser_download_url.clone());
 
+        let expected_sha256 = if let Some(ref notes) = release.body {
+            Self::extract_sha256_from_release_body(notes, "cibitube").ok()
+        } else {
+            None
+        };
+
         Ok(Some(UpdateInfo {
             version: release.tag_name,
             release_page_url: release
@@ -106,6 +113,7 @@ impl Updater {
             download_url,
             apk_download_url,
             notes: release.body.unwrap_or_default(),
+            expected_sha256,
         }))
     }
 
@@ -130,18 +138,56 @@ impl Updater {
         parse_ver(remote) > parse_ver(current)
     }
 
-    /// Сверка SHA-256 с файлом SHA256SUMS (формат `sha256sum`: "<hash>  <name>")
-    pub fn verify_sha256(bytes: &[u8], sums_file: &str, asset_name: &str) -> bool {
-        let computed = hex::encode(Sha256::digest(bytes));
-        for line in sums_file.lines() {
-            let mut parts = line.split_whitespace();
-            if let (Some(hash), Some(name)) = (parts.next(), parts.next()) {
-                if name.trim_start_matches('*') == asset_name {
-                    return hash.eq_ignore_ascii_case(&computed);
+    /// Извлечение хэша SHA-256 для указанного файла из описания релиза GitHub.
+    /// Поддерживает секцию «### Контрольные суммы SHA-256» или любой markdown-блок/список.
+    pub fn extract_sha256_from_release_body(
+        body: &str,
+        asset_name: &str,
+    ) -> Result<String, String> {
+        let clean_asset = asset_name.trim();
+        let search_text = if let Some((_, section)) = body.split_once("Контрольные суммы SHA-256")
+        {
+            section
+        } else {
+            body
+        };
+
+        for line in search_text.lines() {
+            let trimmed = line.trim().trim_matches('`').trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                // Формат: <64-hex-хэш> <имя_файла>
+                let hash_cand = parts[0];
+                let name_cand = parts[1].trim_start_matches('*');
+                if hash_cand.len() == 64
+                    && hash_cand.chars().all(|c| c.is_ascii_hexdigit())
+                    && name_cand.eq_ignore_ascii_case(clean_asset)
+                {
+                    return Ok(hash_cand.to_ascii_lowercase());
+                }
+                // Формат: <имя_файла>: <64-hex-хэш> или - <имя_файла>: <64-hex-хэш>
+                let last = parts[parts.len() - 1];
+                if last.len() == 64 && last.chars().all(|c| c.is_ascii_hexdigit()) {
+                    let first = parts[0].trim_matches(':').trim_start_matches('-').trim();
+                    if first.eq_ignore_ascii_case(clean_asset) {
+                        return Ok(last.to_ascii_lowercase());
+                    }
                 }
             }
         }
-        false
+
+        Err(format!(
+            "Контрольная сумма SHA-256 для файла «{clean_asset}» не найдена в описании релиза"
+        ))
+    }
+
+    /// Сверка вычисленного SHA-256 с ожидаемым хэшем
+    pub fn verify_sha256(bytes: &[u8], expected_hash: &str) -> bool {
+        let computed = hex::encode(Sha256::digest(bytes));
+        computed.eq_ignore_ascii_case(expected_hash.trim())
     }
 
     async fn get_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
@@ -162,9 +208,12 @@ impl Updater {
         Ok(PathBuf::from(s.trim_end_matches(" (deleted)")))
     }
 
-    /// Скачивает новый бинарник, проверяет SHA-256 и ELF-заголовок, заменяет текущий файл
-    /// (с резервной копией `.bak`). Только Linux.
-    pub async fn apply_update(download_url: Option<String>) -> Result<(), String> {
+    /// Скачивает новый бинарник, проверяет SHA-256 по описанию релиза и ELF-заголовок,
+    /// заменяет текущий файл (с резервной копией `.bak`). Только Linux.
+    pub async fn apply_update(
+        download_url: Option<String>,
+        expected_sha256: Option<String>,
+    ) -> Result<(), String> {
         if !cfg!(target_os = "linux") {
             return Err(
                 "Автообновление доступно только на Linux. Скачайте новую версию со страницы релизов."
@@ -172,21 +221,48 @@ impl Updater {
             );
         }
         let url = download_url.ok_or_else(|| "URL для скачивания релиза не найден".to_string())?;
-        let (base, asset_name) = url
+        let (_base, asset_name) = url
             .rsplit_once('/')
             .ok_or_else(|| "Некорректный URL релиза".to_string())?;
 
         let client = Self::http_client(120)?;
+
+        let expected_hash = match expected_sha256 {
+            Some(h) if !h.trim().is_empty() => h,
+            _ => {
+                let rel_url = format!(
+                    "https://api.github.com/repos/{}/releases/latest",
+                    Self::REPO
+                );
+                let resp = client
+                    .get(&rel_url)
+                    .header("Accept", "application/vnd.github+json")
+                    .send()
+                    .await
+                    .map_err(|e| format!("Не удалось запросить релиз для проверки SHA-256: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("GitHub API вернул статус: {}", resp.status()));
+                }
+                let rel = resp
+                    .json::<GitHubRelease>()
+                    .await
+                    .map_err(|e| format!("Ошибка парсинга релиза: {e}"))?;
+                let body = rel.body.unwrap_or_default();
+                Self::extract_sha256_from_release_body(&body, asset_name)?
+            }
+        };
+
         let bytes = Self::get_bytes(&client, &url)
             .await
             .map_err(|e| format!("Ошибка скачивания: {e}"))?;
 
-        let sums = Self::get_bytes(&client, &format!("{base}/SHA256SUMS"))
-            .await
-            .map_err(|e| format!("Не удалось получить SHA256SUMS (обновление отменено): {e}"))?;
-        let sums_text = String::from_utf8_lossy(&sums);
-        if !Self::verify_sha256(&bytes, &sums_text, asset_name) {
-            return Err("Контрольная сумма SHA-256 не совпадает: обновление отменено".to_string());
+        if !Self::verify_sha256(&bytes, &expected_hash) {
+            let computed = hex::encode(Sha256::digest(&bytes));
+            return Err(format!(
+                "Контрольная сумма SHA-256 не совпадает (ожидалось: {}, получено: {}): обновление отменено",
+                expected_hash.trim(),
+                computed
+            ));
         }
 
         if bytes.len() < 500_000 || !bytes.starts_with(b"\x7fELF") {
@@ -252,16 +328,53 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_sha256_from_release_body() {
+        let release_body = "\
+## Изменения в Cibitube v0.2.10
+
+- Улучшена надежность текстов
+- Исправлена сборка на Windows
+
+### Контрольные суммы SHA-256
+```
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  cibitube
+a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90  cibitube-linux-x86_64.tar.gz
+```
+";
+        let extracted = Updater::extract_sha256_from_release_body(release_body, "cibitube");
+        assert_eq!(
+            extracted,
+            Ok("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
+        );
+
+        let tar_extracted =
+            Updater::extract_sha256_from_release_body(release_body, "cibitube-linux-x86_64.tar.gz");
+        assert_eq!(
+            tar_extracted,
+            Ok("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string())
+        );
+
+        // Missing file
+        let missing = Updater::extract_sha256_from_release_body(release_body, "nonexistent");
+        assert!(missing.is_err());
+        assert!(missing
+            .unwrap_err()
+            .contains("Контрольная сумма SHA-256 для файла «nonexistent» не найдена"));
+
+        // Empty body or no checksums
+        let empty_res = Updater::extract_sha256_from_release_body("", "cibitube");
+        assert!(empty_res.is_err());
+    }
+
+    #[test]
     fn test_verify_sha256() {
         let content = b"cibitube update binary test";
         let hash = hex::encode(Sha256::digest(content));
-        let sums_file = format!("{}  cibitube\notherhash  otherfile", hash);
-        assert!(Updater::verify_sha256(content, &sums_file, "cibitube"));
+        assert!(Updater::verify_sha256(content, &hash));
+        assert!(!Updater::verify_sha256(b"wrong bytes", &hash));
         assert!(!Updater::verify_sha256(
-            b"wrong bytes",
-            &sums_file,
-            "cibitube"
+            content,
+            "0000000000000000000000000000000000000000000000000000000000000000"
         ));
-        assert!(!Updater::verify_sha256(content, &sums_file, "unknown"));
     }
 }
