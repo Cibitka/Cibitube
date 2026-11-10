@@ -18,7 +18,7 @@ enum FlagKind {
     UK,
 }
 
-enum AppEvent {
+pub(crate) enum AppEvent {
     SearchResults(Result<Vec<Track>, String>),
     LikedMusicLoaded(Result<Vec<Track>, String>),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
@@ -44,55 +44,55 @@ enum AppEvent {
 }
 
 pub struct MetrolistApp {
-    innertube: Arc<InnertubeClient>,
-    lyrics_client: Arc<LyricsClient>,
-    player: AudioPlayer,
-    discord: Arc<DiscordRpc>,
-    downloader: Downloader,
-    library: Library,
-    settings: AppSettings,
+    pub(crate) innertube: Arc<InnertubeClient>,
+    pub(crate) lyrics_client: Arc<LyricsClient>,
+    pub(crate) player: AudioPlayer,
+    pub(crate) discord: Arc<DiscordRpc>,
+    pub(crate) downloader: Downloader,
+    pub(crate) library: Library,
+    pub(crate) settings: AppSettings,
 
     // UI State
-    active_tab: ActiveTab,
-    previous_tab: ActiveTab,
-    repeat_mode: usize,
-    shuffle_state: bool,
-    settings_menu_tab: usize,
-    show_lyrics_in_player: bool,
-    search_query: String,
-    search_results: Vec<Track>,
-    is_searching: bool,
-    status_message: Option<String>,
-    download_status: Option<String>,
+    pub(crate) active_tab: ActiveTab,
+    pub(crate) previous_tab: ActiveTab,
+    pub(crate) repeat_mode: usize,
+    pub(crate) shuffle_state: bool,
+    pub(crate) settings_menu_tab: usize,
+    pub(crate) show_lyrics_in_player: bool,
+    pub(crate) search_query: String,
+    pub(crate) search_results: Vec<Track>,
+    pub(crate) is_searching: bool,
+    pub(crate) status_message: Option<String>,
+    pub(crate) download_status: Option<String>,
 
     // Updater State
-    update_info: Option<crate::updater::UpdateInfo>,
-    is_checking_update: bool,
-    is_applying_update: bool,
-    update_status: Option<String>,
-    show_update_confirm: bool,
+    pub(crate) update_info: Option<crate::updater::UpdateInfo>,
+    pub(crate) is_checking_update: bool,
+    pub(crate) is_applying_update: bool,
+    pub(crate) update_status: Option<String>,
+    pub(crate) show_update_confirm: bool,
 
     // Playlists state
-    playlists: Vec<Playlist>,
-    selected_playlist: Option<Playlist>,
-    playlist_tracks: Vec<Track>,
-    is_loading_playlists: bool,
-    is_loading_playlist_tracks: bool,
+    pub(crate) playlists: Vec<Playlist>,
+    pub(crate) selected_playlist: Option<Playlist>,
+    pub(crate) playlist_tracks: Vec<Track>,
+    pub(crate) is_loading_playlists: bool,
+    pub(crate) is_loading_playlist_tracks: bool,
 
     // Queue & Playback
-    queue: Vec<Track>,
-    current_index: Option<usize>,
-    lyrics: Option<Lyrics>,
-    lyrics_req_id: u64,
-    is_local_lyrics: bool,
+    pub(crate) queue: Vec<Track>,
+    pub(crate) current_index: Option<usize>,
+    pub(crate) lyrics: Option<Lyrics>,
+    pub(crate) lyrics_req_id: u64,
+    pub(crate) is_local_lyrics: bool,
 
     // Channels
-    event_tx: mpsc::Sender<AppEvent>,
-    event_rx: mpsc::Receiver<AppEvent>,
-    sync_status_message: Option<String>,
-    last_auto_sync: std::time::Instant,
-    volume_popup_open: bool,
-    pre_mute_volume: f64,
+    pub(crate) event_tx: mpsc::Sender<AppEvent>,
+    pub(crate) event_rx: mpsc::Receiver<AppEvent>,
+    pub(crate) sync_status_message: Option<String>,
+    pub(crate) last_auto_sync: std::time::Instant,
+    pub(crate) volume_popup_open: bool,
+    pub(crate) pre_mute_volume: f64,
 }
 
 impl MetrolistApp {
@@ -316,7 +316,7 @@ impl MetrolistApp {
         }
     }
 
-    fn current_track(&self) -> Option<&Track> {
+    pub(crate) fn current_track(&self) -> Option<&Track> {
         self.current_index.and_then(|idx| self.queue.get(idx))
     }
 
@@ -412,150 +412,6 @@ impl MetrolistApp {
             self.current_index = Some(self.queue.len() - 1);
         }
         self.last_auto_sync = std::time::Instant::now();
-    }
-
-    fn start_lyrics_search_for_track(&mut self, track: &Track, bypass_cache: bool) {
-        self.is_local_lyrics = false;
-        self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
-        let req_id = self.lyrics_req_id;
-        let track_id = track.id.clone();
-        let title = track.title.clone();
-        let artist = track.artist.clone();
-        let mode = self.settings.lyrics_source_mode;
-        let client = Arc::clone(&self.lyrics_client);
-        let tx = self.event_tx.clone();
-        let dur_secs =
-            crate::lyrics::LrcParser::parse_timestamp(&track.duration_text).map(|ms| ms / 1000);
-
-        tokio::spawn(async move {
-            // 1. Проверяем локальный кэш соответствующего режима (если поиск не принудительно без кэша)
-            if !bypass_cache {
-                if let Some(cached) = client.get_cached(mode, &title, &artist, dur_secs).await {
-                    let has_word_sync = cached.is_word_synced();
-                    let _ = tx.send(AppEvent::LyricsLoaded {
-                        track_id: track_id.clone(),
-                        req_id,
-                        lyrics: Some(cached),
-                        is_upgraded: false,
-                    });
-                    if has_word_sync || mode != 0 {
-                        return;
-                    }
-                }
-            }
-
-            // 2. Если выбран конкретный источник вручную
-            if mode != 0 {
-                let res = client
-                    .fetch_direct_source(mode, &title, &artist, None, dur_secs)
-                    .await;
-                if let Some(ref l) = res {
-                    client
-                        .save_to_cache(mode, &title, &artist, dur_secs, l)
-                        .await;
-                }
-                let _ = tx.send(AppEvent::LyricsLoaded {
-                    track_id,
-                    req_id,
-                    lyrics: res,
-                    is_upgraded: false,
-                });
-                return;
-            }
-
-            // 3. Автоматический режим: сначала LRCLIB с переданной длительностью и метаданными
-            let primary = client
-                .fetch_with_meta(&title, &artist, None, dur_secs)
-                .await;
-            let mut had_primary = false;
-            if let Some(ref l) = primary {
-                had_primary = true;
-                let _ = tx.send(AppEvent::LyricsLoaded {
-                    track_id: track_id.clone(),
-                    req_id,
-                    lyrics: Some(l.clone()),
-                    is_upgraded: false,
-                });
-                if l.is_word_synced() {
-                    client.save_to_cache(0, &title, &artist, dur_secs, l).await;
-                    return;
-                }
-            }
-
-            // 4. В фоне: ищем более подробную пословную/слоговую синхронизацию (TTML, QQ, LrcMux)
-            if let Some(richer) = client
-                .fetch_richer_sync(&title, &artist, None, dur_secs)
-                .await
-            {
-                client
-                    .save_to_cache(0, &title, &artist, dur_secs, &richer)
-                    .await;
-                let _ = tx.send(AppEvent::LyricsLoaded {
-                    track_id,
-                    req_id,
-                    lyrics: Some(richer),
-                    is_upgraded: true,
-                });
-            } else if had_primary {
-                if let Some(ref l) = primary {
-                    client.save_to_cache(0, &title, &artist, dur_secs, l).await;
-                }
-            } else {
-                // Если LRCLIB и пословные не нашли, пробуем KuGou как резерв построчного текста
-                if let Some(fallback) = client
-                    .fetch_direct_source(4, &title, &artist, None, dur_secs)
-                    .await
-                {
-                    client
-                        .save_to_cache(0, &title, &artist, dur_secs, &fallback)
-                        .await;
-                    let _ = tx.send(AppEvent::LyricsLoaded {
-                        track_id,
-                        req_id,
-                        lyrics: Some(fallback),
-                        is_upgraded: false,
-                    });
-                } else {
-                    let _ = tx.send(AppEvent::LyricsLoaded {
-                        track_id,
-                        req_id,
-                        lyrics: None,
-                        is_upgraded: false,
-                    });
-                }
-            }
-        });
-        self.lyrics = None;
-    }
-
-    fn trigger_lyrics_search(&mut self, bypass_cache: bool) {
-        self.is_local_lyrics = false;
-        if let Some(track) = self.current_track().cloned() {
-            self.start_lyrics_search_for_track(&track, bypass_cache);
-        }
-    }
-
-    fn pick_and_load_local_lyrics_file(&self) {
-        let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let output = std::process::Command::new("zenity")
-                .args([
-                    "--file-selection",
-                    "--title=Выберите файл текста песни (.lrc, .ttml)",
-                    "--file-filter=Тексты песен (*.lrc *.ttml) | *.lrc *.ttml",
-                ])
-                .output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !path_str.is_empty() {
-                        let _ = tx.send(AppEvent::LocalLyricsFileSelected(
-                            std::path::PathBuf::from(path_str),
-                        ));
-                    }
-                }
-            }
-        });
     }
 
     fn shuffle_slice(slice: &mut [Track]) {

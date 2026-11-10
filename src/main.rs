@@ -7,6 +7,7 @@ mod i18n;
 mod innertube;
 mod library;
 mod lyrics;
+mod lyrics_loader;
 mod models;
 mod player;
 mod settings;
