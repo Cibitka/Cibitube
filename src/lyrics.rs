@@ -15,7 +15,6 @@ pub struct LrcParser;
 impl LrcParser {
     pub fn parse(content: &str, source_name: &str) -> Option<Lyrics> {
         let mut lines = Vec::new();
-        let mut plain_lines = Vec::new();
         let mut title = None;
         let mut artist = None;
         let mut album = None;
@@ -28,53 +27,90 @@ impl LrcParser {
                 continue;
             }
 
-            // ID Tags
-            if line.starts_with("[ti:") && line.ends_with(']') {
-                title = Some(line[4..line.len() - 1].trim().to_string());
-                continue;
-            }
-            if line.starts_with("[ar:") && line.ends_with(']') {
-                artist = Some(line[4..line.len() - 1].trim().to_string());
-                continue;
-            }
-            if line.starts_with("[al:") && line.ends_with(']') {
-                album = Some(line[4..line.len() - 1].trim().to_string());
-                continue;
-            }
-            if line.starts_with("[offset:") && line.ends_with(']') {
-                if let Ok(off) = line[8..line.len() - 1].trim().parse::<i64>() {
-                    offset_ms = off;
+            // Extract multiple header timestamps: e.g. [00:10.00][00:20.00]Chorus line
+            let mut timestamps = Vec::new();
+            let mut rest = line;
+
+            while rest.starts_with('[') {
+                if let Some(close) = rest.find(']') {
+                    let tag = &rest[1..close];
+                    if tag.starts_with("offset:") {
+                        if let Ok(off) = tag[7..].trim().parse::<i64>() {
+                            offset_ms = off;
+                        }
+                        rest = rest[close + 1..].trim_start();
+                        continue;
+                    }
+                    if tag.starts_with("ti:") {
+                        title = Some(tag[3..].trim().to_string());
+                        rest = rest[close + 1..].trim_start();
+                        continue;
+                    }
+                    if tag.starts_with("ar:") {
+                        artist = Some(tag[3..].trim().to_string());
+                        rest = rest[close + 1..].trim_start();
+                        continue;
+                    }
+                    if tag.starts_with("al:") {
+                        album = Some(tag[3..].trim().to_string());
+                        rest = rest[close + 1..].trim_start();
+                        continue;
+                    }
+                    if let Some(ts) = Self::parse_timestamp(tag) {
+                        timestamps.push(ts);
+                        rest = rest[close + 1..].trim_start();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
                 }
+            }
+
+            if timestamps.is_empty() {
                 continue;
             }
 
-            // Timestamp lines: [mm:ss.xx]
-            if line.starts_with('[') {
-                if let Some(close_bracket) = line.find(']') {
-                    let time_part = &line[1..close_bracket];
-                    if let Some(start_ms) = Self::parse_timestamp(time_part) {
-                        let text_part = line[close_bracket + 1..].trim();
-                        if !text_part.is_empty() {
-                            // Check for enhanced LRC word timestamps: <mm:ss.xx>word or (mm:ss.xx)word
-                            let (cleaned_text, words) =
-                                Self::parse_enhanced_words(text_part, start_ms);
-                            if words.is_some() {
-                                has_word_tags = true;
-                            }
-                            let seconds = start_ms as f64 / 1000.0;
-                            plain_lines.push(cleaned_text.clone());
-                            lines.push(LyricsLine {
-                                seconds,
-                                start_ms,
-                                end_ms: None,
-                                text: cleaned_text,
-                                words,
-                                translation: None,
-                                romanization: None,
-                            });
-                        }
+            let text_part = rest.trim();
+            if text_part.is_empty() {
+                continue;
+            }
+
+            let base_ts = timestamps[0];
+            let (cleaned_text, base_words) = Self::parse_enhanced_words(text_part, base_ts);
+            if base_words.is_some() {
+                has_word_tags = true;
+            }
+
+            for &ts in &timestamps {
+                let words_for_line = if let Some(ref bw) = base_words {
+                    if ts == base_ts {
+                        Some(bw.clone())
+                    } else {
+                        let shift = ts as i64 - base_ts as i64;
+                        let shifted = bw
+                            .iter()
+                            .map(|w| LyricsWord {
+                                start_ms: (w.start_ms as i64 + shift).max(0) as u64,
+                                end_ms: (w.end_ms as i64 + shift).max(0) as u64,
+                                text: w.text.clone(),
+                            })
+                            .collect();
+                        Some(shifted)
                     }
-                }
+                } else {
+                    None
+                };
+
+                lines.push(LyricsLine {
+                    seconds: ts as f64 / 1000.0,
+                    start_ms: ts,
+                    end_ms: None,
+                    text: cleaned_text.clone(),
+                    words: words_for_line,
+                    translation: None,
+                    romanization: None,
+                });
             }
         }
 
@@ -84,11 +120,18 @@ impl LrcParser {
 
         lines.sort_by_key(|l| l.start_ms);
 
-        // Fill end_ms from next line's start_ms
+        // Fill end_ms from next line's start_ms and bound word timings
         for i in 0..lines.len() {
             if i + 1 < lines.len() {
                 let next_start = lines[i + 1].start_ms;
                 lines[i].end_ms = Some(next_start);
+                if let Some(ref mut words) = lines[i].words {
+                    if let Some(last_word) = words.last_mut() {
+                        if last_word.end_ms <= last_word.start_ms || last_word.end_ms > next_start {
+                            last_word.end_ms = next_start.max(last_word.start_ms);
+                        }
+                    }
+                }
             }
         }
 
@@ -97,6 +140,8 @@ impl LrcParser {
         } else {
             LyricsSyncType::Line
         };
+
+        let plain_lines: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
 
         Some(Lyrics {
             source_name: source_name.to_string(),
@@ -144,26 +189,40 @@ impl LrcParser {
             if c == '<' || c == '(' {
                 let closing = if c == '<' { '>' } else { ')' };
                 let mut tag = String::new();
-                for inner in chars.by_ref() {
+                let mut found_closing = false;
+                while let Some(&inner) = chars.peek() {
+                    chars.next();
                     if inner == closing {
+                        found_closing = true;
                         break;
                     }
                     tag.push(inner);
                 }
-                if let Some(ts) = Self::parse_timestamp(&tag) {
-                    if !cur_word.is_empty() {
-                        let trimmed = cur_word.trim();
-                        if !trimmed.is_empty() {
-                            words.push(LyricsWord {
-                                start_ms: cur_start,
-                                end_ms: ts,
-                                text: cur_word.clone(),
-                            });
+
+                if found_closing {
+                    if let Some(ts) = Self::parse_timestamp(&tag) {
+                        if !cur_word.is_empty() {
+                            let trimmed = cur_word.trim();
+                            if !trimmed.is_empty() {
+                                words.push(LyricsWord {
+                                    start_ms: cur_start,
+                                    end_ms: ts.max(cur_start),
+                                    text: cur_word.clone(),
+                                });
+                            }
+                            clean_text.push_str(&cur_word);
+                            cur_word.clear();
                         }
-                        clean_text.push_str(&cur_word);
-                        cur_word.clear();
+                        cur_start = ts;
+                        continue;
                     }
-                    cur_start = ts;
+                }
+
+                // Regular parenthesis or bracket without timestamp: preserve it!
+                cur_word.push(c);
+                cur_word.push_str(&tag);
+                if found_closing {
+                    cur_word.push(closing);
                 }
             } else {
                 cur_word.push(c);
@@ -172,11 +231,20 @@ impl LrcParser {
 
         if !cur_word.is_empty() {
             clean_text.push_str(&cur_word);
-            words.push(LyricsWord {
-                start_ms: cur_start,
-                end_ms: cur_start + 500,
-                text: cur_word,
-            });
+            let trimmed = cur_word.trim();
+            if !trimmed.is_empty() {
+                let end_ms = if let Some(last_prev) = words.last() {
+                    let prev_dur = last_prev.end_ms.saturating_sub(last_prev.start_ms);
+                    cur_start + prev_dur.max(100)
+                } else {
+                    cur_start
+                };
+                words.push(LyricsWord {
+                    start_ms: cur_start,
+                    end_ms,
+                    text: cur_word,
+                });
+            }
         }
 
         if words.len() >= 2 {
@@ -309,27 +377,49 @@ impl QrcParser {
         while let Some(c) = chars.next() {
             if c == '(' {
                 let mut tag = String::new();
-                for inner in chars.by_ref() {
+                let mut found_closing = false;
+                while let Some(&inner) = chars.peek() {
+                    chars.next();
                     if inner == ')' {
+                        found_closing = true;
                         break;
                     }
                     tag.push(inner);
                 }
-                if let Some(comma) = tag.find(',') {
-                    let w_start: u64 = tag[..comma].parse().unwrap_or(default_start);
-                    let w_dur: u64 = tag[comma + 1..].parse().unwrap_or(200);
-                    if !cur_text.is_empty() {
-                        words.push(LyricsWord {
-                            start_ms: w_start,
-                            end_ms: w_start + w_dur,
-                            text: cur_text.clone(),
-                        });
-                        cur_text.clear();
+                if found_closing {
+                    if let Some(comma) = tag.find(',') {
+                        if let (Ok(w_start), Ok(w_dur)) = (
+                            tag[..comma].trim().parse::<u64>(),
+                            tag[comma + 1..].trim().parse::<u64>(),
+                        ) {
+                            if !cur_text.is_empty() {
+                                words.push(LyricsWord {
+                                    start_ms: w_start,
+                                    end_ms: w_start + w_dur,
+                                    text: cur_text.clone(),
+                                });
+                                cur_text.clear();
+                            }
+                            continue;
+                        }
                     }
+                }
+                cur_text.push(c);
+                cur_text.push_str(&tag);
+                if found_closing {
+                    cur_text.push(')');
                 }
             } else {
                 cur_text.push(c);
             }
+        }
+
+        if !cur_text.is_empty() {
+            words.push(LyricsWord {
+                start_ms: default_start,
+                end_ms: default_start,
+                text: cur_text,
+            });
         }
         words
     }
@@ -353,51 +443,61 @@ pub struct TtmlParser;
 
 impl TtmlParser {
     pub fn parse(raw: &str, provider: Option<&str>) -> Option<Lyrics> {
+        let doc = match roxmltree::Document::parse(raw) {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+
         let mut lines = Vec::new();
         let mut plain_lines = Vec::new();
-        let mut pos = 0;
+        let mut has_syllables = false;
+        let mut has_words = false;
 
-        while let Some(p_start) = raw[pos..].find("<p") {
-            let abs_p_start = pos + p_start;
-            let tag_close = raw[abs_p_start..].find('>')?;
-            let p_tag = &raw[abs_p_start..abs_p_start + tag_close];
-            let p_end_tag = raw[abs_p_start..].find("</p>")?;
-            let p_content = &raw[abs_p_start + tag_close + 1..abs_p_start + p_end_tag];
+        for p_node in doc
+            .descendants()
+            .filter(|n| n.is_element() && n.tag_name().name().eq_ignore_ascii_case("p"))
+        {
+            let line_begin_ms = Self::extract_time_attr(&p_node, "begin").unwrap_or(0);
+            let line_end_ms = Self::extract_time_attr(&p_node, "end").or_else(|| {
+                let dur = Self::extract_time_attr(&p_node, "dur")?;
+                Some(line_begin_ms + dur)
+            });
 
-            pos = abs_p_start + p_end_tag + 4;
+            // Extract timed words/spans
+            let timed_segments = Self::extract_timed_spans(&p_node, line_begin_ms, line_end_ms);
 
-            let line_begin_ms = Self::extract_attr(p_tag, "begin")
-                .and_then(|b| Self::parse_ttml_time(&b))
-                .unwrap_or(0);
-            let line_end_ms =
-                Self::extract_attr(p_tag, "end").and_then(|e| Self::parse_ttml_time(&e));
+            // Extract full line text preserving punctuation and spacing
+            let full_text = Self::extract_p_text(&p_node);
+            let trimmed = full_text.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
 
-            // Parse inner spans
-            let words = Self::parse_spans(p_content, line_begin_ms);
-            let full_text = if !words.is_empty() {
-                words
-                    .iter()
-                    .map(|w| w.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
+            plain_lines.push(trimmed.clone());
+
+            let words_opt = if !timed_segments.is_empty() {
+                let word_count = trimmed.split_whitespace().count();
+                let syllable = timed_segments.len() > word_count
+                    || Self::has_subword_segments(&timed_segments, &trimmed);
+                if syllable {
+                    has_syllables = true;
+                } else {
+                    has_words = true;
+                }
+                Some(timed_segments)
             } else {
-                Self::strip_tags(p_content)
+                None
             };
 
-            let clean_text = full_text.trim().to_string();
-            if !clean_text.is_empty() {
-                plain_lines.push(clean_text.clone());
-                let words_opt = if !words.is_empty() { Some(words) } else { None };
-                lines.push(LyricsLine {
-                    seconds: line_begin_ms as f64 / 1000.0,
-                    start_ms: line_begin_ms,
-                    end_ms: line_end_ms,
-                    text: clean_text,
-                    words: words_opt,
-                    translation: None,
-                    romanization: None,
-                });
-            }
+            lines.push(LyricsLine {
+                seconds: line_begin_ms as f64 / 1000.0,
+                start_ms: line_begin_ms,
+                end_ms: line_end_ms,
+                text: trimmed,
+                words: words_opt,
+                translation: None,
+                romanization: None,
+            });
         }
 
         if lines.is_empty() {
@@ -406,6 +506,31 @@ impl TtmlParser {
 
         lines.sort_by_key(|l| l.start_ms);
 
+        // Fill missing end_ms from next line's start_ms and bound word timings
+        for i in 0..lines.len() {
+            if i + 1 < lines.len() {
+                let next_start = lines[i + 1].start_ms;
+                if lines[i].end_ms.is_none() {
+                    lines[i].end_ms = Some(next_start);
+                }
+                if let Some(ref mut words) = lines[i].words {
+                    if let Some(last_word) = words.last_mut() {
+                        if last_word.end_ms <= last_word.start_ms || last_word.end_ms > next_start {
+                            last_word.end_ms = next_start.max(last_word.start_ms);
+                        }
+                    }
+                }
+            }
+        }
+
+        let sync_type = if has_syllables {
+            LyricsSyncType::Syllable
+        } else if has_words {
+            LyricsSyncType::Word
+        } else {
+            LyricsSyncType::Line
+        };
+
         Some(Lyrics {
             source_name: "Better Lyrics (TTML)".to_string(),
             provider: provider.map(String::from).or(Some("ttml".to_string())),
@@ -413,7 +538,7 @@ impl TtmlParser {
             artist: None,
             album: None,
             duration_ms: lines.last().and_then(|l| l.end_ms),
-            sync_type: LyricsSyncType::Syllable,
+            sync_type,
             is_synced: true,
             plain: plain_lines.join("\n"),
             lines,
@@ -421,85 +546,169 @@ impl TtmlParser {
         })
     }
 
-    fn parse_spans(content: &str, default_start: u64) -> Vec<LyricsWord> {
-        let mut words = Vec::new();
-        let mut pos = 0;
-
-        while let Some(s_start) = content[pos..].find("<span") {
-            let abs_s_start = pos + s_start;
-            let tag_close = match content[abs_s_start..].find('>') {
-                Some(tc) => tc,
-                None => break,
-            };
-            let span_tag = &content[abs_s_start..abs_s_start + tag_close];
-            let span_end_tag = match content[abs_s_start..].find("</span>") {
-                Some(se) => se,
-                None => break,
-            };
-            let span_content = &content[abs_s_start + tag_close + 1..abs_s_start + span_end_tag];
-            pos = abs_s_start + span_end_tag + 7;
-
-            let w_begin = Self::extract_attr(span_tag, "begin")
-                .and_then(|b| Self::parse_ttml_time(&b))
-                .unwrap_or(default_start);
-            let w_end = Self::extract_attr(span_tag, "end")
-                .and_then(|e| Self::parse_ttml_time(&e))
-                .unwrap_or(w_begin + 250);
-
-            let clean_word = Self::unescape_xml(span_content).trim().to_string();
-            if !clean_word.is_empty() {
-                words.push(LyricsWord {
-                    start_ms: w_begin,
-                    end_ms: w_end,
-                    text: clean_word,
-                });
+    fn extract_time_attr(node: &roxmltree::Node, attr_name: &str) -> Option<u64> {
+        for attr in node.attributes() {
+            if attr.name().eq_ignore_ascii_case(attr_name) {
+                return Self::parse_ttml_time(attr.value());
             }
-        }
-        words
-    }
-
-    pub fn parse_ttml_time(s: &str) -> Option<u64> {
-        let clean = s.trim().trim_end_matches('s');
-        if clean.contains(':') {
-            LrcParser::parse_timestamp(clean)
-        } else if let Ok(secs) = clean.parse::<f64>() {
-            Some((secs * 1000.0).round() as u64)
-        } else {
-            None
-        }
-    }
-
-    fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-        let needle = format!("{}=\"", attr);
-        if let Some(idx) = tag.find(&needle) {
-            let start = idx + needle.len();
-            let end = tag[start..].find('"')?;
-            return Some(tag[start..start + end].to_string());
         }
         None
     }
 
-    fn strip_tags(s: &str) -> String {
-        let mut out = String::new();
-        let mut inside = false;
-        for c in s.chars() {
-            if c == '<' {
-                inside = true;
-            } else if c == '>' {
-                inside = false;
-            } else if !inside {
-                out.push(c);
+    fn extract_p_text(p_node: &roxmltree::Node) -> String {
+        let mut raw = String::new();
+        for d in p_node.descendants() {
+            if d.is_text() {
+                if let Some(t) = d.text() {
+                    raw.push_str(t);
+                }
             }
         }
-        Self::unescape_xml(&out)
+        Self::normalize_whitespace(&raw)
     }
 
-    fn unescape_xml(s: &str) -> String {
-        s.replace("&quot;", "\"")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&apos;", "'")
+    fn normalize_whitespace(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut last_was_space = false;
+        for c in s.chars() {
+            if c.is_whitespace() {
+                if !last_was_space {
+                    out.push(' ');
+                    last_was_space = true;
+                }
+            } else {
+                out.push(c);
+                last_was_space = false;
+            }
+        }
+        out.trim().to_string()
+    }
+
+    fn extract_timed_spans(
+        p_node: &roxmltree::Node,
+        _line_begin: u64,
+        line_end: Option<u64>,
+    ) -> Vec<LyricsWord> {
+        let mut raw_spans: Vec<(u64, Option<u64>, String)> = Vec::new();
+
+        for span in p_node
+            .descendants()
+            .filter(|n| n.is_element() && n.tag_name().name().eq_ignore_ascii_case("span"))
+        {
+            if let Some(begin) = Self::extract_time_attr(&span, "begin") {
+                let has_timed_children = span.descendants().any(|child| {
+                    child.is_element()
+                        && child != span
+                        && Self::extract_time_attr(&child, "begin").is_some()
+                });
+                if !has_timed_children {
+                    let end = Self::extract_time_attr(&span, "end").or_else(|| {
+                        let dur = Self::extract_time_attr(&span, "dur")?;
+                        Some(begin + dur)
+                    });
+                    let mut text = String::new();
+                    for d in span.descendants() {
+                        if d.is_text() {
+                            if let Some(t) = d.text() {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    let clean = Self::normalize_whitespace(&text);
+                    if !clean.is_empty() {
+                        raw_spans.push((begin, end, clean));
+                    }
+                }
+            }
+        }
+
+        if raw_spans.is_empty() {
+            return Vec::new();
+        }
+
+        let mut words = Vec::new();
+        let total = raw_spans.len();
+        for i in 0..total {
+            let (begin, explicit_end, text) = &raw_spans[i];
+            let end = match explicit_end {
+                Some(e) => *e,
+                None => {
+                    if i + 1 < total && raw_spans[i + 1].0 >= *begin {
+                        raw_spans[i + 1].0
+                    } else if let Some(le) = line_end {
+                        le.max(*begin)
+                    } else {
+                        *begin
+                    }
+                }
+            };
+            words.push(LyricsWord {
+                start_ms: *begin,
+                end_ms: end.max(*begin),
+                text: text.clone(),
+            });
+        }
+
+        words
+    }
+
+    fn has_subword_segments(segments: &[LyricsWord], full_text: &str) -> bool {
+        let words: Vec<&str> = full_text.split_whitespace().collect();
+        if segments.len() > words.len() {
+            return true;
+        }
+        for seg in segments {
+            let st = seg.text.trim();
+            if !st.is_empty() && !words.iter().any(|w| *w == st) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn parse_ttml_time(s: &str) -> Option<u64> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Offset-time format
+        if let Some(ms_str) = s.strip_suffix("ms") {
+            return ms_str.trim().parse::<f64>().ok().map(|ms| ms.round().max(0.0) as u64);
+        }
+        if let Some(s_str) = s.strip_suffix('s') {
+            return s_str.trim().parse::<f64>().ok().map(|secs| (secs * 1000.0).round().max(0.0) as u64);
+        }
+        if let Some(m_str) = s.strip_suffix('m') {
+            return m_str.trim().parse::<f64>().ok().map(|mins| (mins * 60.0 * 1000.0).round().max(0.0) as u64);
+        }
+        if let Some(h_str) = s.strip_suffix('h') {
+            return h_str.trim().parse::<f64>().ok().map(|hrs| (hrs * 3600.0 * 1000.0).round().max(0.0) as u64);
+        }
+
+        // Clock-time format: [hh:]mm:ss[.frac]
+        if s.contains(':') {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 2 {
+                let mins: f64 = parts[0].trim().parse().ok()?;
+                let secs: f64 = parts[1].trim().parse().ok()?;
+                return Some(((mins * 60.0 + secs) * 1000.0).round().max(0.0) as u64);
+            } else if parts.len() == 3 {
+                let hrs: f64 = parts[0].trim().parse().ok()?;
+                let mins: f64 = parts[1].trim().parse().ok()?;
+                let secs: f64 = parts[2].trim().parse().ok()?;
+                return Some((((hrs * 3600.0) + (mins * 60.0) + secs) * 1000.0).round().max(0.0) as u64);
+            } else {
+                return None;
+            }
+        }
+
+        // Bare float/int seconds
+        if let Ok(secs) = s.parse::<f64>() {
+            return Some((secs * 1000.0).round().max(0.0) as u64);
+        }
+
+        None
     }
 }
 
@@ -1268,8 +1477,101 @@ mod tests {
         assert_eq!(words[1].text, "club");
         assert_eq!(words[1].start_ms, 9927);
         assert_eq!(words[1].end_ms, 10284);
-        assert_eq!(parsed.sync_type, LyricsSyncType::Syllable);
+        assert_eq!(parsed.sync_type, LyricsSyncType::Word);
         assert!(parsed.is_word_synced());
+    }
+
+    #[test]
+    fn test_parse_ttml_syllables_punctuation_cjk() {
+        // Syllables in single words + punctuation + CJK
+        let sample = "\
+<tt xmlns:itunes=\"http://music.apple.com/lyric-ttml-extensions\">
+  <body>
+    <div>
+      <p begin=\"00:01.000\" end=\"00:03.500\">
+        <span begin=\"00:01.000\" end=\"00:01.500\">Hel</span><span begin=\"00:01.500\" end=\"00:02.000\">lo</span><span begin=\"00:02.000\" end=\"00:03.000\">, world!</span>
+      </p>
+      <p begin=\"00:04.000\" end=\"00:06.000\">
+        <span begin=\"00:04.000\" end=\"00:04.800\">你好</span><span begin=\"00:04.800\" end=\"00:05.500\">世界</span>
+      </p>
+    </div>
+  </body>
+</tt>";
+        let parsed = TtmlParser::parse(sample, Some("ttml")).expect("Failed to parse TTML syllables");
+        assert_eq!(parsed.lines.len(), 2);
+        assert_eq!(parsed.lines[0].text, "Hello, world!");
+        assert_eq!(parsed.sync_type, LyricsSyncType::Syllable);
+        assert_eq!(parsed.lines[1].text, "你好世界");
+    }
+
+    #[test]
+    fn test_parse_ttml_line_only() {
+        let sample = "\
+<tt><body><div>
+<p begin=\"00:01.200\" end=\"00:04.500\">Построчный текст без слогов</p>
+<p begin=\"00:05.000\" end=\"00:08.000\">Вторая строка</p>
+</div></body></tt>";
+        let parsed = TtmlParser::parse(sample, Some("ttml")).expect("Failed to parse line-only TTML");
+        assert_eq!(parsed.lines.len(), 2);
+        assert_eq!(parsed.sync_type, LyricsSyncType::Line);
+        assert!(parsed.lines[0].words.is_none());
+        assert_eq!(parsed.lines[0].text, "Построчный текст без слогов");
+        assert_eq!(parsed.lines[0].start_ms, 1200);
+        assert_eq!(parsed.lines[0].end_ms, Some(4500));
+    }
+
+    #[test]
+    fn test_parse_ttml_namespaces_entities_and_corrupted() {
+        // XML entities and namespaces
+        let sample_entities = "\
+<tt:tt xmlns:tt=\"http://www.w3.org/ns/ttml\">
+  <tt:body>
+    <tt:div>
+      <tt:p begin=\"1s\" end=\"3s\">
+        <tt:span begin=\"1s\" end=\"2s\">Rock &amp; &quot;Roll&quot;</tt:span>
+      </tt:p>
+    </tt:div>
+  </tt:body>
+</tt:tt>";
+        let parsed = TtmlParser::parse(sample_entities, Some("ttml")).expect("Entities TTML");
+        assert_eq!(parsed.lines[0].text, "Rock & \"Roll\"");
+
+        // Corrupted XML does not panic
+        assert!(TtmlParser::parse("<tt><p begin=\"1\">Unclosed", None).is_none());
+        assert!(TtmlParser::parse("plain non-xml text", None).is_none());
+        assert!(TtmlParser::parse("", None).is_none());
+    }
+
+    #[test]
+    fn test_parse_lrc_multi_timestamp_offset_and_parentheses() {
+        let sample = "\
+[ti:Test Track]
+[ar:Test Artist]
+[offset:500]
+[00:10.00][00:30.00]Chorus line with (ooh yeah) non-timing brackets
+[00:50.00]End line";
+
+        let parsed = LrcParser::parse(sample, "LRCLIB").expect("Multi-timestamp LRC");
+        assert_eq!(parsed.offset_ms, 500);
+        assert_eq!(parsed.lines.len(), 3);
+        assert_eq!(parsed.lines[0].start_ms, 10000);
+        assert_eq!(parsed.lines[0].text, "Chorus line with (ooh yeah) non-timing brackets");
+        assert_eq!(parsed.lines[1].start_ms, 30000);
+        assert_eq!(parsed.lines[1].text, "Chorus line with (ooh yeah) non-timing brackets");
+        assert_eq!(parsed.lines[2].start_ms, 50000);
+    }
+
+    #[test]
+    fn test_parse_qrc_cyrillic_cjk_parentheses() {
+        let sample = "\
+[1000,3000]Я(1000,500) юзаю(1500,500) (хор) 練(2000,1000)";
+        let parsed = QrcParser::parse(sample, Some("qq")).expect("QRC parse");
+        assert_eq!(parsed.lines.len(), 1);
+        assert_eq!(parsed.lines[0].start_ms, 1000);
+        assert_eq!(parsed.lines[0].end_ms, Some(4000));
+        assert!(parsed.lines[0].text.contains("Я"));
+        assert!(parsed.lines[0].text.contains("(хор)"));
+        assert!(parsed.lines[0].text.contains("練"));
     }
 
     #[test]

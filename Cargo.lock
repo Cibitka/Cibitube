@@ -645,6 +645,7 @@ dependencies = [
  "hex",
  "image",
  "reqwest",
+ "roxmltree",
  "serde",
  "serde_json",
  "sha1",
