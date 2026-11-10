@@ -619,6 +619,7 @@ mod tests {
     use crate::browser_auth::BrowserAuth;
 
     #[tokio::test]
+    #[ignore = "requires network and Firefox cookies"]
     async fn test_fetch_playlists() {
         let client = InnertubeClient::new();
         let cookie = BrowserAuth::extract_firefox_cookies().expect("Cookies from Firefox");
