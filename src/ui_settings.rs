@@ -19,10 +19,11 @@ impl MetrolistApp {
     ) -> egui::Response {
         let desired_size = Vec2::new(76.0, 26.0);
         let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(resp.id.with("no_button_feedback"), true));
         if ui.is_rect_visible(rect) {
             let painter = ui.painter().with_clip_rect(rect);
             let rounding_r = 6.0_f32;
-            let full_rounding = Rounding::same(rounding_r);
 
             match flag {
                 FlagKind::Russia => {
@@ -60,16 +61,12 @@ impl MetrolistApp {
                     );
                 }
                 FlagKind::UK => {
-                    // Fully rounded navy base (#012169)
-                    painter.rect_filled(rect, full_rounding, Color32::from_rgb(1, 33, 105));
+                    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgb(1, 33, 105));
 
-                    // Inset diagonals: stop well before rounded corners so strokes never poke out
-                    let dx = 8.0_f32;
-                    let dy = 5.0_f32;
-                    let p_tl = pos2(rect.min.x + dx, rect.min.y + dy);
-                    let p_br = pos2(rect.max.x - dx, rect.max.y - dy);
-                    let p_bl = pos2(rect.min.x + dx, rect.max.y - dy);
-                    let p_tr = pos2(rect.max.x - dx, rect.min.y + dy);
+                    let p_tl = rect.left_top();
+                    let p_br = rect.right_bottom();
+                    let p_bl = rect.left_bottom();
+                    let p_tr = rect.right_top();
 
                     // White diagonals
                     let stroke_white_diag = Stroke::new(3.2_f32, Color32::WHITE);
@@ -98,24 +95,13 @@ impl MetrolistApp {
                 }
             }
 
-            // Outline stroke: green highlight when selected, subtle border when unselected
-            let stroke = if is_selected {
-                Stroke::new(2.0_f32, Color32::from_rgb(29, 185, 84))
-            } else if resp.hovered() {
-                Stroke::new(1.5_f32, Color32::from_rgb(130, 130, 150))
+            let pill_rect = Rect::from_center_size(rect.center(), Vec2::new(34.0, 17.0));
+            let pill_fill = if is_selected || resp.hovered() {
+                Color32::from_rgb(12, 12, 18)
             } else {
-                Stroke::new(1.0_f32, Color32::from_rgb(55, 55, 70))
+                Color32::from_rgba_unmultiplied(12, 12, 18, 190)
             };
-            painter.rect_stroke(rect, full_rounding, stroke);
-
-            // Center pill overlay for label readability
-            let pill_size = Vec2::new(34.0, 17.0);
-            let pill_rect = Rect::from_center_size(rect.center(), pill_size);
-            painter.rect_filled(
-                pill_rect,
-                Rounding::same(4.0),
-                Color32::from_rgba_unmultiplied(12, 12, 18, 220),
-            );
+            painter.rect_filled(pill_rect, Rounding::same(4.0), pill_fill);
 
             // Text: RU or EN
             painter.text(
@@ -129,32 +115,130 @@ impl MetrolistApp {
         resp
     }
 
+    pub(crate) fn render_welcome_tour(&mut self, ctx: &egui::Context) {
+        let Some(step) = self.welcome_step else {
+            return;
+        };
+        let en = self.settings.ui_language == "en";
+        let steps = if en {
+            [
+                ("Welcome to Cibitube", "Find a track in |Search|, press |Play|, and add tracks to the |Queue|. Expand the mini player to see the cover, lyrics and playback controls.", None),
+                ("Connect your account", "Sign in to |YouTube Music| in |Firefox| first. Then open |Settings → Accounts| and choose the |Firefox| sign-in button. Once connected, you can select your profile and sync playlists.", Some(1)),
+                ("Make the player yours", "In |Navigation|, choose which sidebar tabs to show. In |Sound|, you can |normalize loudness| and |skip long silences|. Use |Downloads| to choose where audio and cover art are saved.", Some(13)),
+            ]
+        } else {
+            [
+                ("Добро пожаловать в Cibitube", "Найди трек через |«Поиск»|, нажми |«Играть»| и добавь другие песни в |очередь|. Разверни мини-плеер, чтобы увидеть обложку, текст песни и управление воспроизведением.", None),
+                ("Вход в аккаунт", "Сначала войди в |YouTube Music| в |Firefox|. Затем открой |«Настройки → Аккаунты»| и нажми |«Войти через Firefox в один клик»|. После подключения можно выбрать профиль и синхронизировать плейлисты.", Some(1)),
+                ("Настрой плеер под себя", "В разделе |«Навигация»| можно скрыть лишние вкладки. В разделе |«Звук»| можно включить |выравнивание громкости| и |пропуск тишины|. Папка для аудио и обложек выбирается в разделе |«Хранилище»|.", Some(13)),
+            ]
+        };
+        let (title, description, section) = steps[step];
+        egui::Modal::new(egui::Id::new("welcome_tour"))
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(23, 26, 29))
+                    .rounding(20.0)
+                    .inner_margin(20.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(440.0);
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                let green = Color32::from_rgb(78, 224, 167);
+                ui.label(RichText::new(format!("{} / {}", step + 1, steps.len())).color(green));
+                ui.heading(title);
+                ui.add_space(8.0);
+                let mut text = egui::text::LayoutJob::default();
+                for (index, segment) in description.split('|').enumerate() {
+                    let color = if index % 2 == 0 {
+                        Color32::WHITE
+                    } else {
+                        green
+                    };
+                    text.append(
+                        segment,
+                        0.0,
+                        egui::TextFormat::simple(egui::FontId::proportional(15.0), color),
+                    );
+                }
+                ui.label(text);
+                ui.add_space(14.0);
+
+                if let Some(section) = section {
+                    let label = match (en, section) {
+                        (true, 1) => "Open Accounts",
+                        (false, 1) => "Открыть аккаунты",
+                        (true, _) => "Open Navigation",
+                        (false, _) => "Открыть навигацию",
+                    };
+                    if ui.button(label).clicked() {
+                        self.active_tab = crate::models::ActiveTab::Settings;
+                        self.settings_menu_tab = section;
+                        self.finish_welcome_tour();
+                        return;
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if step > 0 && ui.button(if en { "Back" } else { "Назад" }).clicked() {
+                        self.welcome_step = Some(step - 1);
+                    }
+                    if step + 1 < steps.len() {
+                        if ui.button(if en { "Next" } else { "Далее" }).clicked() {
+                            self.welcome_step = Some(step + 1);
+                        }
+                        if ui.button(if en { "Skip" } else { "Пропустить" }).clicked() {
+                            self.finish_welcome_tour();
+                        }
+                    } else if ui.button(if en { "Done" } else { "Готово" }).clicked() {
+                        self.finish_welcome_tour();
+                    }
+                });
+            });
+    }
+
+    fn finish_welcome_tour(&mut self) {
+        self.welcome_step = None;
+        if !self.settings.welcome_tour_seen {
+            self.settings.welcome_tour_seen = true;
+            self.settings.save();
+        }
+    }
+
     pub(crate) fn render_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let accent = self.accent_color();
         let strings = crate::i18n::tr(&self.settings.ui_language);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(strings.nav_settings).size(22.0).strong());
-            ui.add_space(12.0);
-            ui.label(RichText::new("Cibitube v0.2.9").size(12.0).weak());
+            ui.label(
+                RichText::new(concat!("Cibitube v", env!("CARGO_PKG_VERSION")))
+                    .size(12.0)
+                    .weak(),
+            );
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let is_en = self.settings.ui_language == "en";
-                if Self::draw_flag_button(ui, "EN", is_en, FlagKind::UK).clicked() {
-                    self.settings.ui_language = "en".to_string();
-                    self.settings.save();
-                }
-                let is_ru = self.settings.ui_language == "ru";
-                if Self::draw_flag_button(ui, "RU", is_ru, FlagKind::Russia).clicked() {
-                    self.settings.ui_language = "ru".to_string();
-                    self.settings.save();
-                }
-                ui.label(
-                    RichText::new(strings.settings_language_label)
-                        .size(12.0)
-                        .weak(),
-                );
-            });
+            let tour_label = if self.settings.ui_language == "en" {
+                "Quick tour"
+            } else {
+                "Знакомство с Cibitube"
+            };
+            if ui.button(tour_label).clicked() {
+                self.welcome_step = Some(0);
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(strings.settings_language_label).size(12.0));
+            let is_ru = self.settings.ui_language == "ru";
+            if Self::draw_flag_button(ui, "RU", is_ru, FlagKind::Russia).clicked() {
+                self.settings.ui_language = "ru".to_string();
+                self.settings.save();
+            }
+            let is_en = self.settings.ui_language == "en";
+            if Self::draw_flag_button(ui, "EN", is_en, FlagKind::UK).clicked() {
+                self.settings.ui_language = "en".to_string();
+                self.settings.save();
+            }
         });
         ui.add_space(10.0);
 
@@ -217,6 +301,14 @@ impl MetrolistApp {
                 },
             ),
             (
+                13,
+                if self.settings.ui_language == "en" {
+                    "Navigation"
+                } else {
+                    "Навигация"
+                },
+            ),
+            (
                 7,
                 if self.settings.ui_language == "en" {
                     "Audio"
@@ -259,21 +351,27 @@ impl MetrolistApp {
             ),
         ];
 
+        let visuals = ui.visuals();
+        let surface = visuals.widgets.inactive.weak_bg_fill;
+        let text_color = visuals.text_color();
+        let order = [7, 4, 3, 13, 5, 2, 9, 6, 1, 11, 8, 10, 12, 0];
         ui.horizontal_wrapped(|ui| {
-            for (cat_id, title) in categories {
-                let is_sel = self.settings_menu_tab == cat_id;
-                let btn = egui::Button::new(RichText::new(title).size(12.0).color(if is_sel {
+            for cat_id in order {
+                let Some((_, title)) = categories.iter().find(|(id, _)| *id == cat_id) else {
+                    continue;
+                };
+                let selected = self.settings_menu_tab == cat_id;
+                let label = RichText::new(*title).size(13.0).color(if selected {
                     Color32::WHITE
                 } else {
-                    Color32::from_rgb(205, 205, 215)
-                }))
-                .fill(if is_sel {
-                    accent
-                } else {
-                    Color32::from_rgb(28, 28, 36)
-                })
-                .rounding(Rounding::same(8.0));
-                if ui.add_sized([106.0, 32.0], btn).clicked() {
+                    text_color
+                });
+                let button = egui::Button::new(label)
+                    .fill(if selected { accent } else { surface })
+                    .stroke(Stroke::NONE)
+                    .rounding(Rounding::same(18.0))
+                    .min_size(Vec2::new(0.0, 36.0));
+                if ui.add(button).clicked() {
                     self.settings_menu_tab = cat_id;
                 }
             }
@@ -281,7 +379,7 @@ impl MetrolistApp {
 
         ui.add_space(14.0);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(("settings_section", self.settings_menu_tab)).show(ui, |ui| {
             // 1. АККАУНТ GOOGLE / YOUTUBE MUSIC
             if self.settings_menu_tab == 0 || self.settings_menu_tab == 1 {
                 egui::CollapsingHeader::new(RichText::new("Аккаунты Google / YouTube Music").size(16.0).strong())
@@ -439,6 +537,23 @@ impl MetrolistApp {
                             self.settings.save();
                         }
                     });
+                egui::CollapsingHeader::new(RichText::new("Плейлисты YouTube Music").size(16.0).strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.label("Сними галочку, чтобы скрыть плейлист из медиатеки и меню выбора.");
+                        if self.playlists.is_empty()
+                            && ui.add_enabled(!self.is_loading_playlists, egui::Button::new("Загрузить плейлисты")).clicked()
+                        {
+                            self.sync_playlists();
+                        }
+                        for playlist in &self.playlists {
+                            let mut visible = !self.settings.youtube_playlist_hidden(&playlist.id);
+                            if ui.checkbox(&mut visible, &playlist.title).changed() {
+                                self.settings.set_youtube_playlist_hidden(&playlist.id, !visible);
+                                self.settings.save();
+                            }
+                        }
+                    });
                 ui.add_space(12.0);
             }
 
@@ -447,6 +562,32 @@ impl MetrolistApp {
                 egui::CollapsingHeader::new(RichText::new("Внешний вид и Тема").size(16.0).strong())
                     .default_open(true)
                     .show(ui, |ui| {
+                        let en = self.settings.ui_language == "en";
+                        if ui.checkbox(&mut self.settings.cover_ambient_light, if en {
+                            "Ambient cover lighting"
+                        } else {
+                            "Профессиональное освещение обложки"
+                        }).changed() {
+                            self.player.set_audio_processing(self.settings.audio_normalization, self.settings.skip_silence, self.settings.cover_ambient_light);
+                            self.settings.save();
+                        }
+
+                        let ambient_enabled = self.settings.cover_ambient_light;
+                        let mut ambient_changed = false;
+                        for (value, label) in [
+                            (&mut self.settings.ambient_pulse_strength, if en { "Pulse strength" } else { "Сила импульсов" }),
+                            (&mut self.settings.ambient_density, if en { "Density" } else { "Плотность" }),
+                            (&mut self.settings.ambient_blur, if en { "Blur" } else { "Размытие" }),
+                        ] {
+                            ambient_changed |= ui.add_enabled(
+                                ambient_enabled,
+                                egui::Slider::new(value, 0..=100).suffix("%").text(label),
+                            ).changed();
+                        }
+                        if ambient_changed {
+                            self.settings.save();
+                        }
+
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label("Режим темы:");
@@ -624,7 +765,7 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Сдвиг синхронизации по умолчанию:");
                             if ui
                                 .add(
@@ -637,26 +778,18 @@ impl MetrolistApp {
                             {
                                 self.settings.save();
                             }
-                            let offsets = [
-                                (0, "0"),
-                                (500, "500"),
-                                (700, "700"),
-                                (900, "900 (реком.)"),
-                                (1200, "1200"),
-                                (1600, "1600"),
-                            ];
-                            for (val, name) in offsets {
-                                if ui.selectable_label(self.settings.lyrics_manual_offset_ms == val, name).clicked() {
-                                    self.settings.lyrics_manual_offset_ms = val;
-                                    self.settings.save();
-                                }
+                            if ui.selectable_label(self.settings.lyrics_manual_offset_ms == 0, "0 мс")
+                                .on_hover_text("Сбросить сдвиг").clicked()
+                            {
+                                self.settings.lyrics_manual_offset_ms = 0;
+                                self.settings.save();
                             }
                         });
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Анимация подсветки текста:");
-                            let anim_modes = ["По буквам", "По словам", "По строчкам", "Без анимации"];
+                            let anim_modes = ["По буквам (бета)", "По словам", "По строчкам", "Без анимации"];
                             for (i, name) in anim_modes.iter().enumerate() {
                                 if ui.selectable_label(self.settings.lyrics_animation_mode == i, *name).clicked() {
                                     self.settings.lyrics_animation_mode = i;
@@ -724,30 +857,6 @@ impl MetrolistApp {
                             self.settings.save();
                         }
 
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Пункты в боковом меню:").strong());
-                        ui.label(RichText::new("«Настройки» отображаются всегда").weak().size(11.0));
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.checkbox(&mut self.settings.show_nav_search, "Поиск").changed() {
-                                self.settings.save();
-                            }
-                            if ui.checkbox(&mut self.settings.show_nav_liked, "Любимые треки").changed() {
-                                self.settings.save();
-                            }
-                            if ui.checkbox(&mut self.settings.show_nav_playlists, "Медиатека").changed() {
-                                self.settings.save();
-                            }
-                            if ui.checkbox(&mut self.settings.show_nav_queue, "Очередь").changed() {
-                                self.settings.save();
-                            }
-                            if ui.checkbox(&mut self.settings.show_nav_lyrics, "Текст песни").changed() {
-                                self.settings.save();
-                            }
-                            if ui.checkbox(&mut self.settings.show_nav_downloads, "Загрузки").changed() {
-                                self.settings.save();
-                            }
-                        });
-
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("Размер ячейки сетки библиотеки:");
@@ -760,6 +869,34 @@ impl MetrolistApp {
                             }
                         });
                     });
+                ui.add_space(12.0);
+            }
+
+            if self.settings_menu_tab == 0 || self.settings_menu_tab == 13 {
+                let en = self.settings.ui_language == "en";
+                let strings = crate::i18n::tr(&self.settings.ui_language);
+                ui.heading(if en { "Sidebar tabs" } else { "Вкладки бокового меню" });
+                ui.label(if en {
+                    "Choose which tabs to show. Settings is always visible."
+                } else {
+                    "Выбери, какие вкладки показывать. «Настройки» видны всегда."
+                });
+                let tabs = [
+                    (&mut self.settings.show_nav_search, strings.nav_search),
+                    (&mut self.settings.show_nav_liked, if en { "Liked Songs" } else { "Любимые треки" }),
+                    (&mut self.settings.show_nav_playlists, strings.nav_library),
+                    (&mut self.settings.show_nav_queue, if en { "Queue" } else { "Очередь" }),
+                    (&mut self.settings.show_nav_wave, if en { "My wave" } else { "Своя волна" }),
+                    (&mut self.settings.show_nav_lyrics, strings.player_lyrics_tab),
+                    (&mut self.settings.show_nav_downloads, strings.nav_downloads),
+                ];
+                let mut changed = false;
+                for (visible, label) in tabs {
+                    changed |= ui.checkbox(visible, label).changed();
+                }
+                if changed {
+                    self.settings.save();
+                }
                 ui.add_space(12.0);
             }
 
@@ -783,15 +920,37 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
-                        if ui.checkbox(&mut self.settings.audio_normalization, "Нормализация громкости (ReplayGain / Loudness Normalization)").changed() {
-                            self.settings.save();
-                        }
-
-                        if ui.checkbox(&mut self.settings.skip_silence, "Пропуск тишины в начале и конце треков").changed() {
-                            self.settings.save();
-                        }
-
                         if ui.checkbox(&mut self.settings.sponsorblock_enabled, "SponsorBlock (автоматический пропуск немузыкальных фрагментов)").changed() {
+                            self.settings.save();
+                        }
+
+                        let en = self.settings.ui_language == "en";
+                        let normalize_changed = ui.checkbox(
+                            &mut self.settings.audio_normalization,
+                            if en { "Normalize loudness" } else { "Выравнивать громкость" },
+                        ).changed();
+                        let silence_changed = ui.checkbox(
+                            &mut self.settings.skip_silence,
+                            if en { "Skip long silences" } else { "Пропускать долгую тишину" },
+                        ).on_hover_text(if en {
+                            "Shortens quiet gaps longer than 0.8 seconds, including at the end."
+                        } else {
+                            "Сокращает паузы тише −55 дБ длительностью от 0,8 с, в том числе в конце трека."
+                        }).changed();
+                        if normalize_changed || silence_changed {
+                            self.player.set_audio_processing(self.settings.audio_normalization, self.settings.skip_silence, self.settings.cover_ambient_light);
+                            self.settings.save();
+                        }
+
+                        let mut fades_changed = false;
+                        for (seconds, title) in [
+                            (&mut self.settings.fade_in_seconds, if en { "Fade in" } else { "Нарастание в начале" }),
+                            (&mut self.settings.fade_out_seconds, if en { "Fade out" } else { "Затухание в конце" }),
+                        ] {
+                            fades_changed |= ui.add(egui::Slider::new(seconds, 0.0..=15.0)
+                                .step_by(0.5).suffix(if en { " s" } else { " с" }).text(title)).changed();
+                        }
+                        if fades_changed {
                             self.settings.save();
                         }
 

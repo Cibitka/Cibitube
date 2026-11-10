@@ -13,8 +13,9 @@ impl MetrolistApp {
         let mode = self.settings.lyrics_source_mode;
         let client = Arc::clone(&self.lyrics_client);
         let tx = self.event_tx.clone();
-        let dur_secs =
-            crate::lyrics::LrcParser::parse_timestamp(&track.duration_text).map(|ms| ms / 1000);
+        let dur_secs = crate::lyrics::LrcParser::parse_timestamp(&track.duration_text)
+            .map(|ms| ms / 1000)
+            .filter(|secs| *secs > 0);
 
         tokio::spawn(async move {
             // 1. Проверяем локальный кэш соответствующего режима (если поиск не принудительно без кэша)

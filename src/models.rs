@@ -91,6 +91,7 @@ pub enum ActiveTab {
     Liked,
     Playlists,
     Queue,
+    Wave,
     Lyrics,
     Downloads,
     Settings,

@@ -1,5 +1,6 @@
 mod app;
 mod browser_auth;
+mod cover_loader;
 mod discord;
 mod donate;
 mod downloader;
@@ -14,6 +15,7 @@ mod settings;
 mod sync;
 mod ui_lyrics;
 mod ui_settings;
+mod ui_wave;
 mod updater;
 
 use app::MetrolistApp;
@@ -94,7 +96,7 @@ fn main() -> eframe::Result<()> {
         .with_title("Cibitube — YouTube Music Client")
         .with_app_id("cibitube")
         .with_inner_size(Vec2::new(1040.0, 700.0))
-        .with_min_inner_size(Vec2::new(850.0, 520.0));
+        .with_min_inner_size(Vec2::new(680.0, 470.0));
 
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);

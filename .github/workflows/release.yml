@@ -154,15 +154,24 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          rm -f SHA256SUMS
-          CHECKSUMS=$(sha256sum * | sort)
-          printf "\n### Контрольные суммы SHA-256\n\`\`\`\n%s\n\`\`\`\n" "$CHECKSUMS" > ../release-notes.md
+          files=(cibitube cibitube-linux-x86_64.tar.gz)
+          for optional in cibitube-windows-x86_64.zip cibitube-macos-arm64.tar.gz cibitube-android.apk; do
+            if [ -f "$optional" ]; then files+=("$optional"); fi
+          done
+          CHECKSUMS=$(sha256sum "${files[@]}" | sort)
+          printf 'При переходе с v0.2.9 установите эту версию вручную.\n' > ../release-notes.md
+          printf "\n### Контрольные суммы SHA-256\n\`\`\`\n%s\n\`\`\`\n" "$CHECKSUMS" >> ../release-notes.md
           cat ../release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          files: |
+            release-assets/cibitube
+            release-assets/cibitube-linux-x86_64.tar.gz
+            release-assets/cibitube-windows-x86_64.zip
+            release-assets/cibitube-macos-arm64.tar.gz
+            release-assets/cibitube-android.apk
           body_path: release-notes.md
           append_body: true
 

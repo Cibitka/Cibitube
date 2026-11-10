@@ -1,6 +1,6 @@
 [package]
 name = "cibitube"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 description = "Fast native YouTube Music client written in Rust"
 license = "MIT"

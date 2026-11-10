@@ -15,6 +15,12 @@ pub struct AppSettings {
 
     // Язык интерфейса / UI Language ("ru" | "en")
     pub ui_language: String,
+    pub wave_auto: bool,
+    pub wave_mode: usize,
+    pub wave_keyword: String,
+    pub wave_playlist: String,
+    pub wave_track: Option<crate::models::Track>,
+    pub welcome_tour_seen: bool,
 
     // 1. Автосозданные плейлисты
     pub show_liked_playlist: bool,
@@ -22,6 +28,7 @@ pub struct AppSettings {
     pub show_top_playlist: bool,
     pub show_cached_playlist: bool,
     pub show_uploaded_playlist: bool,
+    hidden_youtube_playlists: std::collections::HashMap<usize, Vec<String>>,
 
     // 2. Тема и оформление
     pub theme_mode: usize, // 0 = AMOLED Black, 1 = Dark Slate, 2 = Light
@@ -59,12 +66,15 @@ pub struct AppSettings {
     pub lyrics_animation_mode: usize, // 0 = По буквам, 1 = По словам, 2 = По строчкам, 3 = Без анимации
     pub lyrics_source_mode: usize, // 0 = Автоматически, 1 = LRCLIB, 2 = Better Lyrics (QQ), 3 = Better Lyrics (TTML), 4 = Better Lyrics (KuGou), 5 = LrcMux
     pub lyrics_manual_offset_ms: i64,
+    #[serde(default)]
+    lyrics_offset_zero_migrated: bool,
 
     // 6. Навигация и экран
     pub show_nav_search: bool,
     pub show_nav_liked: bool,
     pub show_nav_playlists: bool,
     pub show_nav_queue: bool,
+    pub show_nav_wave: bool,
     pub show_nav_lyrics: bool,
     pub show_nav_downloads: bool,
 
@@ -76,6 +86,12 @@ pub struct AppSettings {
     // 7. Аудио и качество
     pub audio_quality: String,
     pub audio_normalization: bool,
+    pub cover_ambient_light: bool,
+    pub ambient_pulse_strength: u8,
+    pub ambient_density: u8,
+    pub ambient_blur: u8,
+    pub fade_in_seconds: f64,
+    pub fade_out_seconds: f64,
     pub skip_silence: bool,
     pub sponsorblock_enabled: bool,
 
@@ -139,12 +155,19 @@ impl Default for AppSettings {
             available_accounts: Vec::new(),
 
             ui_language: ui_lang,
+            wave_auto: false,
+            wave_mode: 0,
+            wave_keyword: "Рок".into(),
+            wave_playlist: String::new(),
+            wave_track: None,
+            welcome_tour_seen: false,
 
             show_liked_playlist: true,
             show_downloaded_playlist: true,
             show_top_playlist: true,
             show_cached_playlist: false,
             show_uploaded_playlist: true,
+            hidden_youtube_playlists: Default::default(),
 
             theme_mode: 0,
             accent_color_idx: 0,
@@ -177,12 +200,14 @@ impl Default for AppSettings {
             experimental_lyrics: false,
             lyrics_animation_mode: 0,
             lyrics_source_mode: 0,
-            lyrics_manual_offset_ms: 900,
+            lyrics_manual_offset_ms: 0,
+            lyrics_offset_zero_migrated: true,
 
             show_nav_search: true,
             show_nav_liked: true,
             show_nav_playlists: true,
             show_nav_queue: true,
+            show_nav_wave: true,
             show_nav_lyrics: true,
             show_nav_downloads: true,
 
@@ -193,6 +218,12 @@ impl Default for AppSettings {
 
             audio_quality: "High (320 kbps)".to_string(),
             audio_normalization: true,
+            cover_ambient_light: false,
+            ambient_pulse_strength: 15,
+            ambient_density: 100,
+            ambient_blur: 0,
+            fade_in_seconds: 0.0,
+            fade_out_seconds: 0.0,
             skip_silence: false,
             sponsorblock_enabled: true,
 
@@ -223,6 +254,25 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub(crate) fn youtube_playlist_hidden(&self, id: &str) -> bool {
+        let id = id.strip_prefix("VL").unwrap_or(id);
+        self.hidden_youtube_playlists
+            .get(&self.auth_user_index)
+            .is_some_and(|hidden| hidden.iter().any(|item| item == id))
+    }
+
+    pub(crate) fn set_youtube_playlist_hidden(&mut self, id: &str, hidden: bool) {
+        let id = id.strip_prefix("VL").unwrap_or(id);
+        let ids = self
+            .hidden_youtube_playlists
+            .entry(self.auth_user_index)
+            .or_default();
+        ids.retain(|item| item != id);
+        if hidden {
+            ids.push(id.to_owned());
+        }
+    }
+
     pub fn config_path() -> PathBuf {
         let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
         let new_dir = base.join("cibitube");
@@ -239,7 +289,14 @@ impl AppSettings {
     pub fn load_from(path: &Path) -> Self {
         if let Ok(data) = fs::read_to_string(path) {
             match serde_json::from_str::<AppSettings>(&data) {
-                Ok(settings) => return settings,
+                Ok(mut settings) => {
+                    if !settings.lyrics_offset_zero_migrated {
+                        settings.lyrics_manual_offset_ms = 0;
+                        settings.lyrics_offset_zero_migrated = true;
+                        settings.save_to(path);
+                    }
+                    return settings;
+                }
                 Err(err) => {
                     eprintln!(
                         "Ошибка чтения settings.json: {}. Сохраняем резервную копию.",
@@ -296,6 +353,43 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_visibility_uses_account_and_normalized_id() {
+        let mut settings = AppSettings::default();
+        settings.set_youtube_playlist_hidden("VLPLexample", true);
+        assert!(settings.youtube_playlist_hidden("PLexample"));
+        let mut saved: AppSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        saved.auth_user_index = 1;
+        assert!(!saved.youtube_playlist_hidden("PLexample"));
+        saved.auth_user_index = 0;
+        assert!(saved.youtube_playlist_hidden("VLPLexample"));
+        saved.set_youtube_playlist_hidden("PLexample", false);
+        assert!(!saved.youtube_playlist_hidden("VLPLexample"));
+    }
+
+    #[test]
+    fn old_lyrics_offset_is_reset_once() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cibitube_offset_test_{timestamp}"));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"lyrics_manual_offset_ms":800,"volume":42.0}"#).unwrap();
+
+        let mut migrated = AppSettings::load_from(&path);
+        assert_eq!(migrated.lyrics_manual_offset_ms, 0);
+        assert_eq!(migrated.volume, 42.0);
+        migrated.lyrics_manual_offset_ms = 125;
+        migrated.save_to(&path);
+        assert_eq!(AppSettings::load_from(&path).lyrics_manual_offset_ms, 125);
+        assert_eq!(AppSettings::default().lyrics_manual_offset_ms, 0);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_corrupted_settings_creates_backup() {
