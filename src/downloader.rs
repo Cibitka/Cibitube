@@ -135,7 +135,9 @@ impl Downloader {
                 .lines()
                 .filter(|l| {
                     let trim = l.trim();
-                    trim.contains("ERROR:") || trim.contains("timed out") || trim.contains("HTTP Error")
+                    trim.contains("ERROR:")
+                        || trim.contains("timed out")
+                        || trim.contains("HTTP Error")
                 })
                 .collect::<Vec<_>>()
                 .join("; ");

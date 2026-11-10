@@ -8,12 +8,22 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type IpcReader = Box<dyn Read + Send>;
 type IpcWriter = Box<dyn Write + Send>;
 
+struct PreparedStream {
+    source: String,
+    requested_at: Instant,
+    direct_url: Option<String>,
+}
+
 pub struct AudioPlayer {
+    gain: Mutex<(f64, f64)>,
+    audio_pulse: Arc<Mutex<(f32, Instant)>>,
+    prepared_stream: Arc<Mutex<Option<PreparedStream>>>,
+    preparing_stream: Arc<AtomicBool>,
     process: Child,
     cmd_tx: mpsc::Sender<String>,
     #[allow(dead_code)]
@@ -169,13 +179,38 @@ impl AudioPlayer {
         let info_clone = Arc::clone(&info);
         let finished_clone = Arc::clone(&track_finished);
         let died_clone = Arc::clone(&mpv_died);
+        let audio_pulse = Arc::new(Mutex::new((0.0_f32, Instant::now())));
+        let pulse = Arc::clone(&audio_pulse);
         thread::spawn(move || {
+            let mut average = None::<f32>;
             let reader = BufReader::new(read_stream);
             for line in reader.lines() {
                 let Ok(line_str) = line else { break };
                 let Ok(val) = serde_json::from_str::<Value>(&line_str) else {
                     continue;
                 };
+
+                if val.get("request_id").and_then(Value::as_i64) == Some(900) {
+                    let level = val
+                        .pointer("/data/lavfi.astats.Overall.RMS_level")
+                        .and_then(Value::as_str)
+                        .and_then(|db| db.parse::<f32>().ok())
+                        .map(|db| 10.0_f32.powf(db / 20.0))
+                        .filter(|level| level.is_finite())
+                        .unwrap_or(0.0);
+                    let baseline = average.unwrap_or(level);
+                    average = Some(baseline * 0.97 + level * 0.03);
+                    let hit = (5.5 * (level - baseline) / (baseline + 0.008)).clamp(0.0, 1.0);
+                    if let Ok(mut pulse) = pulse.lock() {
+                        let decay = (-pulse.1.elapsed().as_secs_f32() * 5.0).exp();
+                        pulse.0 = hit.max(pulse.0 * decay);
+                        pulse.1 = Instant::now();
+                    }
+                    continue;
+                }
+                if val.get("event").and_then(Value::as_str) == Some("start-file") {
+                    average = None;
+                }
 
                 if val.get("event").and_then(|e| e.as_str()) == Some("end-file")
                     && val.get("reason").and_then(|r| r.as_str()) == Some("eof")
@@ -203,11 +238,6 @@ impl AudioPlayer {
                                     lock.is_playing = !p;
                                 }
                             }
-                            "volume" => {
-                                if let Some(v) = data.as_f64() {
-                                    lock.volume = v;
-                                }
-                            }
                             "eof-reached" if data.as_bool() == Some(true) => {
                                 finished_clone.store(true, Ordering::SeqCst);
                             }
@@ -225,7 +255,6 @@ impl AudioPlayer {
             (2, "duration"),
             (3, "pause"),
             (4, "eof-reached"),
-            (5, "volume"),
         ] {
             let _ = cmd_tx
                 .send(serde_json::json!({ "command": ["observe_property", id, prop] }).to_string());
@@ -234,6 +263,10 @@ impl AudioPlayer {
             .send(serde_json::json!({ "command": ["set_property", "volume", volume] }).to_string());
 
         Ok(Self {
+            gain: Mutex::new((volume, 1.0)),
+            audio_pulse,
+            prepared_stream: Arc::new(Mutex::new(None)),
+            preparing_stream: Arc::new(AtomicBool::new(false)),
             process,
             cmd_tx,
             sock_path,
@@ -248,9 +281,89 @@ impl AudioPlayer {
         !self.mpv_died.load(Ordering::SeqCst)
     }
 
-    pub fn play_url(&self, url: &str) {
+    pub fn prepare_stream(&self, url: String) {
+        let Ok(mut slot) = self.prepared_stream.lock() else {
+            return;
+        };
+        if slot.as_ref().is_some_and(|entry| {
+            entry.source == url && entry.requested_at.elapsed() < Duration::from_secs(120)
+        }) || self.preparing_stream.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        *slot = Some(PreparedStream {
+            source: url.clone(),
+            requested_at: Instant::now(),
+            direct_url: None,
+        });
+        let cache = Arc::clone(&self.prepared_stream);
+        let busy = Arc::clone(&self.preparing_stream);
+        tokio::task::spawn_blocking(move || {
+            let executable = Self::resolve_ytdl_binary().unwrap_or_else(|| PathBuf::from("yt-dlp"));
+            let direct_url = Command::new(executable)
+                .args([
+                    "--no-playlist",
+                    "--no-warnings",
+                    "--socket-timeout",
+                    "8",
+                    "--extractor-retries",
+                    "0",
+                    "--js-runtimes",
+                    "node",
+                    "-f",
+                    "bestaudio[protocol=https]",
+                    "--get-url",
+                    "--",
+                ])
+                .arg(&url)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|output| output.trim().to_owned())
+                .filter(|output| {
+                    output.starts_with("https://") && !output.contains(char::is_whitespace)
+                });
+            if let Ok(mut slot) = cache.lock() {
+                if let Some(entry) = slot.as_mut().filter(|entry| entry.source == url) {
+                    entry.direct_url = direct_url;
+                }
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub fn set_audio_processing(&self, normalize: bool, skip_silence: bool, ambient: bool) {
+        let mut filters = Vec::new();
+        if skip_silence {
+            filters.push("lavfi=[silenceremove=stop_periods=-1:stop_duration=0.8:stop_threshold=-55dB:stop_silence=0.2:timestamp=copy]");
+        }
+        if normalize {
+            filters.push("lavfi=[dynaudnorm=f=150:g=9:m=3]");
+        }
+        if ambient {
+            filters.push("@ambient:lavfi=[astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level]");
+        }
+        let cmd = serde_json::json!({"command": ["set_property", "af", filters.join(",")]});
+        let _ = self.cmd_tx.send(cmd.to_string());
+    }
+
+    pub fn play_url(&self, url: &str, start_gain: f64) {
         self.track_finished.store(false, Ordering::SeqCst);
-        let cmd = serde_json::json!({ "command": ["loadfile", url, "replace"] }).to_string();
+        self.set_fade_gain(start_gain);
+        let prepared = self.prepared_stream.lock().ok().and_then(|mut slot| {
+            if slot.as_ref().is_some_and(|entry| entry.source == url) {
+                slot.take()
+                    .filter(|entry| entry.requested_at.elapsed() < Duration::from_secs(120))
+                    .and_then(|entry| entry.direct_url)
+            } else {
+                None
+            }
+        });
+        let cmd = serde_json::json!({
+            "command": ["loadfile", prepared.as_deref().unwrap_or(url), "replace"]
+        })
+        .to_string();
         let _ = self.cmd_tx.send(cmd);
         let _ = self
             .cmd_tx
@@ -258,6 +371,7 @@ impl AudioPlayer {
         if let Ok(mut l) = self.info.lock() {
             l.is_playing = true;
             l.position_secs = 0.0;
+            l.duration_secs = 0.0;
         }
     }
 
@@ -298,14 +412,38 @@ impl AudioPlayer {
         }
     }
 
+    pub fn poll_audio_pulse(&self) -> f32 {
+        let _ = self.cmd_tx.send(
+            r#"{"command":["get_property","af-metadata/ambient"],"request_id":900}"#.to_string(),
+        );
+        self.audio_pulse
+            .lock()
+            .map(|pulse| pulse.0 * (-pulse.1.elapsed().as_secs_f32() * 5.0).exp())
+            .unwrap_or_default()
+    }
+
+    fn send_volume(&self, base: f64, gain: f64) {
+        let cmd = serde_json::json!({"command": ["set_property", "volume", base * gain]});
+        let _ = self.cmd_tx.send(cmd.to_string());
+    }
+
+    pub fn set_fade_gain(&self, fade: f64) {
+        if let Ok(mut gain) = self.gain.lock() {
+            let fade = fade.clamp(0.0, 1.0);
+            if (gain.1 - fade).abs() >= 0.002 || (fade == 1.0 && gain.1 != 1.0) {
+                gain.1 = fade;
+                self.send_volume(gain.0, gain.1);
+            }
+        }
+    }
+
     pub fn set_volume(&self, volume: f64) {
-        let cmd = serde_json::json!({
-            "command": ["set_property", "volume", volume]
-        })
-        .to_string();
-        let _ = self.cmd_tx.send(cmd);
-        if let Ok(mut l) = self.info.lock() {
-            l.volume = volume;
+        if let Ok(mut gain) = self.gain.lock() {
+            gain.0 = volume.clamp(0.0, 100.0);
+            self.send_volume(gain.0, gain.1);
+        }
+        if let Ok(mut info) = self.info.lock() {
+            info.volume = volume;
         }
     }
 }

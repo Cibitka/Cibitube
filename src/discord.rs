@@ -1,10 +1,20 @@
 use serde_json::json;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+type RpcStream = UnixStream;
+
+#[cfg(windows)]
+type RpcStream = std::fs::File;
+
+#[cfg(not(any(unix, windows)))]
+type RpcStream = std::io::Cursor<Vec<u8>>;
 
 const METROLIST_CLIENT_ID: &str = "1447278780795064401";
 
@@ -34,17 +44,14 @@ impl DiscordRpc {
         let (tx, rx) = mpsc::channel::<RpcMessage>();
 
         thread::spawn(move || {
-            let mut current_stream: Option<UnixStream> = None;
+            let mut current_stream: Option<RpcStream> = None;
             let mut last_activity: Option<ActivityDetails> = None;
 
             loop {
                 // If not connected, try to connect
                 if current_stream.is_none() {
                     if let Some(socket_path) = get_socket_path() {
-                        if let Ok(mut stream) = UnixStream::connect(&socket_path) {
-                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-
+                        if let Ok(mut stream) = connect_rpc_stream(&socket_path) {
                             // Send handshake
                             let handshake = json!({
                                 "v": 1,
@@ -114,7 +121,7 @@ impl DiscordRpc {
     }
 }
 
-fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
+fn send_activity(stream: &mut RpcStream, act: &ActivityDetails) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -187,6 +194,31 @@ fn send_activity(stream: &mut UnixStream, act: &ActivityDetails) -> bool {
     true
 }
 
+#[cfg(unix)]
+fn connect_rpc_stream(path: &Path) -> std::io::Result<RpcStream> {
+    let stream = UnixStream::connect(path)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    Ok(stream)
+}
+
+#[cfg(windows)]
+fn connect_rpc_stream(path: &Path) -> std::io::Result<RpcStream> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn connect_rpc_stream(_path: &Path) -> std::io::Result<RpcStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unsupported OS",
+    ))
+}
+
+#[cfg(unix)]
 fn get_socket_path() -> Option<PathBuf> {
     let runtime_dir =
         std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
@@ -199,7 +231,23 @@ fn get_socket_path() -> Option<PathBuf> {
     None
 }
 
-fn send_packet(stream: &mut UnixStream, opcode: u32, payload: &str) -> std::io::Result<()> {
+#[cfg(windows)]
+fn get_socket_path() -> Option<PathBuf> {
+    for i in 0..10 {
+        let path = PathBuf::from(format!(r"\\.\pipe\discord-ipc-{}", i));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn get_socket_path() -> Option<PathBuf> {
+    None
+}
+
+fn send_packet(stream: &mut RpcStream, opcode: u32, payload: &str) -> std::io::Result<()> {
     let bytes = payload.as_bytes();
     let length = bytes.len() as u32;
 
@@ -213,7 +261,7 @@ fn send_packet(stream: &mut UnixStream, opcode: u32, payload: &str) -> std::io::
     Ok(())
 }
 
-fn read_response(stream: &mut UnixStream) -> std::io::Result<String> {
+fn read_response(stream: &mut RpcStream) -> std::io::Result<String> {
     let mut header = [0u8; 8];
     stream.read_exact(&mut header)?;
     let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;

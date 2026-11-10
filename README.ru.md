@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/Бэкенд-MPV_%2B_yt--dlp-e11d48.svg?style=for-the-badge" alt="MPV">
   </a>
   <a href="https://github.com/Cibitka/Cibitube/releases">
-    <img src="https://img.shields.io/badge/Платформы-Linux_%7C_Windows_(в_разработке)_%7C_macOS_(в_разработке)-3b82f6.svg?style=for-the-badge&logo=linux" alt="Платформы">
+    <img src="https://img.shields.io/badge/Платформы-Linux-3b82f6.svg?style=for-the-badge&logo=linux" alt="Платформы">
   </a>
   <a href="https://github.com/Cibitka/Cibitube/releases/latest">
     <img src="https://img.shields.io/github/v/release/Cibitka/Cibitube?style=for-the-badge&color=8b5cf6&label=Скачать%20Релиз" alt="Релиз">
@@ -36,7 +36,7 @@
 
 **Cibitube** — быстрый и легковесный клиент YouTube Music на чистом **Rust + egui + MPV + yt-dlp**. Запускается моментально и потребляет ~30 МБ оперативной памяти вместо 500+ МБ у Electron-плееров.
 
-Также в разработке находится клиент для **Android** (по мотивам дизайна [Metrolist](https://github.com/2096-764/metrolist)) в едином стиле **Cibitube AMOLED Emerald**.
+Отдельное приложение для **Android** находится в разработке. В его оформлении **Cibitube AMOLED Emerald** использованы идеи дизайна [Metrolist](https://github.com/2096-764/metrolist).
 
 ### ✨ Возможности
 - ⚡ **Легковесность и скорость**: Нативный GUI на Rust 2021 + egui/eframe 0.30 с прямым управлением через сокет MPV IPC.
@@ -45,6 +45,19 @@
 - 🌐 **Двуязычный интерфейс**: Переключение между русским и английским в один клик.
 - ⏱️ **Управление звуком**: Таймер сна (15/30/45/60 мин), скорость и тональность (0.5x–2.0x), громкость из настроек.
 - 🛡️ **Безопасность**: Права доступа `0600` при создании файлов с куками, атомарное сохранение через временный файл, создание бэкапа `settings.json.bak-<timestamp>` при повреждении.
+
+---
+
+### Скриншоты
+
+![Большой плеер с подсветкой в цвет обложки](docs/media/now-playing.png)
+
+<p align="center">
+  <img src="docs/media/favorites.png" alt="Любимые треки и мини-плеер" width="48%">
+  <img src="docs/media/my-wave.png" alt="Настройка «Своей волны»" width="48%">
+</p>
+
+На экранах показаны тестовые треки и обложки.
 
 ---
 
@@ -91,8 +104,6 @@ install -Dm755 target/release/cibitube ~/.local/bin/cibitube
 
 Настройки и сохраненные данные авторизации располагаются по путям:
 - Linux: `~/.local/share/cibitube/settings.json`
-- Windows: `%APPDATA%\cibitube\settings.json`
-- macOS: `~/Library/Application Support/cibitube/settings.json`
 
 Права доступа `0600` устанавливаются сразу при создании. При ошибке парсинга файл не затирается, а сохраняется в бэкап (`settings.json.bak-<метка_времени>`).
 
@@ -116,6 +127,5 @@ Cibitube сохраняет позицию воспроизведения и о�
 
 ### 📄 Лицензия
 
-- Десктопная часть распространяется под лицензией [MIT](LICENSE).
-- Мобильная часть для Android базируется на открытом проекте [Metrolist](https://github.com/2096-764/metrolist).
+Десктопная версия распространяется под лицензией [MIT](LICENSE).
 

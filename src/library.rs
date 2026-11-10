@@ -13,7 +13,7 @@ pub struct Library {
 impl Library {
     fn path() -> PathBuf {
         let dir = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/home/cibitka/.local/share"))
+            .unwrap_or_else(|| PathBuf::from("."))
             .join("metrolist");
         let _ = fs::create_dir_all(&dir);
         dir.join("library.json")

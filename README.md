@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/Backend-MPV_%2B_yt--dlp-e11d48.svg?style=for-the-badge" alt="MPV">
   </a>
   <a href="https://github.com/Cibitka/Cibitube/releases">
-    <img src="https://img.shields.io/badge/Platform-Linux_%7C_Windows_(WIP)_%7C_macOS_(WIP)-3b82f6.svg?style=for-the-badge&logo=linux" alt="Platforms">
+    <img src="https://img.shields.io/badge/Platform-Linux-3b82f6.svg?style=for-the-badge&logo=linux" alt="Platforms">
   </a>
   <a href="https://github.com/Cibitka/Cibitube/releases/latest">
     <img src="https://img.shields.io/github/v/release/Cibitka/Cibitube?style=for-the-badge&color=8b5cf6&label=Download%20Release" alt="Release">
@@ -36,7 +36,7 @@
 
 **Cibitube** is an ultra-fast, lightweight native YouTube Music client written in pure **Rust + egui + MPV + yt-dlp**. It starts instantly and consumes ~30 MB of RAM compared to 500+ MB Electron-based alternatives.
 
-An accompanying **Android client** is currently in development (inspired by [Metrolist](https://github.com/2096-764/metrolist) design) and styled in the signature **Cibitube AMOLED Emerald** theme.
+A separate **Android app** is in development with the **Cibitube AMOLED Emerald** theme, inspired by the design of [Metrolist](https://github.com/2096-764/metrolist).
 
 ### ✨ Key Features
 - ⚡ **Lightweight & Fast**: Rust 2021 + egui/eframe 0.30 desktop UI with direct MPV IPC control.
@@ -45,6 +45,19 @@ An accompanying **Android client** is currently in development (inspired by [Met
 - 🌐 **Bilingual Interface**: Seamless switching between English and Russian in Settings.
 - ⏱️ **Audio Controls**: Sleep Timer (15/30/45/60 min), variable Playback Speed & Pitch (0.5x–2.0x), and volume control.
 - 🛡️ **Security Hardened**: File permissions `0600` on credentials and settings from creation, atomic file saving with automatic `.bak` backups on corrupted files, and isolated runtime IPC sockets.
+
+---
+
+### Screenshots
+
+![Expanded player with cover-based ambient lighting](docs/media/now-playing.png)
+
+<p align="center">
+  <img src="docs/media/favorites.png" alt="Favorites and mini-player" width="48%">
+  <img src="docs/media/my-wave.png" alt="My Wave recommendations" width="48%">
+</p>
+
+The screens use sample tracks and cover art.
 
 ---
 
@@ -91,8 +104,6 @@ install -Dm755 target/release/cibitube ~/.local/bin/cibitube
 
 Settings and authentication tokens are saved in:
 - Linux: `~/.local/share/cibitube/settings.json`
-- Windows: `%APPDATA%\cibitube\settings.json`
-- macOS: `~/Library/Application Support/cibitube/settings.json`
 
 File permissions are enforced to `0600` upon creation. If a corrupted `settings.json` is encountered, Cibitube creates a timestamped backup (`settings.json.bak-<timestamp>`) before re-initializing defaults so your data is never lost.
 
@@ -116,6 +127,5 @@ Cibitube is free and open-source. If you enjoy using Cibitube and want to suppor
 
 ### 📄 License
 
-- Desktop client is distributed under the [MIT License](LICENSE).
-- Android mobile client is based on the open-source [Metrolist](https://github.com/2096-764/metrolist) project.
+The desktop client is distributed under the [MIT License](LICENSE).
 

@@ -6,12 +6,19 @@ pub struct BrowserAuth;
 impl BrowserAuth {
     /// Attempts to extract YouTube cookies automatically from the user's Firefox profile.
     pub fn extract_firefox_cookies() -> Result<String, String> {
-        let home = dirs::home_dir().ok_or_else(|| "Домашняя директория не найдена".to_string())?;
+        let mut search_dirs = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            search_dirs.push(home.join(".config/mozilla/firefox"));
+            search_dirs.push(home.join(".mozilla/firefox"));
+            search_dirs.push(home.join("Library/Application Support/Firefox/Profiles"));
+        }
+        if let Some(data_dir) = dirs::data_dir() {
+            search_dirs.push(data_dir.join("Mozilla/Firefox/Profiles"));
+        }
 
-        let search_dirs = [
-            home.join(".config/mozilla/firefox"),
-            home.join(".mozilla/firefox"),
-        ];
+        if search_dirs.is_empty() {
+            return Err("Домашняя директория не найдена".to_string());
+        }
 
         let mut cookie_db: Option<PathBuf> = None;
 
@@ -98,6 +105,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires local Firefox session"]
     fn test_extract_firefox_cookies() {
         let res = BrowserAuth::extract_firefox_cookies();
         assert!(

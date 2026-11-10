@@ -1,6 +1,6 @@
 [package]
 name = "cibitube"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 description = "Fast native YouTube Music client written in Rust"
 license = "MIT"
@@ -25,6 +25,7 @@ dirs = "5.0"
 sha2 = "0.10"   # проверка SHA-256 в апдейтере
 hex = "0.4"     # hex-кодирование хэша
 chrono = "0.4"  # метки времени в sync.rs
+roxmltree = "0.19" # безопасный парсинг TTML XML
 
 [profile.release]
 opt-level = 3
