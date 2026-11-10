@@ -12,6 +12,7 @@ mod models;
 mod player;
 mod settings;
 mod sync;
+mod ui_lyrics;
 mod updater;
 
 use app::MetrolistApp;
