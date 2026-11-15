@@ -57,7 +57,7 @@ pub struct I18nStrings {
 
 pub const STRINGS_RU: I18nStrings = I18nStrings {
     nav_home: "Главная",
-    nav_search: "Поиск",
+    nav_search: "Главная",
     nav_library: "Медиатека",
     nav_downloads: "Загрузки",
     nav_settings: "Настройки",
@@ -87,7 +87,7 @@ pub const STRINGS_RU: I18nStrings = I18nStrings {
 
 pub const STRINGS_EN: I18nStrings = I18nStrings {
     nav_home: "Home",
-    nav_search: "Search",
+    nav_search: "Home",
     nav_library: "Library",
     nav_downloads: "Downloads",
     nav_settings: "Settings",

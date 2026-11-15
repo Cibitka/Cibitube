@@ -136,6 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download desktop artifacts
         uses: actions/download-artifact@v4
         with:
@@ -150,11 +152,24 @@ jobs:
           name: android-apk
           path: release-assets
 
+      - name: Generate Linux update patch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! command -v zstd >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y zstd
+          fi
+          bash scripts/update_patch.sh release-assets/cibitube release-assets
+
       - name: Generate SHA-256 checksums section for Release Notes
         shell: bash
         run: |
           cd release-assets
           files=(cibitube cibitube-linux-x86_64.tar.gz)
+          shopt -s nullglob
+          files+=(cibitube-linux-from-v*.zst)
           for optional in cibitube-windows-x86_64.zip cibitube-macos-arm64.tar.gz cibitube-android.apk; do
             if [ -f "$optional" ]; then files+=("$optional"); fi
           done
@@ -169,6 +184,7 @@ jobs:
           files: |
             release-assets/cibitube
             release-assets/cibitube-linux-x86_64.tar.gz
+            release-assets/cibitube-linux-from-v*.zst
             release-assets/cibitube-windows-x86_64.zip
             release-assets/cibitube-macos-arm64.tar.gz
             release-assets/cibitube-android.apk

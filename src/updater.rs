@@ -29,6 +29,14 @@ pub struct UpdateInfo {
     pub apk_download_url: Option<String>,
     pub notes: String,
     pub expected_sha256: Option<String>,
+    pub patch: Option<UpdatePatch>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdatePatch {
+    url: String,
+    sha256: String,
+    base_sha256: String,
 }
 
 pub struct Updater;
@@ -105,6 +113,23 @@ impl Updater {
             None
         };
 
+        let prefix = format!("cibitube-linux-from-v{}-", Self::CURRENT_VERSION);
+        let patch = release.assets.iter().find_map(|asset| {
+            let hash = asset.name.strip_prefix(&prefix)?.strip_suffix(".zst")?;
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some(UpdatePatch {
+                url: asset.browser_download_url.clone(),
+                sha256: Self::extract_sha256_from_release_body(
+                    release.body.as_deref()?,
+                    &asset.name,
+                )
+                .ok()?,
+                base_sha256: hash.to_owned(),
+            })
+        });
+
         Ok(Some(UpdateInfo {
             version: release.tag_name,
             release_page_url: release
@@ -114,6 +139,7 @@ impl Updater {
             apk_download_url,
             notes: release.body.unwrap_or_default(),
             expected_sha256,
+            patch,
         }))
     }
 
@@ -213,7 +239,8 @@ impl Updater {
     pub async fn apply_update(
         download_url: Option<String>,
         expected_sha256: Option<String>,
-    ) -> Result<(), String> {
+        patch: Option<UpdatePatch>,
+    ) -> Result<String, String> {
         if !cfg!(target_os = "linux") {
             return Err(
                 "Автообновление доступно только на Linux. Скачайте новую версию со страницы релизов."
@@ -252,9 +279,23 @@ impl Updater {
             }
         };
 
-        let bytes = Self::get_bytes(&client, &url)
-            .await
-            .map_err(|e| format!("Ошибка скачивания: {e}"))?;
+        let partial = if let Some(patch) = patch {
+            Self::download_patch(&client, patch, &expected_hash).await
+        } else {
+            None
+        };
+        let (bytes, message) = match partial {
+            Some((bytes, downloaded)) => {
+                let percent = downloaded * 100 / bytes.len();
+                (bytes, format!("Обновление установлено. Патч занял {percent}% от полной загрузки. Перезапустите Cibitube."))
+            }
+            None => (
+                Self::get_bytes(&client, &url)
+                    .await
+                    .map_err(|e| format!("Ошибка скачивания: {e}"))?,
+                "Обновление установлено полной загрузкой. Перезапустите Cibitube.".to_owned(),
+            ),
+        };
 
         if !Self::verify_sha256(&bytes, &expected_hash) {
             let computed = hex::encode(Sha256::digest(&bytes));
@@ -269,7 +310,68 @@ impl Updater {
             return Err("Скачанный файл не является исполняемым бинарником Linux".to_string());
         }
 
-        Self::install_binary(&bytes)
+        Self::install_binary(&bytes)?;
+        Ok(message)
+    }
+
+    async fn download_patch(
+        client: &reqwest::Client,
+        patch: UpdatePatch,
+        expected_hash: &str,
+    ) -> Option<(Vec<u8>, usize)> {
+        let base = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        let matches_base = Self::verify_sha256(&fs::read(&base).ok()?, &patch.base_sha256);
+        if !matches_base
+            || !Command::new("zstd")
+                .arg("--version")
+                .output()
+                .ok()?
+                .status
+                .success()
+        {
+            return None;
+        }
+        let bytes = Self::get_bytes(client, &patch.url).await.ok()?;
+        if !Self::verify_sha256(&bytes, &patch.sha256) {
+            return None;
+        }
+        let downloaded = bytes.len();
+        let rebuilt = tokio::task::spawn_blocking(move || Self::apply_patch(&base, &bytes))
+            .await
+            .ok()??;
+        Self::verify_sha256(&rebuilt, expected_hash).then_some((rebuilt, downloaded))
+    }
+
+    fn apply_patch(base: &std::path::Path, bytes: &[u8]) -> Option<Vec<u8>> {
+        use std::io::{Read, Write};
+        use std::process::Stdio;
+        const LIMIT: u64 = 128 * 1024 * 1024;
+        let mut child = Command::new("zstd")
+            .args(["-q", "-d", "-c", "--patch-from"])
+            .arg(base)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(bytes));
+            let mut rebuilt = Vec::new();
+            let read = stdout.take(LIMIT + 1).read_to_end(&mut rebuilt);
+            if read.is_err() || rebuilt.len() as u64 > LIMIT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            let succeeded = child.wait().ok()?.success();
+            if !succeeded || writer.join().ok()?.is_err() {
+                return None;
+            }
+            Some(rebuilt)
+        })
     }
 
     fn install_binary(bytes: &[u8]) -> Result<(), String> {
@@ -316,6 +418,45 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zstd_patch_round_trip_through_updater() {
+        if !Command::new("zstd")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cibitube-patch-test-{}-{timestamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let base = dir.join("old");
+        let target = dir.join("new");
+        let original: Vec<u8> = (0u32..32_768).flat_map(u32::to_le_bytes).collect();
+        let mut changed = original.clone();
+        changed.splice(16_000..16_128, [42; 800]);
+        fs::write(&base, &original).unwrap();
+        fs::write(&target, &changed).unwrap();
+        let patch = Command::new("zstd")
+            .args(["-q", "-c", "--patch-from"])
+            .arg(&base)
+            .arg(&target)
+            .output()
+            .unwrap();
+        let actual = Updater::apply_patch(&base, &patch.stdout);
+        fs::remove_dir_all(dir).unwrap();
+        assert!(patch.status.success());
+        assert!(patch.stdout.len() < changed.len() / 4);
+        assert_eq!(actual.as_deref(), Some(changed.as_slice()));
+    }
 
     #[test]
     fn test_is_newer() {

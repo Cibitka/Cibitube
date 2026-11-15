@@ -126,25 +126,19 @@ impl MetrolistApp {
     }
 
     pub(crate) fn pick_and_load_local_lyrics_file(&self) {
+        if let Some(track) = self.current_track() {
+            self.pick_lyrics_for_track(track.id.clone());
+        }
+    }
+
+    pub(crate) fn pick_lyrics_for_track(&self, track_id: String) {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let output = std::process::Command::new("zenity")
-                .args([
-                    "--file-selection",
-                    "--title=Выберите файл текста песни (.lrc, .ttml)",
-                    "--file-filter=Тексты песен (*.lrc *.ttml) | *.lrc *.ttml",
-                ])
-                .output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !path_str.is_empty() {
-                        let _ = tx.send(AppEvent::LocalLyricsFileSelected(
-                            std::path::PathBuf::from(path_str),
-                        ));
-                    }
-                }
-            }
+            let result = crate::local_media::pick_file(
+                "Выберите файл текста песни",
+                "Тексты песен | *.lrc *.ttml *.qrc *.txt",
+            );
+            let _ = tx.send(AppEvent::LocalLyricsFileSelected(track_id, result));
         });
     }
 }

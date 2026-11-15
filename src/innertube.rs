@@ -223,6 +223,67 @@ impl InnertubeClient {
         Ok(tracks)
     }
 
+    pub async fn fetch_home_tracks(
+        &self,
+        country: &str,
+        language: &str,
+    ) -> Result<Vec<Track>, String> {
+        fn collect(
+            value: &Value,
+            tracks: &mut Vec<Track>,
+            seen: &mut std::collections::HashSet<String>,
+        ) {
+            if tracks.len() >= 24 {
+                return;
+            }
+            let track = if let Some(card) = value.get("musicTwoRowItemRenderer") {
+                InnertubeClient::parse_card(card)
+            } else {
+                InnertubeClient::parse_item(value)
+            };
+            if let Some(track) = track {
+                if seen.insert(track.id.clone()) {
+                    tracks.push(track);
+                }
+                return;
+            }
+            match value {
+                Value::Array(items) => items.iter().for_each(|item| collect(item, tracks, seen)),
+                Value::Object(fields) => {
+                    fields.values().for_each(|item| collect(item, tracks, seen))
+                }
+                _ => {}
+            }
+        }
+
+        let payload = serde_json::json!({
+            "context": {"client": {"clientName": "WEB_REMIX",
+                "clientVersion": "1.20240101.01.00", "hl": language, "gl": country}},
+            "browseId": "FEmusic_home"
+        });
+        let response = self
+            .client
+            .post("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false")
+            .timeout(std::time::Duration::from_secs(15))
+            .header("Origin", "https://music.youtube.com")
+            .json(&payload)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|error| format!("Рекомендации недоступны: {}", error.without_url()))?;
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|_| "Ответ YouTube Music не распознан")?;
+        let mut tracks = Vec::new();
+        collect(
+            &json["contents"],
+            &mut tracks,
+            &mut std::collections::HashSet::new(),
+        );
+        Ok(tracks)
+    }
+
     pub async fn fetch_radio(&self, video_id: &str, country: &str) -> Result<Vec<Track>, String> {
         let payload = serde_json::json!({
             "context": {"client": {"clientName": "WEB_REMIX",
@@ -1130,13 +1191,20 @@ impl InnertubeClient {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| {
-                card.pointer("/title/runs/0/navigationEndpoint/watchEndpoint/videoId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
+                [
+                    "/title/runs/0/navigationEndpoint/watchEndpoint/videoId",
+                    "/navigationEndpoint/watchEndpoint/videoId",
+                ]
+                .into_iter()
+                .find_map(|path| card.pointer(path).and_then(Value::as_str))
+                .map(str::to_owned)
             })?;
 
         let thumbnail = card
             .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+            .or_else(|| {
+                card.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
+            })
             .and_then(|v| v.as_array())
             .and_then(|arr| arr.last())
             .and_then(|t| t.get("url"))

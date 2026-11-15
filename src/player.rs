@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,8 +19,16 @@ struct PreparedStream {
     direct_url: Option<String>,
 }
 
+pub enum PlaybackEvent {
+    Ended,
+    Failed(String),
+}
+
+const FIRST_LOAD_REQUEST: u64 = 10_000;
+
 pub struct AudioPlayer {
     gain: Mutex<(f64, f64)>,
+    audio_filters: Mutex<Option<(bool, bool, bool)>>,
     audio_pulse: Arc<Mutex<(f32, Instant)>>,
     prepared_stream: Arc<Mutex<Option<PreparedStream>>>,
     preparing_stream: Arc<AtomicBool>,
@@ -29,7 +37,8 @@ pub struct AudioPlayer {
     #[allow(dead_code)]
     sock_path: PathBuf,
     pub info: Arc<Mutex<PlaybackInfo>>,
-    pub track_finished: Arc<AtomicBool>,
+    load_request: AtomicU64,
+    playback_events: mpsc::Receiver<(u64, PlaybackEvent)>,
     /// true, если mpv завершился или IPC-канал закрылся
     pub mpv_died: Arc<AtomicBool>,
 }
@@ -125,7 +134,8 @@ impl AudioPlayer {
             .arg("--no-video")
             .arg(format!("--input-ipc-server={}", sock_path.display()))
             .arg("--ytdl-format=bestaudio/best")
-            .arg("--keep-open=yes")
+            .arg("--keep-open=no")
+            .arg("--network-timeout=15")
             .arg("--cache=yes")
             .arg("--demuxer-max-bytes=67108864")
             .arg("--demuxer-readahead-secs=120")
@@ -163,7 +173,7 @@ impl AudioPlayer {
             duration_secs: 0.0,
             volume,
         }));
-        let track_finished = Arc::new(AtomicBool::new(false));
+        let (playback_tx, playback_events) = mpsc::channel();
         let mpv_died = Arc::new(AtomicBool::new(false));
 
         // Поток записи команд
@@ -177,12 +187,13 @@ impl AudioPlayer {
 
         // Поток чтения событий
         let info_clone = Arc::clone(&info);
-        let finished_clone = Arc::clone(&track_finished);
         let died_clone = Arc::clone(&mpv_died);
         let audio_pulse = Arc::new(Mutex::new((0.0_f32, Instant::now())));
         let pulse = Arc::clone(&audio_pulse);
         thread::spawn(move || {
             let mut average = None::<f32>;
+            let mut load = None;
+            let mut early_end = None;
             let reader = BufReader::new(read_stream);
             for line in reader.lines() {
                 let Ok(line_str) = line else { break };
@@ -212,10 +223,50 @@ impl AudioPlayer {
                     average = None;
                 }
 
-                if val.get("event").and_then(|e| e.as_str()) == Some("end-file")
-                    && val.get("reason").and_then(|r| r.as_str()) == Some("eof")
+                if let Some(request) = val["request_id"]
+                    .as_u64()
+                    .filter(|id| *id >= FIRST_LOAD_REQUEST)
                 {
-                    finished_clone.store(true, Ordering::SeqCst);
+                    if val["error"].as_str() != Some("success") && request % 2 == 0 {
+                        let error = val["error"].as_str().unwrap_or("ошибка команды mpv");
+                        let _ =
+                            playback_tx.send((request, PlaybackEvent::Failed(error.to_owned())));
+                    }
+                    // Modern mpv returns the entry ID from loadfile; the following property
+                    // request also supports builds that omit data from the loadfile reply.
+                    let entry = if request % 2 == 0 {
+                        val["data"]["playlist_entry_id"].as_i64()
+                    } else {
+                        val["data"].as_i64()
+                    };
+                    if let Some(entry) = entry {
+                        let request = request & !1;
+                        load = Some((entry, request));
+                        if early_end.as_ref().is_some_and(|(id, _)| *id == entry) {
+                            if let Some((_, event)) = early_end.take() {
+                                let _ = playback_tx.send((request, event));
+                            }
+                        }
+                    }
+                }
+                if val["event"].as_str() == Some("end-file") {
+                    let event = match val["reason"].as_str() {
+                        Some("eof") => Some(PlaybackEvent::Ended),
+                        Some("error") => Some(PlaybackEvent::Failed(
+                            val["file_error"]
+                                .as_str()
+                                .unwrap_or("ошибка mpv")
+                                .to_owned(),
+                        )),
+                        _ => None,
+                    };
+                    if let (Some(entry), Some(event)) = (val["playlist_entry_id"].as_i64(), event) {
+                        if let Some((_, request)) = load.filter(|(id, _)| *id == entry) {
+                            let _ = playback_tx.send((request, event));
+                        } else {
+                            early_end = Some((entry, event));
+                        }
+                    }
                 }
 
                 if let (Some(name), Some(data)) =
@@ -238,9 +289,6 @@ impl AudioPlayer {
                                     lock.is_playing = !p;
                                 }
                             }
-                            "eof-reached" if data.as_bool() == Some(true) => {
-                                finished_clone.store(true, Ordering::SeqCst);
-                            }
                             _ => {}
                         }
                     }
@@ -250,12 +298,7 @@ impl AudioPlayer {
             died_clone.store(true, Ordering::SeqCst);
         });
 
-        for (id, prop) in [
-            (1, "time-pos"),
-            (2, "duration"),
-            (3, "pause"),
-            (4, "eof-reached"),
-        ] {
+        for (id, prop) in [(1, "time-pos"), (2, "duration"), (3, "pause")] {
             let _ = cmd_tx
                 .send(serde_json::json!({ "command": ["observe_property", id, prop] }).to_string());
         }
@@ -264,6 +307,7 @@ impl AudioPlayer {
 
         Ok(Self {
             gain: Mutex::new((volume, 1.0)),
+            audio_filters: Mutex::new(None),
             audio_pulse,
             prepared_stream: Arc::new(Mutex::new(None)),
             preparing_stream: Arc::new(AtomicBool::new(false)),
@@ -271,7 +315,8 @@ impl AudioPlayer {
             cmd_tx,
             sock_path,
             info,
-            track_finished,
+            load_request: AtomicU64::new(FIRST_LOAD_REQUEST - 2),
+            playback_events,
             mpv_died,
         })
     }
@@ -281,15 +326,17 @@ impl AudioPlayer {
         !self.mpv_died.load(Ordering::SeqCst)
     }
 
-    pub fn prepare_stream(&self, url: String) {
+    pub fn prepare_stream(&self, url: String) -> bool {
         let Ok(mut slot) = self.prepared_stream.lock() else {
-            return;
+            return false;
         };
         if slot.as_ref().is_some_and(|entry| {
             entry.source == url && entry.requested_at.elapsed() < Duration::from_secs(120)
-        }) || self.preparing_stream.swap(true, Ordering::SeqCst)
-        {
-            return;
+        }) {
+            return true;
+        }
+        if self.preparing_stream.swap(true, Ordering::SeqCst) {
+            return false;
         }
         *slot = Some(PreparedStream {
             source: url.clone(),
@@ -331,9 +378,18 @@ impl AudioPlayer {
             }
             busy.store(false, Ordering::SeqCst);
         });
+        true
     }
 
     pub fn set_audio_processing(&self, normalize: bool, skip_silence: bool, ambient: bool) {
+        let desired = (normalize, skip_silence, ambient);
+        let Ok(mut current) = self.audio_filters.lock() else {
+            return;
+        };
+        if *current == Some(desired) {
+            return;
+        }
+        *current = Some(desired);
         let mut filters = Vec::new();
         if skip_silence {
             filters.push("lavfi=[silenceremove=stop_periods=-1:stop_duration=0.8:stop_threshold=-55dB:stop_silence=0.2:timestamp=copy]");
@@ -349,7 +405,7 @@ impl AudioPlayer {
     }
 
     pub fn play_url(&self, url: &str, start_gain: f64) {
-        self.track_finished.store(false, Ordering::SeqCst);
+        let request = self.load_request.fetch_add(2, Ordering::SeqCst) + 2;
         self.set_fade_gain(start_gain);
         let prepared = self.prepared_stream.lock().ok().and_then(|mut slot| {
             if slot.as_ref().is_some_and(|entry| entry.source == url) {
@@ -361,10 +417,15 @@ impl AudioPlayer {
             }
         });
         let cmd = serde_json::json!({
-            "command": ["loadfile", prepared.as_deref().unwrap_or(url), "replace"]
+            "command": ["loadfile", prepared.as_deref().unwrap_or(url), "replace"],
+            "request_id": request
         })
         .to_string();
-        let _ = self.cmd_tx.send(cmd);
+        let get_entry = serde_json::json!({
+            "command": ["get_property", "playlist/0/id"],
+            "request_id": request + 1
+        });
+        let _ = self.cmd_tx.send(format!("{cmd}\n{get_entry}"));
         let _ = self
             .cmd_tx
             .send(r#"{"command":["set_property","pause",false]}"#.to_string());
@@ -373,6 +434,31 @@ impl AudioPlayer {
             l.position_secs = 0.0;
             l.duration_secs = 0.0;
         }
+    }
+
+    pub fn stop(&self) {
+        self.load_request.fetch_add(2, Ordering::SeqCst);
+        let _ = self.cmd_tx.send(r#"{"command":["stop"]}"#.into());
+        if let Ok(mut info) = self.info.lock() {
+            info.is_playing = false;
+            info.position_secs = 0.0;
+            info.duration_secs = 0.0;
+        }
+    }
+
+    pub fn playback_event(&self) -> Option<PlaybackEvent> {
+        let current = self.load_request.load(Ordering::SeqCst);
+        self.playback_events
+            .try_iter()
+            .find_map(|(request, event)| {
+                if request != current {
+                    return None;
+                }
+                if let Ok(mut info) = self.info.lock() {
+                    info.is_playing = false;
+                }
+                Some(event)
+            })
     }
 
     pub fn set_speed(&self, speed: f64, preserve_pitch: bool) {
@@ -454,5 +540,52 @@ impl Drop for AudioPlayer {
         let _ = self.process.wait();
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires mpv and permission to use local IPC"]
+    fn mpv_reports_errors_and_end_of_file_for_the_current_load() {
+        fn wait_for_event(player: &AudioPlayer) -> PlaybackEvent {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                if let Some(event) = player.playback_event() {
+                    return event;
+                }
+                assert!(Instant::now() < deadline, "no mpv playback event");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let files = tempfile::tempdir().unwrap();
+        let mut wav = Vec::new();
+        let silence = [0; 16_000];
+        wav.extend(b"RIFF");
+        wav.extend((36 + silence.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16_u32.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(8_000_u32.to_le_bytes());
+        wav.extend(16_000_u32.to_le_bytes());
+        wav.extend(2_u16.to_le_bytes());
+        wav.extend(16_u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((silence.len() as u32).to_le_bytes());
+        wav.extend(silence);
+        let audio = files.path().join("silence.wav");
+        std::fs::write(&audio, wav).unwrap();
+
+        let player = AudioPlayer::with_volume(0.0).unwrap();
+        let missing = files.path().join("missing.wav");
+        player.play_url(missing.to_str().unwrap(), 1.0);
+        assert!(matches!(wait_for_event(&player), PlaybackEvent::Failed(_)));
+        player.play_url(missing.to_str().unwrap(), 1.0);
+        player.play_url(audio.to_str().unwrap(), 1.0);
+        assert!(matches!(wait_for_event(&player), PlaybackEvent::Ended));
     }
 }

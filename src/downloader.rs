@@ -1,6 +1,7 @@
-use crate::lyrics::LyricsClient;
+use crate::lyrics::{LrcParser, LyricsClient};
 use crate::models::Track;
 use crate::settings::AppSettings;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -34,27 +35,65 @@ pub struct DownloadTask {
     pub options: DownloadOptions,
 }
 
+#[derive(Clone)]
+pub(crate) enum DownloadState {
+    Queued,
+    Active {
+        attempt: u8,
+        percent: f32,
+        speed: Option<f64>,
+        processing: bool,
+    },
+}
+
+pub(crate) enum DownloadEvent {
+    Progress(String, DownloadState),
+    Finished(Track, Result<String, String>),
+}
+
 pub struct Downloader {
     tx: mpsc::Sender<DownloadTask>,
 }
 
 impl Downloader {
-    #[allow(clippy::type_complexity)]
-    pub fn new() -> (Self, mpsc::Receiver<(Track, Result<String, String>)>) {
+    pub fn new(ctx: eframe::egui::Context) -> (Self, mpsc::Receiver<DownloadEvent>) {
         let (task_tx, task_rx) = mpsc::channel::<DownloadTask>();
-        let (result_tx, result_rx) = mpsc::channel::<(Track, Result<String, String>)>();
-
+        let (result_tx, result_rx) = mpsc::channel();
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .ok();
             let lyrics_client = LyricsClient::new();
-
-            // Последовательная очередь: один трек за раз
+            let send = |event| {
+                let _ = result_tx.send(event);
+                ctx.request_repaint();
+            };
             while let Ok(task) = task_rx.recv() {
-                let res = Self::run_download(&task, rt.as_ref(), &lyrics_client);
-                let _ = result_tx.send((task.track, res));
+                let mut result = Err("Загрузка не началась".to_owned());
+                for attempt in 1..=3 {
+                    let progress = |percent, speed, processing| {
+                        send(DownloadEvent::Progress(
+                            task.track.id.clone(),
+                            DownloadState::Active {
+                                attempt,
+                                percent,
+                                speed,
+                                processing,
+                            },
+                        ));
+                    };
+                    progress(0.0, None, false);
+                    result =
+                        Self::run_download(&task, attempt, rt.as_ref(), &lyrics_client, &progress);
+                    if result.is_ok() {
+                        break;
+                    }
+                    if attempt < 3 {
+                        thread::sleep(std::time::Duration::from_secs(u64::from(attempt)));
+                    }
+                }
+                send(DownloadEvent::Finished(task.track, result));
             }
         });
 
@@ -63,8 +102,10 @@ impl Downloader {
 
     fn run_download(
         task: &DownloadTask,
+        attempt: u8,
         rt: Option<&tokio::runtime::Runtime>,
         lyrics_client: &LyricsClient,
+        progress: &impl Fn(f32, Option<f64>, bool),
     ) -> Result<String, String> {
         let opts = &task.options;
 
@@ -79,8 +120,8 @@ impl Downloader {
             );
         }
 
-        let safe_title =
-            Self::sanitize_filename(&format!("{} - {}", task.track.artist, task.track.title));
+        let raw_title = format!("{} - {}", task.track.artist, task.track.title);
+        let safe_title = Self::download_basename(&raw_title);
         // '%' в шаблоне yt-dlp это спецсимвол, экранируем
         let template_name = safe_title.replace('%', "%%");
         let output_template = PathBuf::from(&opts.download_dir)
@@ -89,11 +130,22 @@ impl Downloader {
             .to_string();
         let url = format!("https://www.youtube.com/watch?v={}", task.track.id);
 
+        let format = match attempt {
+            1 => "ba[protocol=https]/ba/b",
+            2 => "ba[protocol^=m3u8]/ba/b",
+            _ => "ba/b",
+        };
         let mut cmd = Command::new(Self::resolve_ytdl_path());
-        cmd.arg("-x")
+        cmd.arg("--newline")
+            .arg("--progress")
+            .arg("--progress-delta")
+            .arg("0.4")
+            .arg("--progress-template")
+            .arg("download:CIBITUBE %(progress._percent_str)s|%(progress.speed)s")
+            .arg("-x")
             .arg("--no-playlist")
             .arg("-f")
-            .arg("ba/b")
+            .arg(format)
             .arg("--audio-format")
             .arg(&opts.audio_format)
             .arg("--audio-quality")
@@ -103,34 +155,70 @@ impl Downloader {
             .arg("--socket-timeout")
             .arg("15")
             .arg("--retries")
-            .arg("3")
+            .arg("0")
+            .arg("--extractor-retries")
+            .arg("0")
             .arg("--fragment-retries")
-            .arg("5")
-            .arg("--throttled-rate")
-            .arg("100K")
+            .arg("2")
+            .arg("--abort-on-unavailable-fragments")
             .arg("--js-runtimes")
             .arg("node");
 
-        if !opts.google_cookie.is_empty() {
-            cmd.arg("--add-header")
-                .arg(format!("Cookie: {}", opts.google_cookie));
+        let cookie_file = if attempt == 3 && !opts.google_cookie.is_empty() {
+            Some(youtube_cookie_file(&opts.google_cookie).map_err(|e| {
+                format!(
+                    "Не удалось подготовить авторизацию для yt-dlp: {}",
+                    e.kind()
+                )
+            })?)
+        } else {
+            None
+        };
+        if let Some(file) = &cookie_file {
+            cmd.arg("--cookies").arg(file.path());
         }
 
-        if opts.embed_cover {
+        // The final attempt saves the audio even when artwork post-processing fails.
+        let embed_cover = opts.embed_cover && attempt < 3;
+        let save_cover = opts.save_cover_file && attempt < 3;
+        if embed_cover {
             cmd.arg("--embed-thumbnail");
         }
-        if opts.save_cover_file {
+        if save_cover {
             cmd.arg("--write-thumbnail")
                 .arg("--convert-thumbnails")
                 .arg("jpg");
         }
-        cmd.arg("-o").arg(&output_template).arg(&url);
+        cmd.arg("-o").arg(&output_template).arg("--").arg(&url);
 
-        let output = cmd
-            .output()
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("Ошибка запуска yt-dlp: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (status, errors) = thread::scope(|scope| {
+            let errors = scope.spawn(move || {
+                let mut recent = std::collections::VecDeque::new();
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if recent.len() == 16 {
+                        recent.pop_front();
+                    }
+                    recent.push_back(line);
+                }
+                recent.into_iter().collect::<Vec<_>>().join("\n")
+            });
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some((percent, speed)) = parse_progress(&line) {
+                    progress(percent, speed, false);
+                }
+            }
+            (child.wait(), errors.join().unwrap_or_default())
+        });
+        let status = status.map_err(|e| format!("Ошибка ожидания yt-dlp: {e}"))?;
+        if !status.success() {
+            let stderr = errors;
             let meaningful_err = stderr
                 .lines()
                 .filter(|l| {
@@ -157,16 +245,54 @@ impl Downloader {
                     .join(" ")
             };
 
-            return Err(format!("yt-dlp error: {}", err_summary));
+            let message = if err_summary.is_empty() {
+                status.to_string()
+            } else {
+                err_summary
+                    .split_whitespace()
+                    .map(|word| {
+                        if word.contains("https://") || word.contains("http://") {
+                            "[URL]"
+                        } else {
+                            word
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            return Err(format!("yt-dlp: {message}"));
         }
 
+        let audio =
+            PathBuf::from(&opts.download_dir).join(format!("{safe_title}.{}", opts.audio_format));
+        if !audio
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        {
+            return Err("yt-dlp завершился, но итоговый аудиофайл отсутствует.".to_owned());
+        }
+        progress(100.0, None, true);
         // Текст песни (.lrc), только после успешной загрузки аудио
         let mut lyrics_saved = false;
         if opts.save_lyrics_lrc {
             if let Some(runtime) = rt {
-                if let Some(lyrics) =
-                    runtime.block_on(lyrics_client.fetch(&task.track.title, &task.track.artist))
-                {
+                let duration = LrcParser::parse_timestamp(&task.track.duration_text)
+                    .filter(|&millis| millis > 0)
+                    .map(|millis| millis / 1000);
+                if let Some(lyrics) = runtime.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(18),
+                        lyrics_client.fetch_with_meta(
+                            &task.track.title,
+                            &task.track.artist,
+                            None,
+                            duration,
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                }) {
                     let lrc_path =
                         PathBuf::from(&opts.download_dir).join(format!("{safe_title}.lrc"));
                     let mut lrc = format!(
@@ -174,10 +300,17 @@ impl Downloader {
                         task.track.title, task.track.artist
                     );
                     if lyrics.is_synced && !lyrics.lines.is_empty() {
+                        if lyrics.offset_ms != 0 {
+                            lrc.push_str(&format!("[offset:{}]\n", lyrics.offset_ms));
+                        }
                         for line in &lyrics.lines {
-                            let mins = (line.seconds / 60.0).floor() as u32;
-                            let secs = line.seconds % 60.0;
-                            lrc.push_str(&format!("[{:02}:{:05.2}]{}\n", mins, secs, line.text));
+                            let minutes = line.start_ms / 60_000;
+                            let seconds = line.start_ms / 1_000 % 60;
+                            let millis = line.start_ms % 1_000;
+                            lrc.push_str(&format!(
+                                "[{minutes:02}:{seconds:02}.{millis:03}]{}\n",
+                                line.text
+                            ));
                         }
                     } else {
                         lrc.push_str(&lyrics.plain);
@@ -188,7 +321,7 @@ impl Downloader {
         }
 
         let mut details = vec!["Аудио"];
-        if opts.embed_cover || opts.save_cover_file {
+        if embed_cover || save_cover {
             details.push("Обложка");
         }
         if lyrics_saved {
@@ -248,6 +381,16 @@ impl Downloader {
         }
     }
 
+    pub(crate) fn download_basename(raw: &str) -> String {
+        let mut name = Self::sanitize_filename(raw);
+        let mut limit = name.len().min(225);
+        while !name.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        name.truncate(limit);
+        name.trim_end_matches([' ', '.']).to_owned()
+    }
+
     fn resolve_ytdl_path() -> PathBuf {
         let exe = if cfg!(target_os = "windows") {
             "yt-dlp.exe"
@@ -276,9 +419,51 @@ impl Downloader {
     }
 }
 
+fn youtube_cookie_file(raw: &str) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::NamedTempFile::new()?;
+    writeln!(file, "# Netscape HTTP Cookie File")?;
+    for (name, value) in raw
+        .split(';')
+        .filter_map(|pair| pair.trim().split_once('='))
+    {
+        if !name.is_empty()
+            && !name.contains(char::is_whitespace)
+            && !value.contains(char::is_control)
+        {
+            writeln!(file, ".youtube.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")?;
+        }
+    }
+    file.flush()?;
+    Ok(file)
+}
+
+fn parse_progress(line: &str) -> Option<(f32, Option<f64>)> {
+    let (percent, speed) = line.strip_prefix("CIBITUBE ")?.split_once('|')?;
+    let percent = percent.trim().strip_suffix('%')?.parse::<f32>().ok()?;
+    let speed = speed
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0);
+    percent
+        .is_finite()
+        .then_some((percent.clamp(0.0, 100.0), speed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_yt_dlp_progress_and_bounds_long_unicode_names() {
+        assert_eq!(
+            parse_progress("CIBITUBE  13.2%|1024.5"),
+            Some((13.2, Some(1024.5)))
+        );
+        assert_eq!(parse_progress("CIBITUBE 100.0%|NA"), Some((100.0, None)));
+        assert_eq!(parse_progress("CIBITUBE NaN%|NA"), None);
+        assert_eq!(Downloader::download_basename(&"Я".repeat(150)).len(), 224);
+    }
 
     #[test]
     fn test_sanitize_filename() {

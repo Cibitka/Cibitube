@@ -1,6 +1,6 @@
 use crate::app::{AppEvent, MetrolistApp};
 use crate::browser_auth::BrowserAuth;
-use crate::discord::ActivityDetails;
+use crate::discord::DiscordStatus;
 use eframe::egui::{self, pos2, Color32, Rect, RichText, Rounding, Stroke, Vec2};
 use std::sync::Arc;
 
@@ -128,7 +128,7 @@ impl MetrolistApp {
             ]
         } else {
             [
-                ("Добро пожаловать в Cibitube", "Найди трек через |«Поиск»|, нажми |«Играть»| и добавь другие песни в |очередь|. Разверни мини-плеер, чтобы увидеть обложку, текст песни и управление воспроизведением.", None),
+                ("Добро пожаловать в Cibitube", "Найди трек на вкладке |«Главная»|, нажми |«Играть»| и добавь другие песни в |очередь|. Разверни мини-плеер, чтобы увидеть обложку, текст песни и управление воспроизведением.", None),
                 ("Вход в аккаунт", "Сначала войди в |YouTube Music| в |Firefox|. Затем открой |«Настройки → Аккаунты»| и нажми |«Войти через Firefox в один клик»|. После подключения можно выбрать профиль и синхронизировать плейлисты.", Some(1)),
                 ("Настрой плеер под себя", "В разделе |«Навигация»| можно скрыть лишние вкладки. В разделе |«Звук»| можно включить |выравнивание громкости| и |пропуск тишины|. Папка для аудио и обложек выбирается в разделе |«Хранилище»|.", Some(13)),
             ]
@@ -318,6 +318,14 @@ impl MetrolistApp {
             ),
             (8, "Discord"),
             (
+                14,
+                if self.settings.ui_language == "en" {
+                    "Pet"
+                } else {
+                    "Питомец"
+                },
+            ),
+            (
                 9,
                 if self.settings.ui_language == "en" {
                     "Downloads"
@@ -354,7 +362,7 @@ impl MetrolistApp {
         let visuals = ui.visuals();
         let surface = visuals.widgets.inactive.weak_bg_fill;
         let text_color = visuals.text_color();
-        let order = [7, 4, 3, 13, 5, 2, 9, 6, 1, 11, 8, 10, 12, 0];
+        let order = [7, 4, 3, 13, 5, 2, 9, 6, 1, 11, 8, 14, 10, 12, 0];
         ui.horizontal_wrapped(|ui| {
             for cat_id in order {
                 let Some((_, title)) = categories.iter().find(|(id, _)| *id == cat_id) else {
@@ -568,7 +576,6 @@ impl MetrolistApp {
                         } else {
                             "Профессиональное освещение обложки"
                         }).changed() {
-                            self.player.set_audio_processing(self.settings.audio_normalization, self.settings.skip_silence, self.settings.cover_ambient_light);
                             self.settings.save();
                         }
 
@@ -766,14 +773,15 @@ impl MetrolistApp {
 
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
-                            ui.label("Сдвиг синхронизации по умолчанию:");
+                            ui.label("Сдвиг текста для всех треков");
                             if ui
                                 .add(
                                     egui::DragValue::new(&mut self.settings.lyrics_manual_offset_ms)
                                         .speed(25)
+                                        .range(-300_000..=300_000)
                                         .suffix(" мс"),
                                 )
-                                .on_hover_text("Введите любое значение в миллисекундах (или перетаскивайте мышью)")
+                                .on_hover_text("Этот сдвиг применяется ко всем трекам с таймингами. Поправка отдельного трека прибавляется к нему.")
                                 .changed()
                             {
                                 self.settings.save();
@@ -785,6 +793,11 @@ impl MetrolistApp {
                                 self.settings.save();
                             }
                         });
+
+                        if let Some(track) = self.current_track() {
+                            ui.label(format!("Текущий трек · {}", track.title));
+                            self.render_lyric_timing_controls(ui);
+                        }
 
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
@@ -843,7 +856,7 @@ impl MetrolistApp {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label("Вкладка навигации по умолчанию:");
-                            let nav_tabs = ["Главная", "Плейлисты", "Любимые треки", "Поиск"];
+                            let nav_tabs = ["Главная", "Медиатека", "Любимые треки"];
                             for (i, name) in nav_tabs.iter().enumerate() {
                                 if ui.selectable_label(self.settings.default_nav_tab == i, *name).clicked() {
                                     self.settings.default_nav_tab = i;
@@ -938,7 +951,6 @@ impl MetrolistApp {
                             "Сокращает паузы тише −55 дБ длительностью от 0,8 с, в том числе в конце трека."
                         }).changed();
                         if normalize_changed || silence_changed {
-                            self.player.set_audio_processing(self.settings.audio_normalization, self.settings.skip_silence, self.settings.cover_ambient_light);
                             self.settings.save();
                         }
 
@@ -980,24 +992,18 @@ impl MetrolistApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
-                        let mut enabled = self.settings.discord_rpc_enabled;
-                        if ui.checkbox(&mut enabled, "Отображать статус в Discord").changed() {
-                            self.settings.discord_rpc_enabled = enabled;
+                        if ui.checkbox(&mut self.settings.discord_rpc_enabled, "Отображать статус в Discord").changed() {
                             self.settings.save();
-                            if !enabled {
-                                self.discord.clear();
-                            } else if let Some(t) = self.current_track() {
-                                self.discord.set_activity(ActivityDetails {
-                                    title: t.title.clone(),
-                                    artist: t.artist.clone(),
-                                    song_id: t.id.clone(),
-                                    elapsed_secs: 0.0,
-                                    duration_secs: 0.0,
-                                    thumbnail: t.thumbnail_url.clone(),
-                                    show_buttons: self.settings.discord_show_buttons,
-                                    activity_type: self.settings.discord_activity_type,
-                                });
-                            }
+                        }
+                        if self.settings.discord_rpc_enabled {
+                            let message = match self.discord.status() {
+                                DiscordStatus::Idle => "Статус появится при воспроизведении трека.".into(),
+                                DiscordStatus::Connecting => "Подключение к Discord…".into(),
+                                DiscordStatus::Unavailable => "Нет ответа от настольного Discord. Проверь, что он запущен.".into(),
+                                DiscordStatus::Active => "Discord принял статус.".into(),
+                                DiscordStatus::Rejected(code) => format!("Discord отклонил статус. Код {code}."),
+                            };
+                            ui.label(message);
                         }
 
                         ui.add_space(4.0);
@@ -1069,22 +1075,33 @@ impl MetrolistApp {
                 ui.add_space(12.0);
             }
 
+            if self.settings_menu_tab == 14 {
+                self.render_pet_settings(ui);
+            }
+
             // 10. ОБНОВЛЕНИЯ ПРОГРАММЫ
             if self.settings_menu_tab == 0 || self.settings_menu_tab == 10 {
                 egui::CollapsingHeader::new(RichText::new("Обновления программы (GitHub)").size(16.0).strong())
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
+                        egui::CollapsingHeader::new("Что обновилось").show(ui, |ui| {
+                            for note in include_str!("../CHANGELOG.md").lines().skip_while(|line| !line.starts_with("## ")).skip(1).filter(|line| line.starts_with("- ")) {
+                                ui.label(format!("• {}", &note[2..]));
+                            }
+                        });
                         let cur_ver = crate::updater::Updater::CURRENT_VERSION;
                         ui.label(RichText::new(format!("Текущая версия Cibitube: v{}", cur_ver)).size(13.0).strong());
                         ui.add_space(6.0);
 
                         ui.horizontal(|ui| {
-                            let check_btn = egui::Button::new(RichText::new(strings.updater_check_btn).strong())
+                            let check_label = if cfg!(target_os = "linux") { "Проверить и обновить" } else { strings.updater_check_btn };
+                            let check_btn = egui::Button::new(RichText::new(check_label).strong())
                                 .fill(Color32::from_rgb(35, 45, 55))
                                 .rounding(Rounding::same(6.0));
-                            if ui.add(check_btn).clicked() {
+                            if ui.add_enabled(!self.is_checking_update && !self.is_applying_update, check_btn).clicked() {
                                 self.is_checking_update = true;
+                                self.install_after_check = cfg!(target_os = "linux");
                                 self.update_status = Some("Проверка новых релизов на GitHub...".to_string());
                                 let tx = self.event_tx.clone();
                                 tokio::spawn(async move {
@@ -1132,17 +1149,7 @@ impl MetrolistApp {
                                             .fill(Color32::from_rgb(16, 185, 129))
                                             .rounding(Rounding::same(6.0));
                                         if ui.add(confirm_btn).clicked() {
-                                            self.is_applying_update = true;
-                                            self.show_update_confirm = false;
-                                            self.update_status = Some("Загрузка обновления...".to_string());
-                                            let dl = info.download_url.clone();
-                                            let expected_hash = info.expected_sha256.clone();
-                                            let tx = self.event_tx.clone();
-                                            tokio::spawn(async move {
-                                                let res =
-                                                    crate::updater::Updater::apply_update(dl, expected_hash).await;
-                                                let _ = tx.send(AppEvent::UpdateApplied(res));
-                                            });
+                                            self.begin_update(info.clone());
                                         }
 
                                         if ui.button("Отмена").clicked() {

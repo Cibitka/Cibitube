@@ -7,9 +7,11 @@ mod downloader;
 mod i18n;
 mod innertube;
 mod library;
+mod local_media;
 mod lyrics;
 mod lyrics_loader;
 mod models;
+mod pet;
 mod player;
 mod settings;
 mod sync;
@@ -89,7 +91,14 @@ fn setup_custom_fonts(ctx: &eframe::egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let workers = std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .min(4);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
@@ -102,9 +111,13 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    // Blocking on the compositor's swap can stall the event loop on a hidden Wayland window.
+    let wayland = cfg!(target_os = "linux")
+        && (std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            || std::env::var_os("WAYLAND_DISPLAY").is_some());
     let native_options = eframe::NativeOptions {
         viewport,
-        vsync: false,
+        vsync: !wayland,
         ..Default::default()
     };
 

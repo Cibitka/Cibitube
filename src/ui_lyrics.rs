@@ -199,22 +199,175 @@ impl MetrolistApp {
         ui.label(job);
     }
 
+    pub(crate) fn render_highlighted_lyric_line(
+        &self,
+        ui: &mut egui::Ui,
+        line: &LyricsLine,
+        current_ms: i64,
+        font_size: f32,
+    ) -> egui::Response {
+        let draw = |ui: &mut egui::Ui| {
+            let frame = egui::Frame::none()
+                .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 65))
+                .rounding(Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(10.0, 4.0));
+            let rect = frame
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("▶")
+                                .size(font_size - 2.0)
+                                .color(self.accent_color()),
+                        );
+                        self.render_active_lyric_line(ui, line, current_ms, font_size);
+                    });
+                })
+                .response;
+            ui.interact(rect.rect, rect.id.with("seek-lyric"), egui::Sense::click())
+        };
+        if self.settings.lyrics_position == 0 {
+            ui.vertical_centered(draw).inner
+        } else {
+            draw(ui)
+        }
+    }
+
+    pub(crate) fn scroll_to_active_lyric(
+        &self,
+        ui: &egui::Ui,
+        track_id: Option<&str>,
+        index: usize,
+        response: &egui::Response,
+    ) {
+        let id = ui.make_persistent_id("lyrics-last-scroll-target");
+        let target = egui::Id::new((track_id, index));
+        let changed = ui.ctx().data_mut(|data| {
+            if !self.settings.lyrics_auto_scroll {
+                data.remove::<egui::Id>(id);
+                return false;
+            }
+            if data.get_temp::<egui::Id>(id) == Some(target) {
+                return false;
+            }
+            data.insert_temp(id, target);
+            true
+        });
+        if changed {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
+    }
+
+    pub(crate) fn lyric_timing_badge(lyrics: &crate::models::Lyrics, mode: usize) -> String {
+        let timing = if !lyrics.is_synced {
+            "Без синхронизации"
+        } else if lyrics.is_word_synced() {
+            match mode {
+                0 => "Тайминги слов • подсветка букв",
+                1 => "По словам",
+                _ => "По строкам",
+            }
+        } else if mode <= 1 {
+            "Тайминги строк • караоке приблизительное"
+        } else {
+            "По строкам"
+        };
+        format!("{} • {timing}", lyrics.source_name)
+    }
+
+    fn lyric_track_offset(&self) -> i64 {
+        self.current_track()
+            .and_then(|track| self.library.lyric_track_offsets.get(&track.id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn lyric_total_offset(&self, lyrics: &crate::models::Lyrics) -> i64 {
+        lyrics
+            .offset_ms
+            .saturating_add(self.settings.lyrics_manual_offset_ms)
+            .saturating_add(self.lyric_track_offset())
+    }
+
+    pub(crate) fn save_lyric_track_offset(&mut self, offset: i64) {
+        let Some(id) = self.current_track().map(|track| track.id.clone()) else {
+            return;
+        };
+        if offset == 0 {
+            self.library.lyric_track_offsets.remove(&id);
+        } else {
+            self.library
+                .lyric_track_offsets
+                .insert(id, offset.clamp(-300_000, 300_000));
+        }
+        self.library.save();
+    }
+
+    pub(crate) fn render_lyric_timing_controls(&mut self, ui: &mut egui::Ui) {
+        if self.current_track().is_none() {
+            return;
+        }
+        let original = self.lyric_track_offset();
+        let mut seconds = original as f64 / 1000.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Поправка трека").on_hover_text(
+                "Прибавляется к общему сдвигу и автоматически восстанавливается для этого трека.",
+            );
+            ui.spacing_mut().button_padding.x = 5.0;
+            let control_size = egui::vec2(72.0, 26.0);
+            if ui
+                .add_sized(control_size, egui::Button::new("−0,5"))
+                .clicked()
+            {
+                seconds -= 0.5;
+            }
+            ui.add_sized(
+                control_size,
+                egui::DragValue::new(&mut seconds)
+                    .speed(0.1)
+                    .range(-300.0..=300.0)
+                    .min_decimals(1)
+                    .max_decimals(3)
+                    .suffix(" с"),
+            )
+            .on_hover_text("Если текст отстаёт, введите положительный сдвиг. Например, +45 с.");
+            if ui
+                .add_sized(control_size, egui::Button::new("+0,5"))
+                .clicked()
+            {
+                seconds += 0.5;
+            }
+            if ui
+                .add_sized(control_size, egui::Button::new("Сброс"))
+                .on_hover_text("Убрать поправку трека и оставить общий сдвиг.")
+                .clicked()
+            {
+                seconds = 0.0;
+            }
+        });
+        let offset = ((seconds * 1000.0).round() as i64).clamp(-300_000, 300_000);
+        if offset != original {
+            self.save_lyric_track_offset(offset);
+        }
+        let base = self.settings.lyrics_manual_offset_ms;
+        ui.label(
+            RichText::new(format!(
+                "Для всех: {base:+} мс  ·  Итог: {:+} мс",
+                base.saturating_add(offset)
+            )).small(),
+        ).on_hover_text("Сумма общего сдвига и поправки трека. Метка [offset] в файле текста учитывается отдельно.");
+    }
+
     pub(crate) fn render_lyrics_tab(&mut self, ui: &mut egui::Ui, current_time: f64) {
         let accent = self.accent_color();
 
         let is_narrow = ui.available_width() < 620.0;
-        let anim_mode_label = match self.settings.lyrics_animation_mode {
-            0 => "По буквам",
-            1 => "По словам",
-            2 => "По строчкам",
-            _ => "Без анимации",
-        };
 
         if is_narrow {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Текст песни").size(18.0).strong());
                 if let Some(lyrics) = &self.lyrics {
-                    let badge_text = format!("{} • {}", lyrics.source_name, anim_mode_label);
+                    let badge_text =
+                        Self::lyric_timing_badge(lyrics, self.settings.lyrics_animation_mode);
                     ui.label(
                         RichText::new(badge_text)
                             .size(11.0)
@@ -272,7 +425,8 @@ impl MetrolistApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Текст песни").size(18.0).strong());
                 if let Some(lyrics) = &self.lyrics {
-                    let badge_text = format!("{} • {}", lyrics.source_name, anim_mode_label);
+                    let badge_text =
+                        Self::lyric_timing_badge(lyrics, self.settings.lyrics_animation_mode);
                     ui.label(
                         RichText::new(badge_text)
                             .size(11.0)
@@ -331,50 +485,7 @@ impl MetrolistApp {
             });
         }
 
-        // Блок ручной регулировки задержки синхронизации
-        if let Some(ref mut lyrics) = self.lyrics {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Задержка текста:").size(11.0).weak());
-                if ui.small_button("-500мс").clicked() {
-                    lyrics.offset_ms -= 500;
-                }
-                if ui.small_button("-100мс").clicked() {
-                    lyrics.offset_ms -= 100;
-                }
-                let off_str = format!("{:+}", lyrics.offset_ms);
-                ui.label(RichText::new(off_str).size(11.0).strong().color(
-                    if lyrics.offset_ms == 0 {
-                        Color32::GRAY
-                    } else {
-                        accent
-                    },
-                ));
-                if ui.small_button("+100мс").clicked() {
-                    lyrics.offset_ms += 100;
-                }
-                if ui.small_button("+500мс").clicked() {
-                    lyrics.offset_ms += 500;
-                }
-                if lyrics.offset_ms != 0 && ui.small_button("0 (сброс)").clicked() {
-                    lyrics.offset_ms = 0;
-                }
-                if lyrics.offset_ms != 0
-                    && ui
-                        .small_button("💾 Сохранить по умолч.")
-                        .on_hover_text("Сохранить этот сдвиг в настройки как значение по умолчанию для всех песен")
-                        .clicked()
-                {
-                    self.settings.lyrics_manual_offset_ms += lyrics.offset_ms;
-                    lyrics.offset_ms = 0;
-                    self.settings.save();
-                    self.status_message = Some(format!(
-                        "Сдвиг текстов по умолчанию сохранён: {} мс",
-                        self.settings.lyrics_manual_offset_ms
-                    ));
-                }
-            });
-        }
+        self.render_lyric_timing_controls(ui);
 
         ui.add_space(10.0);
 
@@ -388,6 +499,12 @@ impl MetrolistApp {
             return;
         };
 
+        crate::pet::register_surface(
+            ui.ctx(),
+            egui::Id::new("pet-lyrics-panel"),
+            ui.available_rect_before_wrap().intersect(ui.clip_rect()),
+            false,
+        );
         if !lyrics.is_synced {
             ui.label(
                 RichText::new("ℹ Для этого трека доступен только несинхронизированный текст")
@@ -405,50 +522,26 @@ impl MetrolistApp {
             return;
         }
 
-        let current_time_ms = ((current_time * 1000.0) as i64
-            + lyrics.offset_ms
-            + self.settings.lyrics_manual_offset_ms)
-            .max(0);
+        let offset = self.lyric_total_offset(lyrics);
+        let current_time_ms = ((current_time * 1000.0) as i64).saturating_add(offset);
         let current_line_idx = lyrics
             .lines
             .iter()
             .rposition(|l| (l.start_ms as i64) <= current_time_ms);
         let mut seek_to_sec: Option<f64> = None;
+        let track_id = self.current_track().map(|track| track.id.as_str());
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, line) in lyrics.lines.iter().enumerate() {
                 let is_active = Some(idx) == current_line_idx;
-                if is_active {
-                    let active_frame = egui::Frame::none()
-                        .fill(Color32::from_rgba_unmultiplied(29, 185, 84, 45))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(egui::Margin::symmetric(12.0, 8.0));
-
-                    let main_align = if self.settings.lyrics_position == 0 {
-                        egui::Align::Center
-                    } else {
-                        egui::Align::Min
-                    };
-
-                    let resp = active_frame
-                        .show(ui, |ui| {
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center)
-                                    .with_main_align(main_align),
-                                |ui| {
-                                    ui.label(RichText::new("▶").size(15.0).color(accent).strong());
-                                    self.render_active_lyric_line(ui, line, current_time_ms, 18.0);
-                                },
-                            );
-                        })
-                        .response;
+                let response = if is_active {
+                    let resp = self.render_highlighted_lyric_line(ui, line, current_time_ms, 18.0);
 
                     if resp.clicked() {
-                        seek_to_sec = Some(line.seconds);
+                        seek_to_sec = Some((line.seconds - offset as f64 / 1000.0).max(0.0));
                     }
-                    if self.settings.lyrics_auto_scroll {
-                        resp.scroll_to_me(Some(egui::Align::Center));
-                    }
+                    self.scroll_to_active_lyric(ui, track_id, idx, &resp);
+                    resp
                 } else {
                     let is_past = current_line_idx.is_some_and(|cur| idx < cur);
                     let text_color = if is_past {
@@ -465,9 +558,11 @@ impl MetrolistApp {
                         ui.add(label_widget.sense(egui::Sense::click()))
                     };
                     if resp.clicked() {
-                        seek_to_sec = Some(line.seconds);
+                        seek_to_sec = Some((line.seconds - offset as f64 / 1000.0).max(0.0));
                     }
-                }
+                    resp
+                };
+                crate::pet::register_lyric_row(ui, track_id, idx, &response, is_active, None);
                 ui.add_space(6.0);
             }
         });
