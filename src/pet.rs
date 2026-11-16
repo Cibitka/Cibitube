@@ -177,6 +177,10 @@ impl Surface {
         }
     }
 
+    fn supports(self, bounds: Rect, side: f32) -> bool {
+        bounds.y_range().contains(self.landing(0.5, side).y)
+    }
+
     fn landing(self, anchor: f32, side: f32) -> Pos2 {
         Pos2::new(
             self.rect.left() + self.rect.width() * anchor - side / 2.0,
@@ -429,10 +433,7 @@ impl Pet {
         let dt = dt.clamp(0.0, 0.08);
         let feet = *pos + Vec2::new(side / 2.0, side * 0.92);
         let clamp = |point: Pos2| point.clamp(bounds.min, bounds.max);
-        let visible = |surface: &Surface| {
-            surface.landing(0.5, side).y >= bounds.top()
-                && surface.landing(0.5, side).y <= bounds.bottom()
-        };
+        let visible = |surface: &Surface| surface.supports(bounds, side);
         let surface_for = |id| {
             surfaces
                 .iter()
@@ -713,7 +714,7 @@ impl Pet {
             surfaces
                 .iter()
                 .copied()
-                .filter(|surface| surface.rect.contains(pointer))
+                .filter(|surface| surface.rect.contains(pointer) && surface.supports(bounds, side))
                 .min_by(|a, b| a.rect.area().total_cmp(&b.rect.area()))
         });
         let previous_pos = pos;
@@ -1317,6 +1318,7 @@ mod tests {
                 |ctx| {
                     clear_surfaces(ctx);
                     egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.add_space(70.0);
                         if onto_lyric {
                             register_surface(
                                 ctx,

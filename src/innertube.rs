@@ -2,8 +2,37 @@ use crate::models::{AccountProfile, Playlist, Track};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 
+const MUSIC_ORIGIN: &str = "https://music.youtube.com";
+const FALLBACK_WEB_VERSION: &str = "1.20240101.01.00";
+
+#[derive(Clone)]
 pub struct InnertubeClient {
     client: reqwest::Client,
+    web_config: std::sync::Arc<tokio::sync::OnceCell<WebClientConfig>>,
+}
+
+#[derive(serde::Deserialize)]
+struct WebClientConfig {
+    #[serde(rename = "INNERTUBE_API_KEY")]
+    api_key: String,
+    #[serde(rename = "INNERTUBE_CLIENT_VERSION")]
+    version: String,
+    #[serde(rename = "VISITOR_DATA")]
+    visitor_data: Option<String>,
+}
+
+impl WebClientConfig {
+    fn from_page(html: &str) -> Option<Self> {
+        html.match_indices("ytcfg.set(")
+            .find_map(|(position, marker)| {
+                let json = &html[position + marker.len()..];
+                let config = serde_json::Deserializer::from_str(json)
+                    .into_iter::<Self>()
+                    .next()?
+                    .ok()?;
+                (!config.api_key.is_empty() && !config.version.is_empty()).then_some(config)
+            })
+    }
 }
 
 pub(crate) struct PlaylistChoice {
@@ -23,7 +52,10 @@ impl InnertubeClient {
             .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            client,
+            web_config: Default::default(),
+        }
     }
 
     /// Automatically upscales YouTube Music thumbnails to HD / 800x800 master resolution
@@ -43,18 +75,23 @@ impl InnertubeClient {
         url.to_string()
     }
 
-    /// Helper to compute SAPISIDHASH auth header if SAPISID or __Secure-3PAPISID cookie exists
-    fn get_sapisid_auth(cookie: &str) -> Option<(String, &'static str, &'static str)> {
-        let sapisid = cookie.split(';').map(|s| s.trim()).find_map(|s| {
-            if let Some(val) = s.strip_prefix("SAPISID=") {
-                Some(val)
-            } else if let Some(val) = s.strip_prefix("__Secure-3PAPISID=") {
-                Some(val)
-            } else {
-                None
-            }
-        })?;
+    pub(crate) fn has_browser_auth(cookie: &str) -> bool {
+        Self::sapisid(cookie).is_some()
+    }
 
+    fn sapisid(cookie: &str) -> Option<&str> {
+        ["__Secure-3PAPISID=", "SAPISID="]
+            .into_iter()
+            .find_map(|name| {
+                cookie
+                    .split(';')
+                    .filter_map(|part| part.trim().strip_prefix(name))
+                    .find(|value| !value.is_empty())
+            })
+    }
+
+    fn get_sapisid_auth(cookie: &str) -> Option<(String, &'static str, &'static str)> {
+        let sapisid = Self::sapisid(cookie)?;
         let origin = "https://music.youtube.com";
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -70,70 +107,115 @@ impl InnertubeClient {
         Some((auth_header, origin, "https://music.youtube.com/"))
     }
 
-    /// Discovers all Google/YouTube accounts associated with this cookie session (e.g. authuser 0, 1)
-    pub async fn discover_accounts(&self, cookie: &str) -> Vec<AccountProfile> {
-        if cookie.is_empty() {
-            return Vec::new();
-        }
-        let mut list = Vec::new();
-
-        for u in 0..4 {
-            let payload = serde_json::json!({
-                "context": {
-                    "client": {
-                        "clientName": "WEB_REMIX",
-                        "clientVersion": "1.20240101.01.00",
-                        "hl": "ru",
-                        "gl": "RU"
-                    }
-                }
-            });
-
-            let mut req = self.client
-                .post(format!("https://music.youtube.com/youtubei/v1/account/account_menu?prettyPrint=false&authuser={}", u))
-                .header("Cookie", cookie)
-                .header("X-YouTube-Client-Name", "67")
-                .header("X-YouTube-Client-Version", "1.20240101.01.00")
-                .header("X-Goog-AuthUser", u.to_string())
-                .json(&payload);
-
-            if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                req = req
-                    .header("Authorization", auth)
-                    .header("Origin", origin)
-                    .header("Referer", referer);
-            }
-
-            if let Ok(res) = req.send().await {
-                if let Ok(json) = res.json::<Value>().await {
-                    let header = json.pointer("/actions/0/openPopupAction/popup/multiPageMenuRenderer/header/activeAccountHeaderRenderer");
-                    let name = header
-                        .and_then(|h| h.pointer("/accountName/runs/0/text"))
-                        .and_then(|t| t.as_str());
-                    let email = header
-                        .and_then(|h| h.pointer("/email/runs/0/text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-
-                    if let Some(n) = name {
-                        if !n.trim().is_empty() {
-                            list.push(AccountProfile {
-                                name: n.to_string(),
-                                email: email.to_string(),
-                                auth_user: u,
-                            });
-                            continue;
+    pub async fn discover_accounts(
+        &self,
+        cookie: &str,
+        selected: usize,
+    ) -> Result<Vec<AccountProfile>, String> {
+        let mut accounts = Vec::new();
+        let mut last_error = None;
+        let mut confirmed_without_name = None;
+        let request = |auth_user| async move {
+            let result = self
+                .playlist_request(
+                    "account/account_menu",
+                    serde_json::json!({}),
+                    cookie,
+                    auth_user,
+                )
+                .await;
+            (auth_user, result)
+        };
+        let other_indices: Vec<_> = (0..=4).filter(|&index| index != selected).take(4).collect();
+        let results = tokio::join!(
+            request(selected),
+            request(other_indices[0]),
+            request(other_indices[1]),
+            request(other_indices[2]),
+            request(other_indices[3]),
+        );
+        for (auth_user, result) in [results.0, results.1, results.2, results.3, results.4] {
+            match result {
+                Ok(response) => {
+                    if let Some(account) = Self::parse_active_account(&response, auth_user) {
+                        if !accounts.iter().any(|other: &AccountProfile| {
+                            other.name == account.name && other.email == account.email
+                        }) {
+                            accounts.push(account);
                         }
+                    } else if Self::response_is_signed_in(&response) {
+                        confirmed_without_name.get_or_insert(auth_user);
                     }
                 }
-            }
-
-            if u > 0 {
-                break;
+                Err(error) => {
+                    last_error.get_or_insert(error);
+                }
             }
         }
+        if let Some(auth_user) = confirmed_without_name {
+            if accounts.is_empty() || auth_user == selected {
+                accounts.push(AccountProfile {
+                    name: format!("Аккаунт YouTube Music ({})", auth_user.saturating_add(1)),
+                    email: String::new(),
+                    auth_user,
+                });
+            }
+        }
+        if accounts.is_empty() {
+            return Err(last_error.unwrap_or_else(|| {
+                "YouTube Music не подтвердил вход. Обнови вход через Firefox или Cookie.".into()
+            }));
+        }
+        accounts.sort_by_key(|account| account.auth_user);
+        Ok(accounts)
+    }
 
-        list
+    fn response_is_signed_in(response: &Value) -> bool {
+        response["responseContext"]["serviceTrackingParams"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|service| service["params"].as_array())
+            .flatten()
+            .any(|param| param["key"] == "logged_in" && param["value"] == "1")
+    }
+
+    fn parse_active_account(node: &Value, auth_user: usize) -> Option<AccountProfile> {
+        if let Some(header) = node.get("activeAccountHeaderRenderer").or_else(|| {
+            node.get("accountItemRenderer")
+                .filter(|account| account["isSelected"] == true)
+        }) {
+            let name = Self::runs_text(&header["accountName"]);
+            if !name.trim().is_empty() {
+                let email = Self::runs_text(&header["email"]);
+                return Some(AccountProfile {
+                    name,
+                    email,
+                    auth_user,
+                });
+            }
+        }
+        match node {
+            Value::Array(nodes) => nodes
+                .iter()
+                .find_map(|node| Self::parse_active_account(node, auth_user)),
+            Value::Object(nodes) => nodes
+                .values()
+                .find_map(|node| Self::parse_active_account(node, auth_user)),
+            _ => None,
+        }
+    }
+
+    fn runs_text(value: &Value) -> String {
+        if let Some(text) = value.as_str().or_else(|| value["simpleText"].as_str()) {
+            return text.to_owned();
+        }
+        value["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|run| run["text"].as_str())
+            .collect()
     }
 
     pub async fn search(
@@ -223,47 +305,129 @@ impl InnertubeClient {
         Ok(tracks)
     }
 
-    pub async fn fetch_home_tracks(
+    fn collect_home(node: &Value, tracks: &mut Vec<Track>, playlists: &mut Vec<Playlist>) {
+        let card = node
+            .get("musicTwoRowItemRenderer")
+            .or_else(|| node.get("musicResponsiveListItemRenderer"));
+        if let Some(playlist) = card.and_then(|card| Self::parse_playlist_card(card, true)) {
+            if !playlists.iter().any(|entry| entry.id == playlist.id) {
+                playlists.push(playlist);
+            }
+            return;
+        }
+        let candidate = node
+            .get("musicTwoRowItemRenderer")
+            .and_then(Self::parse_card)
+            .or_else(|| Self::parse_item(node));
+        if let Some(track) = candidate {
+            if !tracks.iter().any(|entry| entry.id == track.id) {
+                tracks.push(track);
+            }
+            return;
+        }
+        match node {
+            Value::Array(nodes) => nodes
+                .iter()
+                .for_each(|node| Self::collect_home(node, tracks, playlists)),
+            Value::Object(nodes) => nodes
+                .values()
+                .for_each(|node| Self::collect_home(node, tracks, playlists)),
+            _ => {}
+        }
+    }
+
+    fn parse_playlist_card(card: &Value, public_only: bool) -> Option<Playlist> {
+        let id = [
+            "/navigationEndpoint/browseEndpoint/browseId",
+            "/title/runs/0/navigationEndpoint/browseEndpoint/browseId",
+            "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/browseEndpoint/browseId",
+        ]
+        .into_iter()
+        .find_map(|path| card.pointer(path).and_then(Value::as_str))?;
+        let normalized = id.strip_prefix("VL").unwrap_or(id);
+        let public = normalized.starts_with("PL") || normalized.starts_with("RDCLAK");
+        if !public && (public_only || !id.starts_with("VL")) {
+            return None;
+        }
+        let title = Self::runs_text(card.get("title").unwrap_or(
+            &card["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"],
+        ));
+        if title.trim().is_empty() {
+            return None;
+        }
+        let thumbnail_url = card
+            .pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
+            .or_else(|| card.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails"))
+            .and_then(Value::as_array)
+            .and_then(|list| list.last())
+            .and_then(|image| image["url"].as_str())
+            .map(str::to_owned);
+        Some(Playlist {
+            id: normalized.to_owned(),
+            title,
+            subtitle: Self::runs_text(card.get("subtitle").unwrap_or(
+                &card["flexColumns"][1]["musicResponsiveListItemFlexColumnRenderer"]["text"],
+            )),
+            thumbnail_url,
+        })
+    }
+
+    pub async fn fetch_home(
         &self,
         country: &str,
         language: &str,
-    ) -> Result<Vec<Track>, String> {
-        fn collect(
-            value: &Value,
-            tracks: &mut Vec<Track>,
-            seen: &mut std::collections::HashSet<String>,
-        ) {
-            if tracks.len() >= 24 {
-                return;
-            }
-            let track = if let Some(card) = value.get("musicTwoRowItemRenderer") {
-                InnertubeClient::parse_card(card)
-            } else {
-                InnertubeClient::parse_item(value)
-            };
-            if let Some(track) = track {
-                if seen.insert(track.id.clone()) {
-                    tracks.push(track);
+    ) -> Result<(Vec<Track>, Vec<Playlist>), String> {
+        let (home, discover) = tokio::join!(
+            self.public_recommendation_feed(
+                "browse",
+                serde_json::json!({
+                    "browseId": "FEmusic_home"
+                }),
+                country,
+                language
+            ),
+            self.public_recommendation_feed(
+                "search",
+                serde_json::json!({
+                    "query": if language == "ru" { "музыка плейлист" } else { "music playlist" }
+                }),
+                country,
+                language
+            )
+        );
+        match (home, discover) {
+            (Ok((mut tracks, mut playlists)), Ok((fallback_tracks, found))) => {
+                if tracks.is_empty() {
+                    tracks = fallback_tracks;
                 }
-                return;
-            }
-            match value {
-                Value::Array(items) => items.iter().for_each(|item| collect(item, tracks, seen)),
-                Value::Object(fields) => {
-                    fields.values().for_each(|item| collect(item, tracks, seen))
+                for playlist in found {
+                    if !playlists.iter().any(|entry| entry.id == playlist.id) {
+                        playlists.push(playlist);
+                    }
                 }
-                _ => {}
+                Ok((tracks, playlists))
             }
+            (Ok(feed), Err(_)) | (Err(_), Ok(feed)) => Ok(feed),
+            (Err(error), Err(_)) => Err(error),
         }
+    }
 
-        let payload = serde_json::json!({
-            "context": {"client": {"clientName": "WEB_REMIX",
-                "clientVersion": "1.20240101.01.00", "hl": language, "gl": country}},
-            "browseId": "FEmusic_home"
+    async fn public_recommendation_feed(
+        &self,
+        endpoint: &str,
+        mut payload: Value,
+        country: &str,
+        language: &str,
+    ) -> Result<(Vec<Track>, Vec<Playlist>), String> {
+        payload["context"] = serde_json::json!({
+            "client": {"clientName": "WEB_REMIX",
+                "clientVersion": "1.20240101.01.00", "hl": language, "gl": country}
         });
         let response = self
             .client
-            .post("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false")
+            .post(format!(
+                "https://music.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"
+            ))
             .timeout(std::time::Duration::from_secs(15))
             .header("Origin", "https://music.youtube.com")
             .json(&payload)
@@ -276,12 +440,9 @@ impl InnertubeClient {
             .await
             .map_err(|_| "Ответ YouTube Music не распознан")?;
         let mut tracks = Vec::new();
-        collect(
-            &json["contents"],
-            &mut tracks,
-            &mut std::collections::HashSet::new(),
-        );
-        Ok(tracks)
+        let mut playlists = Vec::new();
+        Self::collect_home(&json["contents"], &mut tracks, &mut playlists);
+        Ok((tracks, playlists))
     }
 
     pub async fn fetch_radio(&self, video_id: &str, country: &str) -> Result<Vec<Track>, String> {
@@ -398,72 +559,8 @@ impl InnertubeClient {
             );
         }
 
-        let payload = serde_json::json!({
-            "context": {
-                "client": {
-                    "clientName": "WEB_REMIX",
-                    "clientVersion": "1.20240101.01.00",
-                    "hl": "ru",
-                    "gl": "RU"
-                }
-            },
-            "browseId": "FEmusic_liked_videos"
-        });
-
-        let mut req = self
-            .client
-            .post(format!(
-                "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
-                auth_user
-            ))
-            .header("Cookie", cookie)
-            .header("X-YouTube-Client-Name", "67")
-            .header("X-YouTube-Client-Version", "1.20240101.01.00")
-            .header("X-Goog-AuthUser", auth_user.to_string())
-            .json(&payload);
-
-        if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-            req = req
-                .header("Authorization", auth)
-                .header("Origin", origin)
-                .header("Referer", referer);
-        }
-
-        let res = req
-            .send()
+        self.fetch_playlist_tracks("FEmusic_liked_videos", cookie, auth_user)
             .await
-            .map_err(|e| format!("Ошибка загрузки: {}", e))?;
-
-        let json: Value = res.json().await.map_err(|e| e.to_string())?;
-        let mut tracks = Vec::new();
-
-        if let Some(tabs) = json
-            .pointer("/contents/singleColumnBrowseResultsRenderer/tabs")
-            .and_then(|v| v.as_array())
-        {
-            for tab in tabs {
-                if let Some(sections) = tab
-                    .pointer("/tabRenderer/content/sectionListRenderer/contents")
-                    .and_then(|v| v.as_array())
-                {
-                    for sec in sections {
-                        if let Some(items) = sec
-                            .pointer("/musicPlaylistShelfRenderer/contents")
-                            .or_else(|| sec.pointer("/musicShelfRenderer/contents"))
-                            .and_then(|v| v.as_array())
-                        {
-                            for item in items {
-                                if let Some(t) = Self::parse_item(item) {
-                                    tracks.push(t);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(tracks)
     }
 
     pub async fn fetch_user_playlists(
@@ -475,137 +572,171 @@ impl InnertubeClient {
             return Err("Для загрузки плейлистов требуется войти в аккаунт".to_string());
         }
 
-        let payload = serde_json::json!({
-            "context": {
-                "client": {
-                    "clientName": "WEB_REMIX",
-                    "clientVersion": "1.20240101.01.00",
-                    "hl": "ru",
-                    "gl": "RU"
+        fn collect(node: &Value, playlists: &mut Vec<Playlist>, tokens: &mut Vec<String>) {
+            if let Some(card) = node
+                .get("musicTwoRowItemRenderer")
+                .or_else(|| node.get("musicResponsiveListItemRenderer"))
+            {
+                if let Some(playlist) = InnertubeClient::parse_playlist_card(card, false) {
+                    if !playlists.iter().any(|entry| entry.id == playlist.id) {
+                        playlists.push(playlist);
+                    }
                 }
-            },
-            "browseId": "FEmusic_liked_playlists"
-        });
-
-        let mut req = self
-            .client
-            .post(format!(
-                "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
-                auth_user
-            ))
-            .header("Cookie", cookie)
-            .header("X-YouTube-Client-Name", "67")
-            .header("X-YouTube-Client-Version", "1.20240101.01.00")
-            .header("X-Goog-AuthUser", auth_user.to_string())
-            .json(&payload);
-
-        if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-            req = req
-                .header("Authorization", auth)
-                .header("Origin", origin)
-                .header("Referer", referer);
+                return;
+            }
+            if let Some(token) = node
+                .pointer("/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                .or_else(|| node.pointer("/nextContinuationData/continuation"))
+                .and_then(Value::as_str)
+            {
+                tokens.push(token.to_owned());
+            }
+            match node {
+                Value::Array(nodes) => nodes
+                    .iter()
+                    .for_each(|node| collect(node, playlists, tokens)),
+                Value::Object(nodes) => nodes
+                    .values()
+                    .for_each(|node| collect(node, playlists, tokens)),
+                _ => {}
+            }
         }
-
-        let res = req.send().await.map_err(|e| e.to_string())?;
-        let json: Value = res.json().await.map_err(|e| e.to_string())?;
 
         let mut playlists = Vec::new();
+        let mut last_error = None;
+        let mut loaded = false;
+        for browse_id in ["FEmusic_liked_playlists", "FEmusic_library_landing"] {
+            let page = match self
+                .playlist_request(
+                    "browse",
+                    serde_json::json!({"browseId": browse_id}),
+                    cookie,
+                    auth_user,
+                )
+                .await
+            {
+                Ok(page) if page.get("contents").is_some() || page.get("header").is_some() => page,
+                Ok(_) => {
+                    last_error = Some("YouTube Music не вернул список плейлистов.".to_owned());
+                    continue;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            loaded = true;
+            let mut tokens = Vec::new();
+            collect(&page, &mut playlists, &mut tokens);
+            let mut seen = std::collections::HashSet::new();
+            while let Some(token) = tokens.pop() {
+                if !seen.insert(token.clone()) {
+                    continue;
+                }
+                if seen.len() > 50 {
+                    return Err("YouTube Music вернул слишком много страниц плейлистов.".into());
+                }
+                let page = self
+                    .playlist_request(
+                        "browse",
+                        serde_json::json!({"continuation": token}),
+                        cookie,
+                        auth_user,
+                    )
+                    .await?;
+                collect(&page, &mut playlists, &mut tokens);
+            }
+            if !playlists.is_empty() {
+                break;
+            }
+        }
+        if loaded {
+            Ok(playlists)
+        } else {
+            Err(last_error.unwrap_or_else(|| "Список плейлистов недоступен.".into()))
+        }
+    }
 
-        fn extract_playlists(val: &Value, out: &mut Vec<Playlist>) {
-            if let Some(obj) = val.as_object() {
-                if let Some(it) = obj.get("musicTwoRowItemRenderer") {
-                    let title = it
-                        .pointer("/title/runs/0/text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    let subtitle = it
-                        .pointer("/subtitle/runs")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.pointer("/text").and_then(|t| t.as_str()))
-                                .collect::<Vec<_>>()
-                                .join("")
+    pub(crate) async fn recommendation_library(
+        self: std::sync::Arc<Self>,
+        cookie: String,
+        auth_user: usize,
+    ) -> Result<
+        (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+        String,
+    > {
+        let playlists = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            self.fetch_user_playlists(&cookie, auth_user),
+        )
+        .await
+        .map_err(|_| "Не дождались списка плейлистов.")??;
+        let own: std::collections::HashSet<_> = playlists
+            .into_iter()
+            .map(|p| p.id.strip_prefix("VL").unwrap_or(&p.id).to_owned())
+            .collect();
+        let mut remaining = own
+            .iter()
+            .filter(|&id| id != "LM")
+            .cloned()
+            .chain(std::iter::once("FEmusic_liked_videos".to_owned()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter();
+        let cookie = std::sync::Arc::new(cookie);
+        let mut workers = tokio::task::JoinSet::new();
+        let mut tracks = std::collections::HashSet::new();
+        loop {
+            while workers.len() < 4 {
+                let Some(id) = remaining.next() else {
+                    break;
+                };
+                let client = self.clone();
+                let cookie = cookie.clone();
+                workers.spawn(async move {
+                    let mut tracks = Vec::new();
+                    client
+                        .scan_playlist(&id, &cookie, auth_user, |item| {
+                            if let Some(id) = Self::playlist_row_video_id(
+                                &item["musicResponsiveListItemRenderer"],
+                            ) {
+                                tracks.push(id.to_owned());
+                            }
+                            false
                         })
-                        .unwrap_or_default();
-                    let browse_id = it
-                        .pointer("/navigationEndpoint/browseEndpoint/browseId")
-                        .and_then(|b| b.as_str())
-                        .unwrap_or("");
-                    let thumbnail = it
-                        .pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.last())
-                        .and_then(|t| t.get("url"))
-                        .and_then(|u| u.as_str())
-                        .map(str::to_owned);
-
-                    if !browse_id.is_empty()
-                        && !title.eq_ignore_ascii_case("новый")
-                        && !title.eq_ignore_ascii_case("new playlist")
-                        && !out.iter().any(|p| p.id == browse_id)
-                    {
-                        out.push(Playlist {
-                            id: browse_id.to_string(),
-                            title: title.to_string(),
-                            subtitle,
-                            thumbnail_url: thumbnail,
-                        });
-                    }
-                }
-                for v in obj.values() {
-                    extract_playlists(v, out);
-                }
-            } else if let Some(arr) = val.as_array() {
-                for item in arr {
-                    extract_playlists(item, out);
-                }
+                        .await?;
+                    Ok::<_, String>(tracks)
+                });
             }
+            let Some(result) = workers.join_next().await else {
+                break;
+            };
+            tracks.extend(result.map_err(|_| "Проверка состава плейлиста остановилась.")??);
         }
+        Ok((own, tracks))
+    }
 
-        extract_playlists(&json, &mut playlists);
-
-        // Fallback: If liked playlists didn't return anything or for additional playlists, check library landing
-        if playlists.is_empty() {
-            let landing_payload = serde_json::json!({
-                "context": {
-                    "client": {
-                        "clientName": "WEB_REMIX",
-                        "clientVersion": "1.20240101.01.00",
-                        "hl": "ru",
-                        "gl": "RU"
-                    }
-                },
-                "browseId": "FEmusic_library_landing"
-            });
-
-            let mut l_req = self
-                .client
-                .post(format!(
-                    "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={}",
-                    auth_user
-                ))
-                .header("Cookie", cookie)
-                .header("X-YouTube-Client-Name", "67")
-                .header("X-YouTube-Client-Version", "1.20240101.01.00")
-                .header("X-Goog-AuthUser", auth_user.to_string())
-                .json(&landing_payload);
-
-            if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                l_req = l_req
-                    .header("Authorization", auth)
-                    .header("Origin", origin)
-                    .header("Referer", referer);
-            }
-
-            if let Ok(l_res) = l_req.send().await {
-                if let Ok(l_json) = l_res.json::<Value>().await {
-                    extract_playlists(&l_json, &mut playlists);
-                }
-            }
-        }
-
-        Ok(playlists)
+    async fn browser_config(&self) -> Option<&WebClientConfig> {
+        self.web_config
+            .get_or_try_init(|| async {
+                let page = self
+                    .client
+                    .get(MUSIC_ORIGIN)
+                    .timeout(std::time::Duration::from_secs(6))
+                    .send()
+                    .await
+                    .map_err(|_| ())?
+                    .error_for_status()
+                    .map_err(|_| ())?
+                    .text()
+                    .await
+                    .map_err(|_| ())?;
+                WebClientConfig::from_page(&page).ok_or(())
+            })
+            .await
+            .ok()
     }
 
     async fn playlist_request(
@@ -615,29 +746,68 @@ impl InnertubeClient {
         cookie: &str,
         auth_user: usize,
     ) -> Result<Value, String> {
-        let (auth, origin, referer) =
-            Self::get_sapisid_auth(cookie).ok_or("Войди в аккаунт YouTube Music в настройках.")?;
+        let (auth, origin, referer) = Self::get_sapisid_auth(cookie)
+            .ok_or("В Cookie не найдены данные входа YouTube Music.")?;
+        self.web_browse_request(
+            endpoint,
+            &mut payload,
+            auth_user,
+            Some((cookie, auth, origin, referer)),
+        )
+        .await
+    }
+
+    async fn web_browse_request(
+        &self,
+        endpoint: &str,
+        payload: &mut Value,
+        auth_user: usize,
+        auth: Option<(&str, String, &str, &str)>,
+    ) -> Result<Value, String> {
+        let config = if auth.is_some() {
+            self.browser_config().await
+        } else {
+            None
+        };
+        let version = config.map_or(FALLBACK_WEB_VERSION, |config| &config.version);
         payload["context"] = serde_json::json!({
-            "client": {"clientName": "WEB_REMIX", "clientVersion": "1.20240101.01.00", "hl": "ru"}
+            "client": {"clientName": "WEB_REMIX", "clientVersion": version, "hl": "ru", "gl": "RU"},
+            "user": {}
         });
-        let response = self
+        let mut request = self
             .client
-            .post(format!(
-                "{origin}/youtubei/v1/{endpoint}?prettyPrint=false&authuser={auth_user}"
-            ))
-            .timeout(std::time::Duration::from_secs(20))
-            .header("Cookie", cookie)
-            .header("Authorization", auth)
-            .header("Origin", origin)
-            .header("X-Origin", origin)
-            .header("Referer", referer)
+            .post(format!("{MUSIC_ORIGIN}/youtubei/v1/{endpoint}"))
+            .query(&[
+                ("alt", "json"),
+                ("prettyPrint", "false"),
+                ("authuser", &auth_user.to_string()),
+            ])
+            .timeout(std::time::Duration::from_secs(15))
+            .header("Origin", MUSIC_ORIGIN)
             .header("X-YouTube-Client-Name", "67")
-            .header("X-YouTube-Client-Version", "1.20240101.01.00")
-            .header("X-Goog-AuthUser", auth_user.to_string())
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Не удалось связаться с YouTube Music: {}", e.without_url()))?;
+            .header("X-YouTube-Client-Version", version)
+            .header("X-Goog-AuthUser", auth_user.to_string());
+        if let Some((cookie, authorization, origin, referer)) = auth {
+            request = request
+                .header("Cookie", cookie)
+                .header("Authorization", authorization)
+                .header("X-Origin", origin)
+                .header("Referer", referer);
+        }
+        if let Some(config) = config {
+            request = request.query(&[("key", &config.api_key)]);
+            if let Some(visitor) = &config.visitor_data {
+                payload["context"]["client"]["visitorData"] = serde_json::json!(visitor);
+                request = request.header("X-Goog-Visitor-Id", visitor);
+            }
+        }
+        if let Some(token) = payload["continuation"].as_str() {
+            request = request.query(&[("continuation", token)]);
+        }
+        let response =
+            request.json(payload).send().await.map_err(|e| {
+                format!("Не удалось связаться с YouTube Music: {}", e.without_url())
+            })?;
         let status = response.status();
         match status.as_u16() {
             401 => return Err("Сессия YouTube Music истекла. Войди в аккаунт заново.".into()),
@@ -685,9 +855,7 @@ impl InnertubeClient {
             if !matches!(choice.membership, PlaylistMembership::Unknown) {
                 continue;
             }
-            let client = Self {
-                client: self.client.clone(),
-            };
+            let client = self.clone();
             let playlist_id = choice.playlist.id.clone();
             let track_id = track_id.to_owned();
             let cookie = cookie.clone();
@@ -989,35 +1157,13 @@ impl InnertubeClient {
         };
 
         let request_page = |mut body: Value| async move {
-            body["context"] = serde_json::json!({
-                "client": {"clientName": "WEB_REMIX", "clientVersion": "1.20240101.01.00", "hl": "ru", "gl": "RU"}
-            });
-            let mut req = self.client
-                .post(format!("https://music.youtube.com/youtubei/v1/browse?prettyPrint=false&authuser={auth_user}"))
-                .timeout(std::time::Duration::from_secs(15))
-                .header("Cookie", cookie)
-                .header("X-YouTube-Client-Name", "67")
-                .header("X-YouTube-Client-Version", "1.20240101.01.00")
-                .header("X-Goog-AuthUser", auth_user.to_string())
-                .json(&body);
-
-            if let Some((auth, origin, referer)) = Self::get_sapisid_auth(cookie) {
-                req = req
-                    .header("Authorization", auth)
-                    .header("Origin", origin)
-                    .header("Referer", referer);
-            }
-            req.send()
-                .await?
-                .error_for_status()?
-                .json::<Value>()
+            let auth = Self::get_sapisid_auth(cookie)
+                .map(|(authorization, origin, referer)| (cookie, authorization, origin, referer));
+            self.web_browse_request("browse", &mut body, auth_user, auth)
                 .await
-                .map_err(reqwest::Error::without_url)
         };
 
-        let mut page = request_page(serde_json::json!({"browseId": actual_id}))
-            .await
-            .map_err(|e| e.without_url().to_string())?;
+        let mut page = request_page(serde_json::json!({"browseId": actual_id})).await?;
         if page.get("contents").is_none() && page.get("header").is_none() {
             return Err("YouTube Music не вернул содержимое плейлиста.".into());
         }
@@ -1033,12 +1179,13 @@ impl InnertubeClient {
                     "YouTube Music повторил страницу плейлиста. Попробуй обновить его.".into(),
                 );
             }
-            page = request_page(serde_json::json!({"continuation": token}))
-                .await
-                .map_err(|e| e.without_url().to_string())?;
+            page = request_page(serde_json::json!({"continuation": token})).await?;
             if page.pointer("/onResponseReceivedActions").is_none()
                 && page
                     .pointer("/continuationContents/musicPlaylistShelfContinuation/contents")
+                    .is_none()
+                && page
+                    .pointer("/continuationContents/musicShelfContinuation/contents")
                     .is_none()
             {
                 return Err("YouTube Music не вернул следующую страницу плейлиста.".into());
@@ -1048,12 +1195,14 @@ impl InnertubeClient {
     }
 
     fn playlist_page(json: &Value) -> (Vec<&Value>, Option<String>) {
-        fn find_shelf(node: &Value) -> Option<&Value> {
+        fn find_shelf<'a>(node: &'a Value, renderer: &str) -> Option<&'a Value> {
             match node {
-                Value::Object(fields) => fields
-                    .get("musicPlaylistShelfRenderer")
-                    .or_else(|| fields.values().find_map(find_shelf)),
-                Value::Array(items) => items.iter().find_map(find_shelf),
+                Value::Object(fields) => fields.get(renderer).or_else(|| {
+                    fields
+                        .values()
+                        .find_map(|child| find_shelf(child, renderer))
+                }),
+                Value::Array(items) => items.iter().find_map(|child| find_shelf(child, renderer)),
                 _ => None,
             }
         }
@@ -1071,6 +1220,11 @@ impl InnertubeClient {
             }
         }
 
+        let shelf = json
+            .pointer("/continuationContents/musicPlaylistShelfContinuation")
+            .or_else(|| json.pointer("/continuationContents/musicShelfContinuation"))
+            .or_else(|| find_shelf(json, "musicPlaylistShelfRenderer"))
+            .or_else(|| find_shelf(json, "musicShelfRenderer"));
         let items = json["onResponseReceivedActions"]
             .as_array()
             .and_then(|actions| {
@@ -1078,10 +1232,7 @@ impl InnertubeClient {
                     action.pointer("/appendContinuationItemsAction/continuationItems")
                 })
             })
-            .or_else(|| {
-                json.pointer("/continuationContents/musicPlaylistShelfContinuation/contents")
-            })
-            .or_else(|| find_shelf(json).and_then(|shelf| shelf.get("contents")));
+            .or_else(|| shelf.and_then(|shelf| shelf.get("contents")));
         let mut tracks = Vec::new();
         collect_tracks(items.unwrap_or(json), &mut tracks);
         let token = items
@@ -1107,6 +1258,11 @@ impl InnertubeClient {
                                 })
                         })
                 })
+            })
+            .or_else(|| {
+                shelf?
+                    .pointer("/continuations/0/nextContinuationData/continuation")?
+                    .as_str()
             })
             .map(str::to_owned);
         (tracks, token)
@@ -1225,6 +1381,30 @@ impl InnertubeClient {
 mod tests {
     use super::*;
     use crate::browser_auth::BrowserAuth;
+
+    #[test]
+    fn reads_public_web_music_configuration() {
+        let page = r#"<script>ytcfg.set({"LOGGED_IN":false});ytcfg.set({"INNERTUBE_API_KEY":"fixture","INNERTUBE_CLIENT_VERSION":"test-version","VISITOR_DATA":"visitor"});</script>"#;
+        let config = WebClientConfig::from_page(page).unwrap();
+        assert_eq!(config.api_key, "fixture");
+        assert_eq!(config.version, "test-version");
+        assert_eq!(config.visitor_data.as_deref(), Some("visitor"));
+        assert!(WebClientConfig::from_page("<html>Sign in</html>").is_none());
+    }
+
+    #[test]
+    fn only_an_explicit_server_marker_confirms_a_nameless_account() {
+        let response = |status: &str| {
+            serde_json::json!({
+                "responseContext": {"serviceTrackingParams": [
+                    {"params": [{"key": "logged_in", "value": status}]}
+                ]}
+            })
+        };
+        assert!(InnertubeClient::response_is_signed_in(&response("1")));
+        assert!(!InnertubeClient::response_is_signed_in(&response("0")));
+        assert!(!InnertubeClient::response_is_signed_in(&Value::Null));
+    }
 
     #[test]
     fn playlist_pages_keep_track_order_and_exclude_suggestions() {
@@ -1357,16 +1537,13 @@ mod tests {
     #[ignore = "requires network and Firefox cookies"]
     async fn test_fetch_playlists() {
         let client = InnertubeClient::new();
-        let cookie = BrowserAuth::extract_firefox_cookies().expect("Cookies from Firefox");
-        let accounts = client.discover_accounts(&cookie).await;
-        println!("Discovered accounts: {:?}", accounts);
+        let cookie = BrowserAuth::firefox_sessions()
+            .expect("Cookies from Firefox")
+            .remove(0);
+        assert!(client.discover_accounts(&cookie, 0).await.is_ok());
 
         for authuser in [0, 1] {
             let res = client.fetch_user_playlists(&cookie, authuser).await;
-            println!(
-                "Fetch user playlists result (authuser={}): {:?}",
-                authuser, res
-            );
             assert!(res.is_ok());
         }
     }

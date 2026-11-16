@@ -2,11 +2,30 @@ use crate::app::MetrolistApp;
 use crate::models::LyricsLine;
 use eframe::egui::{self, Color32, RichText, Rounding};
 
+// Leave time to display the fully sung line before the next line becomes active.
+fn highlight_end(start_ms: u64, end_ms: Option<u64>, next_start_ms: Option<u64>) -> u64 {
+    let end = end_ms
+        .or(next_start_ms)
+        .unwrap_or_else(|| start_ms.saturating_add(4_000));
+    if let Some(next) = next_start_ms.filter(|&next| next > start_ms) {
+        let hold_ms = ((next - start_ms) / 4).min(120);
+        end.min(next - hold_ms).max(start_ms.saturating_add(1))
+    } else {
+        end.max(start_ms.saturating_add(1))
+    }
+}
+
+fn highlighted_word_count(progress: f32, word_count: usize) -> usize {
+    // Highlight each word at the start of its slice, including the last word.
+    ((progress * word_count as f32).floor() as usize + 1).min(word_count)
+}
+
 impl MetrolistApp {
     pub(crate) fn render_active_lyric_line(
         &self,
         ui: &mut egui::Ui,
         line: &LyricsLine,
+        next_start_ms: Option<u64>,
         current_ms: i64,
         font_size: f32,
     ) {
@@ -19,10 +38,16 @@ impl MetrolistApp {
         let color_sung = Color32::WHITE;
         let color_unsung = Color32::from_rgb(175, 175, 185); // Solid readable light silver!
 
-        if let Some(ref words) = line.words {
-            for word in words {
-                let is_fully_sung = (current_ms as u64) >= word.end_ms;
-                let is_unsung = (current_ms as u64) < word.start_ms;
+        let current_ms = current_ms.max(0) as u64;
+        if let Some(words) = line.words.as_ref().filter(|words| !words.is_empty()) {
+            for (index, word) in words.iter().enumerate() {
+                let end_ms = if index + 1 == words.len() {
+                    highlight_end(word.start_ms, Some(word.end_ms), next_start_ms)
+                } else {
+                    word.end_ms
+                };
+                let is_fully_sung = current_ms >= end_ms;
+                let is_unsung = current_ms < word.start_ms;
 
                 if is_fully_sung {
                     job.append(
@@ -48,9 +73,9 @@ impl MetrolistApp {
                     match self.settings.lyrics_animation_mode {
                         // 0 = По буквам (караоке-заливка внутри текущего слова)
                         0 => {
-                            let dur = (word.end_ms - word.start_ms).max(1);
-                            let frac = ((current_ms as u64 - word.start_ms) as f32 / dur as f32)
-                                .clamp(0.0, 1.0);
+                            let dur = end_ms.saturating_sub(word.start_ms).max(1);
+                            let frac =
+                                ((current_ms - word.start_ms) as f32 / dur as f32).clamp(0.0, 1.0);
                             let chars: Vec<char> = word.text.chars().collect();
                             let sung_len =
                                 ((frac * chars.len() as f32).round() as usize).min(chars.len());
@@ -99,12 +124,9 @@ impl MetrolistApp {
             // Построчный LRC: интерполируем прогресс строки по времени,
             // чтобы анимация караоке («По буквам», «По словам», «По строчкам»)
             // работала для всех песен без исключения!
-            let line_dur = line
-                .end_ms
-                .map(|e| e.saturating_sub(line.start_ms))
-                .unwrap_or(4000)
-                .max(600);
-            let elapsed = (current_ms as u64).saturating_sub(line.start_ms);
+            let end_ms = highlight_end(line.start_ms, line.end_ms, next_start_ms);
+            let line_dur = end_ms.saturating_sub(line.start_ms).max(1);
+            let elapsed = current_ms.saturating_sub(line.start_ms);
             let progress = (elapsed as f32 / line_dur as f32).clamp(0.0, 1.0);
 
             match self.settings.lyrics_animation_mode {
@@ -141,9 +163,8 @@ impl MetrolistApp {
                 }
                 // 1 = По словам: постепенная подсветка слов строки по очереди
                 1 => {
-                    let words: Vec<&str> = line.text.split_inclusive(' ').collect();
-                    let sung_count =
-                        ((progress * words.len() as f32).floor() as usize).min(words.len());
+                    let words: Vec<&str> = line.text.split_inclusive(char::is_whitespace).collect();
+                    let sung_count = highlighted_word_count(progress, words.len());
                     let sung: String = words[..sung_count].concat();
                     let unsung: String = words[sung_count..].concat();
 
@@ -203,6 +224,7 @@ impl MetrolistApp {
         &self,
         ui: &mut egui::Ui,
         line: &LyricsLine,
+        next_start_ms: Option<u64>,
         current_ms: i64,
         font_size: f32,
     ) -> egui::Response {
@@ -219,7 +241,13 @@ impl MetrolistApp {
                                 .size(font_size - 2.0)
                                 .color(self.accent_color()),
                         );
-                        self.render_active_lyric_line(ui, line, current_ms, font_size);
+                        self.render_active_lyric_line(
+                            ui,
+                            line,
+                            next_start_ms,
+                            current_ms,
+                            font_size,
+                        );
                     });
                 })
                 .response;
@@ -535,9 +563,16 @@ impl MetrolistApp {
             for (idx, line) in lyrics.lines.iter().enumerate() {
                 let is_active = Some(idx) == current_line_idx;
                 let response = if is_active {
-                    let resp = self.render_highlighted_lyric_line(ui, line, current_time_ms, 18.0);
+                    let next_start_ms = lyrics.lines.get(idx + 1).map(|next| next.start_ms);
+                    let resp = self.render_highlighted_lyric_line(
+                        ui,
+                        line,
+                        next_start_ms,
+                        current_time_ms,
+                        18.0,
+                    );
 
-                    if resp.clicked() {
+                    if self.settings.lyrics_change_on_tap && resp.clicked() {
                         seek_to_sec = Some((line.seconds - offset as f64 / 1000.0).max(0.0));
                     }
                     self.scroll_to_active_lyric(ui, track_id, idx, &resp);
@@ -557,7 +592,7 @@ impl MetrolistApp {
                     } else {
                         ui.add(label_widget.sense(egui::Sense::click()))
                     };
-                    if resp.clicked() {
+                    if self.settings.lyrics_change_on_tap && resp.clicked() {
                         seek_to_sec = Some((line.seconds - offset as f64 / 1000.0).max(0.0));
                     }
                     resp
@@ -578,5 +613,27 @@ impl MetrolistApp {
                 .unwrap_or_default();
             self.trigger_auto_sync(&playback_info);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolated_word_highlight_reaches_last_word_before_line_end() {
+        assert_eq!(highlighted_word_count(0.0, 3), 1);
+        assert_eq!(highlighted_word_count(0.5, 3), 2);
+        assert_eq!(highlighted_word_count(0.9, 3), 3);
+        assert_eq!(highlighted_word_count(0.0, 1), 1);
+        assert_eq!(highlighted_word_count(0.5, 0), 0);
+    }
+
+    #[test]
+    fn last_word_can_finish_even_with_overlapping_or_missing_end_times() {
+        assert_eq!(highlight_end(1_000, Some(2_000), Some(1_800)), 1_680);
+        assert_eq!(highlight_end(1_000, Some(1_500), Some(1_800)), 1_500);
+        assert_eq!(highlight_end(1_000, None, Some(1_200)), 1_150);
+        assert_eq!(highlight_end(1_000, None, None), 5_000);
     }
 }

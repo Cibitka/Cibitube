@@ -1,6 +1,5 @@
-use crate::browser_auth::BrowserAuth;
 use crate::discord::DiscordRpc;
-use crate::downloader::{DownloadEvent, DownloadState, Downloader};
+use crate::downloader::{DownloadControl, DownloadEvent, DownloadState, Downloader};
 use crate::innertube::{InnertubeClient, PlaylistChoice, PlaylistMembership};
 use crate::library::Library;
 use crate::lyrics::LyricsClient;
@@ -44,6 +43,68 @@ enum PlaylistPickerAction {
     Remove,
 }
 
+#[derive(Clone, Copy)]
+struct SliderClock {
+    sample: f64,
+    sampled_at: f64,
+    displayed: f64,
+    drawn_at: f64,
+}
+
+impl SliderClock {
+    fn update(&mut self, position: f64, now: f64, speed: f64) -> f64 {
+        if position != self.sample && (position - self.displayed).abs() > 0.7 {
+            *self = Self {
+                sample: position,
+                sampled_at: now,
+                displayed: position,
+                drawn_at: now,
+            };
+        } else if position != self.sample {
+            self.sample = position;
+            self.sampled_at = now;
+        }
+        let elapsed = (now - self.sampled_at).clamp(0.0, 0.35);
+        let step = (now - self.drawn_at).max(0.0) * speed;
+        let target = self.sample + elapsed * speed;
+        let predicted = self.displayed + step;
+        let correction = (target - predicted).clamp(-step * 0.3, step * 0.3);
+        let limit = self.sample + 0.35 * speed;
+        self.displayed = (predicted + correction).min(limit).max(self.displayed);
+        self.drawn_at = now;
+        self.displayed
+    }
+}
+
+#[cfg(test)]
+mod slider_clock_tests {
+    use super::SliderClock;
+
+    #[test]
+    fn interpolates_between_position_reports_and_stops_on_a_stale_report() {
+        let mut clock = SliderClock {
+            sample: 10.0,
+            sampled_at: 0.0,
+            displayed: 10.0,
+            drawn_at: 0.0,
+        };
+        assert!((clock.update(10.0, 0.016, 1.0) - 10.016).abs() < 0.0001);
+        let corrected = clock.update(10.01, 0.032, 1.0);
+        assert!(corrected > 10.016 && corrected < 10.032);
+        assert!((clock.update(10.01, 2.0, 1.0) - 10.36).abs() < 0.0001);
+        assert_eq!(clock.update(3.0, 2.016, 1.0), 3.0);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Recommendations {
+    tracks: Vec<Track>,
+    playlists: Vec<Playlist>,
+    excluded_tracks: std::collections::HashSet<String>,
+    library_error: Option<String>,
+    feed_error: Option<String>,
+}
+
 pub(crate) enum AppEvent {
     WaveSearchLoaded {
         request: u64,
@@ -55,9 +116,9 @@ pub(crate) enum AppEvent {
         resume_after: Option<String>,
     },
     SearchResults(u64, Result<Vec<Track>, String>),
-    RecommendationsLoaded(Result<Vec<Track>, String>),
+    RecommendationsLoaded(u64, Recommendations),
     LikedMusicLoaded(Result<Vec<Track>, String>),
-    PlaylistsLoaded(usize, Result<Vec<Playlist>, String>),
+    PlaylistsLoaded(usize, u64, Result<Vec<Playlist>, String>),
     PlaylistTracksLoaded {
         playlist_id: String,
         request: u64,
@@ -72,9 +133,10 @@ pub(crate) enum AppEvent {
     },
     LocalLyricsFileSelected(String, Result<Option<std::path::PathBuf>, String>),
     LocalAudioSelected(Result<Option<std::path::PathBuf>, String>),
+    LocalAudioChecked(Option<Track>, Result<std::path::PathBuf, String>),
     PetSpriteSelected(Result<Option<std::path::PathBuf>, String>),
-    AccountsDiscovered(Vec<AccountProfile>),
-    CookiesExtracted(Result<String, String>),
+    AccountsDiscovered(u64, Result<Vec<AccountProfile>, String>),
+    YouTubeSessionChecked(u64, Result<(String, Vec<AccountProfile>), String>),
     UpdateCheckResult(Result<Option<crate::updater::UpdateInfo>, String>),
     UpdateApplied(Result<String, String>),
 }
@@ -109,15 +171,23 @@ pub struct MetrolistApp {
     pub(crate) search_results: Vec<Track>,
     pub(crate) is_searching: bool,
     search_request: u64,
-    recommendations: Option<Result<Vec<Track>, String>>,
+    recommendations: Option<Recommendations>,
+    recommendation_request: u64,
+    accounts_request: u64,
+    playlist_list_request: u64,
     is_loading_recommendations: bool,
     pub(crate) status_message: Option<String>,
     pub(crate) download_status: Option<String>,
     download_events: mpsc::Receiver<DownloadEvent>,
     downloads: Vec<(Track, DownloadState)>,
+    download_controls: std::collections::HashMap<String, DownloadControl>,
     download_log_open: bool,
     playback_retries: u8,
     playback_needs_restart: bool,
+    pending_resume: Option<(f64, bool)>,
+    playback_loaded: bool,
+    sync_writer: crate::sync::SyncWriter,
+    pub(crate) pending_sync_save: Option<mpsc::Receiver<Result<(), String>>>,
     playback_start_deadline: Option<std::time::Instant>,
     prefetched_track: Option<String>,
 
@@ -138,6 +208,8 @@ pub struct MetrolistApp {
     playlist_picker: Option<PlaylistPicker>,
     playlist_tracks_request: u64,
     playlists_account: Option<usize>,
+    pub(crate) youtube_cookie_draft: String,
+    pub(crate) youtube_login_error: Option<String>,
 
     // Queue & Playback
     pub(crate) queue: Vec<Track>,
@@ -178,6 +250,9 @@ impl MetrolistApp {
             3 if settings.show_nav_search => ActiveTab::Search,
             0 if settings.show_nav_search => ActiveTab::Search,
             0 | 1 if settings.show_nav_playlists => ActiveTab::Playlists,
+            _ if settings.show_nav_search => ActiveTab::Search,
+            _ if settings.show_nav_playlists => ActiveTab::Playlists,
+            _ if settings.show_nav_liked => ActiveTab::Liked,
             _ => ActiveTab::Settings,
         };
 
@@ -211,14 +286,22 @@ impl MetrolistApp {
             is_searching: false,
             search_request: 0,
             recommendations: None,
+            recommendation_request: 0,
+            accounts_request: 0,
+            playlist_list_request: 0,
             is_loading_recommendations: false,
             status_message: None,
             download_status: None,
             download_events,
             downloads: Vec::new(),
+            download_controls: Default::default(),
             download_log_open: false,
             playback_retries: 0,
             playback_needs_restart: false,
+            pending_resume: None,
+            playback_loaded: false,
+            sync_writer: crate::sync::SyncWriter::new(),
+            pending_sync_save: None,
             playback_start_deadline: None,
             prefetched_track: None,
             update_info: None,
@@ -235,6 +318,8 @@ impl MetrolistApp {
             playlist_picker: None,
             playlist_tracks_request: 0,
             playlists_account: None,
+            youtube_cookie_draft: String::new(),
+            youtube_login_error: None,
             queue: Vec::new(),
             current_index: None,
             lyrics: None,
@@ -252,57 +337,10 @@ impl MetrolistApp {
         app.apply_theme(&cc.egui_ctx);
         app.player.set_volume(app.settings.volume);
 
-        // Восстановление последнего сеанса (очередь, трек, точная секунда, повтор/шаффл)
         if let Some(state) =
             crate::sync::SyncManager::load_state(&app.settings.google_drive_sync_folder)
         {
-            let restored_queue: Vec<Track> = state
-                .queue
-                .iter()
-                .map(|qe| Track {
-                    id: qe.id.clone(),
-                    title: qe.title.clone(),
-                    artist: qe.artist.clone(),
-                    duration_text: Self::format_time(qe.duration_secs),
-                    thumbnail_url: qe.thumbnail.clone(),
-                })
-                .collect();
-
-            if !restored_queue.is_empty() {
-                app.queue = restored_queue;
-                let idx = state.queue_index.min(app.queue.len() - 1);
-                app.current_index = Some(idx);
-                app.repeat_mode = match state.repeat_mode.as_str() {
-                    "one" => 1,
-                    "all" => 2,
-                    _ => 0,
-                };
-                app.shuffle_state = state.shuffle_enabled;
-
-                if let Some(track) = app.queue.get(idx).cloned() {
-                    if let Ok(mut lock) = app.player.info.lock() {
-                        lock.is_playing = false;
-                        lock.position_secs = state.position_secs;
-                        lock.duration_secs = state.duration_secs;
-                    }
-                    let track_target = if let Some(local_path) = app.find_local_track_file(&track) {
-                        local_path.to_string_lossy().to_string()
-                    } else if track.id.starts_with("local:") {
-                        String::new()
-                    } else {
-                        format!("https://www.youtube.com/watch?v={}", track.id)
-                    };
-                    if !track_target.is_empty() {
-                        app.player.play_url(
-                            &track_target,
-                            app.track_fade_gain(state.position_secs, state.duration_secs),
-                        );
-                        app.player.toggle_pause();
-                        app.player.seek(state.position_secs);
-                    }
-                    app.load_track_lyrics(&track);
-                }
-            }
+            app.restore_session(state, false);
         }
 
         // Check for updates in background on startup
@@ -312,32 +350,21 @@ impl MetrolistApp {
             let _ = tx_up.send(AppEvent::UpdateCheckResult(res));
         });
 
-        // Non-blocking async cookie extraction on startup
-        let tx = app.event_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let res = BrowserAuth::extract_firefox_cookies();
-            let _ = tx.send(AppEvent::CookiesExtracted(res));
-        });
-
-        // Auto-discover / refresh accounts and playlists if cookie exists
         if !app.settings.google_cookie.is_empty() {
-            let client1 = Arc::clone(&app.innertube);
-            let client2 = Arc::clone(&app.innertube);
-            let cookie1 = app.settings.google_cookie.clone();
-            let cookie2 = app.settings.google_cookie.clone();
-            let auth_user = app.settings.auth_user_index;
-            let tx1 = app.event_tx.clone();
-            let tx2 = app.event_tx.clone();
+            app.refresh_youtube_accounts();
+        }
 
-            tokio::spawn(async move {
-                let accounts = client1.discover_accounts(&cookie1).await;
-                let _ = tx1.send(AppEvent::AccountsDiscovered(accounts));
-            });
-
-            tokio::spawn(async move {
-                let pls = client2.fetch_user_playlists(&cookie2, auth_user).await;
-                let _ = tx2.send(AppEvent::PlaylistsLoaded(auth_user, pls));
-            });
+        for track in app.library.pending_downloads.clone() {
+            if let Some(path) = app.find_local_track_file(&track) {
+                app.library
+                    .pending_downloads
+                    .retain(|pending| pending.id != track.id);
+                if let Err(error) = app.library.link_audio(&track, path) {
+                    app.download_status = Some(error);
+                }
+            } else {
+                app.start_queued_download(track);
+            }
         }
 
         app
@@ -415,35 +442,55 @@ impl MetrolistApp {
     }
 
     fn find_local_track_file(&self, track: &Track) -> Option<std::path::PathBuf> {
-        if track.id.starts_with("local:") {
-            return self
-                .library
-                .local_audio
-                .get(&track.id)
-                .filter(|path| path.is_file())
-                .cloned();
+        if let Some(path) = self.library.local_audio.get(&track.id) {
+            return path.is_file().then(|| path.clone());
         }
-        let dir = std::path::PathBuf::from(&self.settings.download_dir);
-        if !dir.exists() {
+        if track.id.starts_with("local:") {
+            return None;
+        }
+        let dir = std::path::Path::new(&self.settings.download_dir);
+        if !dir.is_dir() {
             return None;
         }
 
-        let full_title = format!("{} - {}", track.artist, track.title);
-        let names = [
-            Downloader::download_basename(&full_title),
-            Downloader::sanitize_filename(&full_title),
-            Downloader::sanitize_filename(&track.title),
-        ];
-        for name in names {
-            for ext in ["mp3", "m4a", "opus", "flac", "webm", "wav"] {
-                let file = dir.join(format!("{name}.{ext}"));
-                if file.is_file() {
-                    return Some(file);
-                }
-            }
+        let file_for = |name: &str| {
+            [
+                "mp3", "m4a", "opus", "flac", "webm", "wav", "ogg", "aac", "aiff",
+            ]
+            .into_iter()
+            .map(|ext| dir.join(format!("{name}.{ext}")))
+            .find(|file| file.is_file())
+        };
+        if let Some(file) = file_for(&Downloader::track_basename(track)) {
+            return Some(file);
         }
 
-        None
+        if !self
+            .library
+            .downloaded_tracks
+            .iter()
+            .any(|entry| entry.id == track.id)
+        {
+            return None;
+        }
+        let full_title = format!("{} - {}", track.artist, track.title);
+        let legacy_names = [
+            Downloader::download_basename(&full_title),
+            Downloader::sanitize_filename(&full_title),
+        ];
+        legacy_names.iter().find_map(|name| {
+            let ambiguous = self.library.downloaded_tracks.iter().any(|other| {
+                let other_title = format!("{} - {}", other.artist, other.title);
+                other.id != track.id
+                    && (Downloader::download_basename(&other_title) == *name
+                        || Downloader::sanitize_filename(&other_title) == *name)
+            });
+            if ambiguous {
+                None
+            } else {
+                file_for(name)
+            }
+        })
     }
 
     fn track_cover(&self, ctx: &egui::Context, track: &Track) -> Option<egui::Image<'static>> {
@@ -709,6 +756,7 @@ impl MetrolistApp {
         let dir = std::path::PathBuf::from(&self.settings.download_dir);
         let full_title = format!("{} - {}", track.artist, track.title);
         let names = [
+            Downloader::track_basename(track),
             Downloader::download_basename(&full_title),
             Downloader::sanitize_filename(&full_title),
             Downloader::sanitize_filename(&track.title),
@@ -739,8 +787,61 @@ impl MetrolistApp {
         }
     }
 
+    pub(crate) fn restore_session(
+        &mut self,
+        state: crate::sync::CrossDeviceSyncState,
+        follow_remote: bool,
+    ) {
+        let position = if follow_remote {
+            state.effective_position_secs()
+        } else {
+            state.position_secs
+        };
+        let paused = !follow_remote || !state.is_playing;
+        self.repeat_mode = state.repeat_index();
+        self.shuffle_state = state.shuffle_enabled;
+        if follow_remote {
+            self.settings.playback_speed = state.playback_speed.clamp(0.5, 2.0);
+            self.player
+                .set_speed(self.settings.playback_speed, self.settings.preserve_pitch);
+        }
+        self.queue = state.queue.iter().map(|entry| entry.to_track()).collect();
+        if self.queue.is_empty() && !state.track_id.is_empty() {
+            self.queue.push(state.to_track());
+        }
+        if self.queue.is_empty() {
+            self.clear_queue(true);
+            return;
+        }
+
+        let saved_index = state.queue_index.min(self.queue.len() - 1);
+        self.current_index = Some(if self.queue[saved_index].id == state.track_id {
+            saved_index
+        } else {
+            self.queue
+                .iter()
+                .position(|track| track.id == state.track_id)
+                .unwrap_or(saved_index)
+        });
+        let track = self
+            .current_track()
+            .expect("restored queue is nonempty")
+            .clone();
+        self.playback_retries = 0;
+        self.playback_needs_restart = false;
+        self.playback_start_deadline = None;
+        self.prefetched_track = None;
+        self.pending_resume = Some((position.max(0.0), paused));
+        self.load_track_lyrics(&track);
+        if !self.start_track_audio(&track) {
+            self.player.stop();
+            self.playback_needs_restart = true;
+        }
+    }
+
     pub(crate) fn play_track(&mut self, track: Track) {
         self.playback_retries = 0;
+        self.pending_resume = None;
         self.playback_needs_restart = false;
         self.playback_start_deadline = None;
         self.prefetched_track = None;
@@ -770,19 +871,22 @@ impl MetrolistApp {
     }
 
     fn start_track_audio(&mut self, track: &Track) -> bool {
-        // Мгновенное воспроизведение локального файла, если трек уже скачан (задержка 0.0с вместо 3-5с)
-        if let Some(local_path) = self.find_local_track_file(track) {
-            let path_str = local_path.to_string_lossy().to_string();
-            self.player
-                .play_url(&path_str, self.track_fade_gain(0.0, 0.0));
+        self.playback_loaded = false;
+        let target = if let Some(path) = self.find_local_track_file(track) {
+            path.to_string_lossy().into_owned()
         } else if track.id.starts_with("local:") {
             self.status_message =
-                Some("Локальный аудиофайл недоступен. Добавьте его заново.".into());
+                Some("Локальный аудиофайл недоступен. Перепривяжите его в загрузках.".into());
             return false;
         } else {
-            let url = format!("https://www.youtube.com/watch?v={}", track.id);
-            self.player.play_url(&url, self.track_fade_gain(0.0, 0.0));
-        }
+            format!("https://www.youtube.com/watch?v={}", track.id)
+        };
+        let position = self.pending_resume.map_or(0.0, |(position, _)| position);
+        self.player.load_url(
+            &target,
+            self.track_fade_gain(position, 0.0),
+            self.pending_resume.is_some(),
+        );
 
         self.playback_start_deadline =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(45));
@@ -809,6 +913,8 @@ impl MetrolistApp {
 
         self.playback_start_deadline = None;
         self.playback_needs_restart = true;
+        self.pending_resume = None;
+        self.playback_loaded = false;
         self.player.stop();
         self.status_message = Some(format!("Пропущен трек «{}»: {error}", track.title));
         if self.current_index.is_some_and(|i| i + 1 < self.queue.len()) {
@@ -932,6 +1038,8 @@ impl MetrolistApp {
 
     fn load_recommendations(&mut self, ctx: &egui::Context) {
         self.is_loading_recommendations = true;
+        self.recommendation_request = self.recommendation_request.wrapping_add(1);
+        let request = self.recommendation_request;
         let client = Arc::clone(&self.innertube);
         let seed = self
             .library
@@ -941,25 +1049,153 @@ impl MetrolistApp {
             .map(|track| track.id.clone());
         let country = self.settings.content_country.clone();
         let language = self.settings.ui_language.clone();
+        let cookie = self.settings.google_cookie.clone();
+        let auth_user = self.settings.auth_user_index;
         let tx = self.event_tx.clone();
         let ctx = ctx.clone();
+
         tokio::spawn(async move {
-            let result = match seed.as_deref() {
-                Some(id) => client.fetch_radio(id, &country).await.map(|mut tracks| {
-                    tracks.retain(|track| track.id != id);
-                    tracks.truncate(24);
-                    tracks
-                }),
-                None => client.fetch_home_tracks(&country, &language).await,
+            let home = client.fetch_home(&country, &language);
+            let radio = async {
+                if let Some(id) = seed.as_deref() {
+                    client.fetch_radio(id, &country).await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
             };
-            let result = match result {
-                Ok(tracks) if !tracks.is_empty() => Ok(tracks),
-                _ if seed.is_some() => client.fetch_home_tracks(&country, &language).await,
-                result => result,
+            let library = async {
+                if cookie.is_empty() {
+                    return Ok(Default::default());
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(55),
+                    Arc::clone(&client).recommendation_library(cookie, auth_user),
+                )
+                .await
+                .map_err(|_| "Проверка плейлистов заняла слишком много времени.".to_owned())?
             };
-            let _ = tx.send(AppEvent::RecommendationsLoaded(result));
+            let (home, radio, library) = tokio::join!(home, radio, library);
+            let mut result = Recommendations::default();
+            let mut seen = std::collections::HashSet::new();
+            let (home_tracks, mut playlists) = match home {
+                Ok(contents) => contents,
+                Err(error) => {
+                    result.feed_error = Some(error);
+                    (Vec::new(), Vec::new())
+                }
+            };
+            result.tracks = radio
+                .into_iter()
+                .chain(home_tracks)
+                .filter(|track| {
+                    seed.as_deref() != Some(track.id.as_str()) && seen.insert(track.id.clone())
+                })
+                .collect();
+            match library {
+                Ok((own, excluded)) => {
+                    playlists.retain(|playlist| !own.contains(&playlist.id));
+                    playlists.truncate(12);
+                    result.playlists = playlists;
+                    result.excluded_tracks = excluded;
+                }
+                Err(error) => {
+                    result.library_error = Some(error);
+                }
+            }
+            let _ = tx.send(AppEvent::RecommendationsLoaded(request, result));
             ctx.request_repaint();
         });
+    }
+
+    pub(crate) fn invalidate_recommendations(&mut self) {
+        self.recommendation_request = self.recommendation_request.wrapping_add(1);
+        self.recommendations = None;
+        self.is_loading_recommendations = false;
+    }
+
+    pub(crate) fn refresh_youtube_accounts(&mut self) {
+        self.accounts_request = self.accounts_request.wrapping_add(1);
+        let request = self.accounts_request;
+        let client = Arc::clone(&self.innertube);
+        let cookie = self.settings.google_cookie.clone();
+        let selected = self.settings.auth_user_index;
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let accounts = client.discover_accounts(&cookie, selected).await;
+            let _ = tx.send(AppEvent::AccountsDiscovered(request, accounts));
+        });
+    }
+
+    pub(crate) fn connect_youtube(
+        &mut self,
+        account_hint: Option<usize>,
+        read_sessions: impl FnOnce() -> Result<Vec<String>, String> + Send + 'static,
+    ) {
+        self.accounts_request = self.accounts_request.wrapping_add(1);
+        let request = self.accounts_request;
+        let selected = account_hint.unwrap_or(self.settings.auth_user_index);
+        let client = Arc::clone(&self.innertube);
+        let tx = self.event_tx.clone();
+        self.youtube_login_error = None;
+        self.status_message = Some("Проверяем вход в YouTube Music…".into());
+        tokio::spawn(async move {
+            let result = async {
+                let sessions = tokio::task::spawn_blocking(read_sessions)
+                    .await
+                    .map_err(|_| "Не удалось прочитать сессию.")??;
+                let mut first_error = None;
+                for cookie in sessions {
+                    match client.discover_accounts(&cookie, selected).await {
+                        Ok(mut accounts) => {
+                            if let Some(index) = accounts
+                                .iter()
+                                .position(|account| account.auth_user == selected)
+                            {
+                                accounts.swap(0, index);
+                            }
+                            return Ok((cookie, accounts));
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                Err(first_error.unwrap_or_else(|| "Сессия YouTube Music не найдена.".into()))
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(45), result)
+                .await
+                .unwrap_or_else(|_| {
+                    Err("YouTube Music не ответил вовремя. Повтори подключение.".into())
+                });
+            let _ = tx.send(AppEvent::YouTubeSessionChecked(request, result));
+        });
+    }
+
+    fn apply_youtube_accounts(&mut self, accounts: Vec<AccountProfile>) {
+        let active = accounts
+            .iter()
+            .find(|account| account.auth_user == self.settings.auth_user_index)
+            .or_else(|| accounts.first());
+        if let Some(account) = active {
+            self.settings.auth_user_index = account.auth_user;
+            self.settings.account_name = Some(account.name.clone());
+        }
+        self.settings.available_accounts = accounts;
+        self.settings.save();
+        self.sync_playlists();
+    }
+
+    pub(crate) fn reset_youtube_library(&mut self) {
+        self.accounts_request = self.accounts_request.wrapping_add(1);
+        self.playlist_list_request = self.playlist_list_request.wrapping_add(1);
+        self.playlist_tracks_request = self.playlist_tracks_request.wrapping_add(1);
+        self.playlists.clear();
+        self.playlists_account = None;
+        self.selected_playlist = None;
+        self.playlist_tracks.clear();
+        self.is_loading_playlists = false;
+        self.is_loading_playlist_tracks = false;
+        self.invalidate_recommendations();
     }
 
     pub(crate) fn sync_playlists(&mut self) {
@@ -975,6 +1211,9 @@ impl MetrolistApp {
             self.playlist_tracks.clear();
             self.is_loading_playlist_tracks = false;
         }
+        self.invalidate_recommendations();
+        self.playlist_list_request = self.playlist_list_request.wrapping_add(1);
+        let request = self.playlist_list_request;
         self.is_loading_playlists = true;
         self.status_message = Some("Загрузка плейлистов из YouTube Music...".to_string());
         let client = Arc::clone(&self.innertube);
@@ -983,7 +1222,7 @@ impl MetrolistApp {
 
         tokio::spawn(async move {
             let res = client.fetch_user_playlists(&cookie, auth_user).await;
-            let _ = tx.send(AppEvent::PlaylistsLoaded(auth_user, res));
+            let _ = tx.send(AppEvent::PlaylistsLoaded(auth_user, request, res));
         });
     }
 
@@ -1249,16 +1488,55 @@ impl MetrolistApp {
                 Some("Локальный файл недоступен. Импортируйте его заново.".into());
             return;
         }
-        let opts = crate::downloader::DownloadOptions::from_settings(&self.settings);
-        if self
-            .downloads
-            .iter()
-            .any(|(queued, _)| queued.id == track.id)
-        {
+        if self.download_controls.contains_key(&track.id) {
             return;
         }
-        self.downloads.push((track.clone(), DownloadState::Queued));
-        self.downloader.download_with(track, opts);
+        if !self
+            .library
+            .pending_downloads
+            .iter()
+            .any(|pending| pending.id == track.id)
+        {
+            self.library.pending_downloads.push(track.clone());
+            if let Err(error) = self.library.persist() {
+                self.library.pending_downloads.pop();
+                self.download_status = Some(format!("Не удалось сохранить очередь: {error}"));
+                return;
+            }
+        }
+        self.start_queued_download(track);
+    }
+
+    fn start_queued_download(&mut self, track: Track) {
+        let options = crate::downloader::DownloadOptions::from_settings(&self.settings);
+        if let Some(control) = self.downloader.download_with(track.clone(), options) {
+            self.download_controls.insert(track.id.clone(), control);
+            self.downloads.push((track, DownloadState::Queued));
+        } else {
+            self.download_status = Some("Загрузчик недоступен. Очередь сохранена.".into());
+        }
+    }
+
+    fn cancel_download(&mut self, id: &str) {
+        let Some(index) = self
+            .library
+            .pending_downloads
+            .iter()
+            .position(|track| track.id == id)
+        else {
+            return;
+        };
+        let track = self.library.pending_downloads.remove(index);
+        if let Err(error) = self.library.persist() {
+            self.library.pending_downloads.insert(index, track);
+            self.download_status = Some(format!("Не удалось отменить загрузку: {error}"));
+            return;
+        }
+        if let Some(control) = self.download_controls.remove(id) {
+            control.cancel();
+        }
+        self.downloads.retain(|(queued, _)| queued.id != id);
+        self.download_status = Some(format!("Загрузка «{}» отменена", track.title));
     }
 
     fn format_time(seconds: f64) -> String {
@@ -1273,9 +1551,19 @@ impl MetrolistApp {
 
     fn toggle_playback(&mut self) {
         if self.playback_needs_restart {
+            if self.pending_resume.is_some() {
+                if let Some(track) = self.current_track().cloned() {
+                    self.playback_needs_restart = !self.start_track_audio(&track);
+                }
+                return;
+            }
             if let Some(track) = self.current_track().cloned() {
                 self.play_track(track);
             }
+            return;
+        }
+        if let Some((_, paused)) = &mut self.pending_resume {
+            *paused = !*paused;
             return;
         }
         self.player.toggle_pause();
@@ -1285,46 +1573,40 @@ impl MetrolistApp {
         }
     }
 
-    pub(crate) fn trigger_auto_sync(&self, playback_info: &PlaybackInfo) {
-        let Some(track) = self.current_track().cloned() else {
-            return;
-        };
-        let folder = self.settings.google_drive_sync_folder.clone();
-        let pos = playback_info.position_secs;
-        let dur = playback_info.duration_secs;
-        let is_playing = playback_info.is_playing;
-        let speed = self.settings.playback_speed;
-        let queue = self.queue.clone();
-        let current_idx = self.current_index.unwrap_or(0);
-        let repeat_str = if self.repeat_mode == 1 {
-            "one".to_string()
-        } else if self.repeat_mode == 2 {
-            "all".to_string()
-        } else {
-            "off".to_string()
-        };
-        let shuffle = self.shuffle_state;
-        let drive_enabled = self.settings.cross_device_sync_enabled;
+    pub(crate) fn trigger_auto_sync(
+        &self,
+        playback_info: &PlaybackInfo,
+    ) -> mpsc::Receiver<Result<(), String>> {
+        let (position, paused) = self
+            .pending_resume
+            .unwrap_or((playback_info.position_secs, !playback_info.is_playing));
+        let state = crate::sync::SyncManager::snapshot(
+            self.current_track(),
+            position,
+            playback_info.duration_secs,
+            !paused && self.current_track().is_some(),
+            self.settings.playback_speed,
+            &self.queue,
+            self.current_index.unwrap_or(0),
+            match self.repeat_mode {
+                1 => "all",
+                2 => "one",
+                _ => "off",
+            },
+            self.shuffle_state,
+        );
+        self.sync_writer
+            .save(self.settings.google_drive_sync_folder.clone(), state)
+    }
 
-        std::thread::spawn(move || {
-            let res = crate::sync::SyncManager::save_state_with_queue(
-                &folder,
-                &track,
-                pos,
-                dur,
-                is_playing,
-                speed,
-                &queue,
-                current_idx,
-                &repeat_str,
-                shuffle,
-            );
-            if drive_enabled {
-                if let Ok(state) = res {
-                    let _ = state;
-                }
-            }
-        });
+    fn save_queue_state(&self) {
+        let info = self
+            .player
+            .info
+            .lock()
+            .map(|info| info.clone())
+            .unwrap_or_default();
+        self.trigger_auto_sync(&info);
     }
 
     fn render_playback_slider(
@@ -1339,12 +1621,45 @@ impl MetrolistApp {
         } else {
             100.0
         };
-        let pos = playback_info.position_secs.clamp(0.0, max_d);
-        let fraction = if max_d > 0.0 {
-            (pos / max_d).clamp(0.0, 1.0) as f32
+        let position = playback_info.position_secs.clamp(0.0, max_d);
+        let (now, focused, minimized) = ui.input(|input| {
+            (
+                input.time,
+                input.focused,
+                input.viewport().minimized == Some(true),
+            )
+        });
+        let clock_id = ui.make_persistent_id((
+            "playback-slider-clock",
+            self.current_track().map(|track| &track.id),
+        ));
+        let mut shown = position;
+        let animating = playback_info.is_playing && self.playback_loaded && !minimized;
+        if animating {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(if focused {
+                    16
+                } else {
+                    33
+                }));
+            shown = ui.ctx().data_mut(|data| {
+                let mut clock = data
+                    .get_temp::<SliderClock>(clock_id)
+                    .unwrap_or(SliderClock {
+                        sample: position,
+                        sampled_at: now,
+                        displayed: position,
+                        drawn_at: now,
+                    });
+                let shown = clock.update(position, now, self.settings.playback_speed);
+                data.insert_temp(clock_id, clock);
+                shown
+            });
         } else {
-            0.0
-        };
+            ui.ctx()
+                .data_mut(|data| data.remove::<SliderClock>(clock_id));
+        }
+        let mut fraction = (shown / max_d).clamp(0.0, 1.0) as f32;
 
         let (hit_rect, resp) = ui.allocate_exact_size(
             Vec2::new(width, height.max(18.0)),
@@ -1354,14 +1669,17 @@ impl MetrolistApp {
         let inset = (hit_rect.width() * 0.25).min(9.0);
         let rect = hit_rect.shrink2(Vec2::new(inset, 0.0));
 
-        // Seeking interaction
-        if resp.clicked() || resp.dragged() {
+        if resp.clicked() || resp.dragged() || resp.drag_stopped() {
             if let Some(mouse_pos) = resp.interact_pointer_pos() {
-                let frac = ((mouse_pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                let seek_target = frac as f64 * max_d;
+                fraction = ((mouse_pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let seek_target = f64::from(fraction) * max_d;
+                ui.ctx()
+                    .data_mut(|data| data.remove::<SliderClock>(clock_id));
                 self.player.seek(seek_target);
-                self.last_auto_sync = std::time::Instant::now();
-                self.trigger_auto_sync(playback_info);
+            }
+            self.last_auto_sync = std::time::Instant::now();
+            if resp.clicked() || resp.drag_stopped() {
+                self.save_queue_state();
             }
         }
 
@@ -1385,21 +1703,17 @@ impl MetrolistApp {
             painter.rect_filled(track, radius.min(track.width() / 2.0), color);
         };
 
+        let hovered = ui.ctx().animate_bool_with_time(
+            resp.id.with("thumb-hover"),
+            resp.hovered() || resp.dragged(),
+            0.12,
+        );
         match self.settings.slider_style {
             // 1 = Волнистый (Змейка) / Squiggly seekbar
             1 => {
-                let time_sec = ui.input(|i| i.time) as f32;
-                let phase = if playback_info.is_playing {
-                    time_sec * 5.0
-                } else {
-                    0.0
-                };
-                let wave_len = 22.0_f32; // wave period length
-                let amplitude = if playback_info.is_playing {
-                    3.5_f32
-                } else {
-                    2.5_f32
-                };
+                let phase = (shown * 5.0).rem_euclid(std::f64::consts::TAU) as f32;
+                let wave_len = 22.0_f32;
+                let amplitude = 3.5_f32;
 
                 // Draw unplayed straight line on the right
                 if played_x < rect.right() {
@@ -1410,11 +1724,12 @@ impl MetrolistApp {
                 if played_x > rect.left() {
                     let step = 2.0_f32;
                     let start_x = (rect.left() + 1.75).min(played_x);
-                    let mut prev_pt = Pos2::new(start_x, center_y);
-                    painter.circle_filled(prev_pt, 1.75, accent);
+                    let start = Pos2::new(start_x, center_y);
+                    let mut points = vec![start];
+                    painter.circle_filled(start, 1.75, accent);
 
                     let mut x = start_x + step;
-                    while x <= played_x {
+                    while x < played_x {
                         // Smoothly taper amplitude at the very start and near the thumb
                         let dist_from_start = x - rect.left();
                         let dist_from_end = played_x - x;
@@ -1426,27 +1741,15 @@ impl MetrolistApp {
                         let y = center_y
                             + ((dist_from_start / wave_len) * std::f32::consts::TAU - phase).sin()
                                 * current_amp;
-                        let curr_pt = Pos2::new(x, y);
-
-                        painter.line_segment([prev_pt, curr_pt], Stroke::new(3.5_f32, accent));
-                        prev_pt = curr_pt;
+                        points.push(Pos2::new(x, y));
                         x += step;
                     }
-
-                    if prev_pt.x < played_x {
-                        painter.line_segment(
-                            [prev_pt, Pos2::new(played_x, center_y)],
-                            Stroke::new(3.5_f32, accent),
-                        );
-                    }
+                    points.push(Pos2::new(played_x, center_y));
+                    painter.add(egui::Shape::line(points, Stroke::new(3.5_f32, accent)));
                 }
 
                 // Thumb circle
-                let thumb_radius = if resp.hovered() || resp.dragged() {
-                    7.5
-                } else {
-                    6.0
-                };
+                let thumb_radius = egui::lerp(6.0..=7.5, hovered);
                 painter.circle_filled(Pos2::new(played_x, center_y), thumb_radius, Color32::WHITE);
                 painter.circle_stroke(
                     Pos2::new(played_x, center_y),
@@ -1462,11 +1765,7 @@ impl MetrolistApp {
                     rounded_track(rect.left(), played_x, 2.5, accent);
                 }
                 // Small thumb
-                let thumb_radius = if resp.hovered() || resp.dragged() {
-                    5.0
-                } else {
-                    3.5
-                };
+                let thumb_radius = egui::lerp(3.5..=5.0, hovered);
                 painter.circle_filled(Pos2::new(played_x, center_y), thumb_radius, accent);
                 painter.circle_stroke(
                     Pos2::new(played_x, center_y),
@@ -1482,11 +1781,7 @@ impl MetrolistApp {
                     rounded_track(rect.left(), played_x, 4.0, accent);
                 }
                 // Thumb circle
-                let thumb_radius = if resp.hovered() || resp.dragged() {
-                    7.0
-                } else {
-                    5.5
-                };
+                let thumb_radius = egui::lerp(5.5..=7.0, hovered);
                 painter.circle_filled(Pos2::new(played_x, center_y), thumb_radius, Color32::WHITE);
                 painter.circle_stroke(
                     Pos2::new(played_x, center_y),
@@ -1502,6 +1797,9 @@ impl MetrolistApp {
         text: &'static str,
         show_on_click: bool,
     ) -> egui::Response {
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), text)
+        });
         let ctx = &response.ctx;
         if response.enabled() && response.layer_id.order <= egui::Order::Middle {
             crate::pet::register_surface(ctx, response.id, response.interact_rect, true);
@@ -1955,11 +2253,31 @@ impl eframe::App for MetrolistApp {
                 && !self.settings.hide_player_thumbnail
                 && ctx.input(|i| i.viewport().minimized != Some(true)),
         );
+        if self.current_track().is_some()
+            && !ctx.wants_keyboard_input()
+            && self.welcome_step.is_none()
+            && self.playlist_picker.is_none()
+        {
+            let (toggle, next, previous) = ctx.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Space),
+                    input.modifiers.alt && input.key_pressed(egui::Key::ArrowRight),
+                    input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
+                )
+            });
+            if toggle {
+                self.toggle_playback();
+            } else if next {
+                self.play_next();
+            } else if previous {
+                self.play_prev();
+            }
+        }
         crate::pet::clear_surfaces(ctx);
         let playback_info = self
             .player
             .info
-            .try_lock()
+            .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
         if playback_info.is_playing {
@@ -1978,25 +2296,48 @@ impl eframe::App for MetrolistApp {
 
         while let Ok(event) = self.download_events.try_recv() {
             match event {
-                DownloadEvent::Progress(id, state) => {
-                    if let Some((_, current)) =
-                        self.downloads.iter_mut().find(|(track, _)| track.id == id)
+                DownloadEvent::Progress(id, control, state) => {
+                    if self
+                        .download_controls
+                        .get(&id)
+                        .is_some_and(|current| current.same_job(&control))
                     {
-                        *current = state;
+                        if let Some((_, current)) =
+                            self.downloads.iter_mut().find(|(track, _)| track.id == id)
+                        {
+                            *current = state;
+                        }
                     }
                 }
-                DownloadEvent::Finished(track, Ok(message)) => {
+                DownloadEvent::Finished(track, control, result) => {
+                    if !self
+                        .download_controls
+                        .get(&track.id)
+                        .is_some_and(|current| current.same_job(&control))
+                    {
+                        continue;
+                    }
+                    self.download_controls.remove(&track.id);
                     self.downloads.retain(|(queued, _)| queued.id != track.id);
-                    self.download_status = Some(format!("✓ {} ({message})", track.title));
-                    self.library.add_downloaded(track);
-                }
-                DownloadEvent::Finished(track, Err(error)) => {
-                    self.downloads.retain(|(queued, _)| queued.id != track.id);
-                    self.download_status = Some(format!(
-                        "Не скачался трек «{}». Причина в журнале загрузок.",
-                        track.title
-                    ));
-                    self.library.add_download_failure(track, error);
+                    self.library
+                        .pending_downloads
+                        .retain(|queued| queued.id != track.id);
+                    match result {
+                        Ok((message, path)) => {
+                            self.download_status =
+                                Some(match self.library.link_audio(&track, path) {
+                                    Ok(()) => format!("✓ {} ({message})", track.title),
+                                    Err(error) => error,
+                                });
+                        }
+                        Err(error) => {
+                            self.download_status = Some(format!(
+                                "Не скачался трек «{}». Причина в журнале загрузок.",
+                                track.title
+                            ));
+                            self.library.add_download_failure(track, error);
+                        }
+                    }
                 }
             }
         }
@@ -2096,9 +2437,11 @@ impl eframe::App for MetrolistApp {
                         }
                     }
                 }
-                AppEvent::RecommendationsLoaded(result) => {
-                    self.is_loading_recommendations = false;
-                    self.recommendations = Some(result);
+                AppEvent::RecommendationsLoaded(request, result) => {
+                    if request == self.recommendation_request {
+                        self.is_loading_recommendations = false;
+                        self.recommendations = Some(result);
+                    }
                 }
                 AppEvent::LikedMusicLoaded(res) => match res {
                     Ok(tracks) => {
@@ -2116,8 +2459,10 @@ impl eframe::App for MetrolistApp {
                         self.status_message = Some(err);
                     }
                 },
-                AppEvent::PlaylistsLoaded(auth_user, res) => {
-                    if self.settings.auth_user_index != auth_user {
+                AppEvent::PlaylistsLoaded(auth_user, request, res) => {
+                    if self.settings.auth_user_index != auth_user
+                        || request != self.playlist_list_request
+                    {
                         continue;
                     }
                     self.is_loading_playlists = false;
@@ -2195,73 +2540,58 @@ impl eframe::App for MetrolistApp {
                     Ok(None) => {}
                     Err(err) => self.status_message = Some(err),
                 },
+                AppEvent::LocalAudioChecked(track, result) => {
+                    self.status_message = Some(match (track, result) {
+                        (_, Err(error)) => error,
+                        (None, Ok(path)) => match self.library.import_audio(path) {
+                            Ok(track) => format!("Добавлен трек «{}»", track.title),
+                            Err(error) => error,
+                        },
+                        (Some(track), Ok(path)) => match self.library.link_audio(&track, path) {
+                            Ok(()) => format!("Файл трека «{}» обновлён", track.title),
+                            Err(error) => error,
+                        },
+                    });
+                }
                 AppEvent::PetSpriteSelected(result) => match result {
                     Ok(Some(path)) => self.import_pet_sprite(&path, ctx),
                     Ok(None) => {}
                     Err(error) => self.pet_import_error(error),
                 },
-                AppEvent::AccountsDiscovered(accounts) => {
-                    let total = accounts.len();
-                    self.settings.available_accounts = accounts;
-
-                    // Ensure selected index is valid
-                    let current_user = self.settings.auth_user_index;
-                    if let Some(active) = self
-                        .settings
-                        .available_accounts
-                        .iter()
-                        .find(|a| a.auth_user == current_user)
-                    {
-                        self.settings.account_name = Some(active.name.clone());
-                    } else if let Some(first) = self.settings.available_accounts.first() {
-                        self.settings.auth_user_index = first.auth_user;
-                        self.settings.account_name = Some(first.name.clone());
+                AppEvent::AccountsDiscovered(request, result) => {
+                    if request != self.accounts_request || self.settings.google_cookie.is_empty() {
+                        continue;
                     }
-
-                    self.settings.save();
-                    if let Some(name) = &self.settings.account_name {
-                        self.status_message =
-                            Some(format!("Аккаунтов Google: {}. Активен: {}", total, name));
-                    }
-                    if self.playlists.is_empty() {
-                        self.sync_playlists();
+                    match result {
+                        Ok(accounts) => self.apply_youtube_accounts(accounts),
+                        Err(error) => {
+                            self.settings.available_accounts.clear();
+                            self.settings.account_name = None;
+                            self.settings.save();
+                            self.status_message =
+                                Some(format!("Не удалось подтвердить аккаунт: {error}"));
+                        }
                     }
                 }
-                AppEvent::CookiesExtracted(res) => match res {
-                    Ok(fresh_cookie) => {
-                        if !fresh_cookie.is_empty() {
-                            let was_empty = self.settings.google_cookie.is_empty();
-                            self.settings.google_cookie = fresh_cookie.clone();
-                            self.settings.save();
-                            if was_empty {
-                                self.status_message =
-                                    Some("Куки из Firefox успешно получены!".to_string());
+                AppEvent::YouTubeSessionChecked(request, result) => {
+                    if request != self.accounts_request {
+                        continue;
+                    }
+                    match result {
+                        Ok((cookie, accounts)) => {
+                            self.reset_youtube_library();
+                            self.settings.google_cookie = cookie;
+                            if let Some(account) = accounts.first() {
+                                self.settings.auth_user_index = account.auth_user;
                             }
-                            let client1 = Arc::clone(&self.innertube);
-                            let client2 = Arc::clone(&self.innertube);
-                            let auth_user = self.settings.auth_user_index;
-                            let tx1 = self.event_tx.clone();
-                            let tx2 = self.event_tx.clone();
-                            let cookie_for_acc = fresh_cookie.clone();
-                            let cookie_for_pls = fresh_cookie;
-                            tokio::spawn(async move {
-                                let accounts = client1.discover_accounts(&cookie_for_acc).await;
-                                let _ = tx1.send(AppEvent::AccountsDiscovered(accounts));
-                            });
-                            tokio::spawn(async move {
-                                let pls = client2
-                                    .fetch_user_playlists(&cookie_for_pls, auth_user)
-                                    .await;
-                                let _ = tx2.send(AppEvent::PlaylistsLoaded(auth_user, pls));
-                            });
+                            self.apply_youtube_accounts(accounts);
+                        }
+                        Err(error) => {
+                            self.status_message = Some("Вход в YouTube Music не выполнен.".into());
+                            self.youtube_login_error = Some(error);
                         }
                     }
-                    Err(err) => {
-                        if self.settings.google_cookie.is_empty() {
-                            self.status_message = Some(format!("Firefox: {}", err));
-                        }
-                    }
-                },
+                }
                 AppEvent::UpdateCheckResult(res) => {
                     self.is_checking_update = false;
                     let install = std::mem::take(&mut self.install_after_check);
@@ -2298,10 +2628,39 @@ impl eframe::App for MetrolistApp {
             }
         }
 
+        if let Some(result) = self
+            .pending_sync_save
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.pending_sync_save = None;
+            self.sync_status_message = Some(match result {
+                Ok(()) => "Состояние и очередь сохранены.".into(),
+                Err(error) => format!("Не удалось сохранить состояние: {error}"),
+            });
+        }
+
         match self.player.playback_event() {
+            Some(PlaybackEvent::Loaded) => {
+                self.playback_loaded = true;
+                self.playback_start_deadline = None;
+                if let Some((position, paused)) = self.pending_resume.take() {
+                    self.player.seek(position);
+                    self.player.set_paused(paused);
+                    if self
+                        .sync_status_message
+                        .as_deref()
+                        .is_some_and(|message| message.starts_with("Загружается «"))
+                    {
+                        self.sync_status_message =
+                            Some("Состояние воспроизведения восстановлено.".into());
+                    }
+                }
+            }
             Some(PlaybackEvent::Failed(error)) => self.recover_playback(&error),
             Some(PlaybackEvent::Ended) => {
                 self.playback_start_deadline = None;
+                self.playback_loaded = false;
                 self.playback_needs_restart = true;
                 if self.repeat_mode == 2 {
                     if let Some(track) = self.current_track().cloned() {
@@ -2314,9 +2673,6 @@ impl eframe::App for MetrolistApp {
                         self.request_wave(true);
                     }
                 }
-            }
-            None if playback_info.duration_secs > 0.0 || playback_info.position_secs > 0.0 => {
-                self.playback_start_deadline = None;
             }
             None if self
                 .playback_start_deadline
@@ -3090,7 +3446,11 @@ impl eframe::App for MetrolistApp {
             let track = self
                 .current_index
                 .and_then(|index| self.queue.get(index))
-                .filter(|_| self.settings.discord_rpc_enabled && self.player.is_alive());
+                .filter(|_| {
+                    self.settings.discord_rpc_enabled
+                        && self.player.is_alive()
+                        && self.playback_loaded
+                });
             self.discord.sync_activity(
                 track,
                 &info,
@@ -3117,13 +3477,19 @@ impl eframe::App for MetrolistApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        for download in self.download_controls.values() {
+            download.cancel();
+        }
         let playback_info = self
             .player
             .info
             .try_lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        self.trigger_auto_sync(&playback_info);
+        let _ = self
+            .trigger_auto_sync(&playback_info)
+            .recv_timeout(std::time::Duration::from_millis(450));
+        self.downloader.shutdown();
     }
 }
 
@@ -3214,6 +3580,7 @@ impl MetrolistApp {
         ui.add_space(16.0);
 
         let showing_recommendations = self.search_query.trim().is_empty();
+        let mut recommended_tracks = Vec::new();
         if showing_recommendations {
             ui.horizontal(|ui| {
                 ui.heading("Рекомендации");
@@ -3234,15 +3601,66 @@ impl MetrolistApp {
                 ui.spinner();
                 return;
             }
-            match self.recommendations.as_ref() {
-                Some(Ok(tracks)) if !tracks.is_empty() => {}
-                Some(Err(error)) => {
-                    ui.label(error);
-                    return;
-                }
-                _ => {
-                    ui.label("YouTube Music пока не вернул рекомендации.");
-                    return;
+            if let Some(recommendations) = &self.recommendations {
+                if let Some(error) = &recommendations.library_error {
+                    ui.label(format!(
+                        "Не удалось сверить рекомендации с медиатекой: {error}"
+                    ));
+                } else {
+                    if !recommendations.playlists.is_empty() {
+                        ui.heading("Плейлисты других авторов");
+                        let mut open = None;
+                        egui::ScrollArea::horizontal()
+                            .id_salt("recommended_playlists")
+                            .max_height(98.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for playlist in &recommendations.playlists {
+                                        if self.settings.youtube_playlist_hidden(&playlist.id) {
+                                            continue;
+                                        }
+                                        ui.push_id(&playlist.id, |ui| {
+                                            ui.allocate_ui_with_layout(
+                                                Vec2::new(285.0, 78.0),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    let rounding = Rounding::same(
+                                                        self.settings.album_art_rounding,
+                                                    );
+                                                    if Self::playlist_card(
+                                                        ui,
+                                                        playlist,
+                                                        rounding,
+                                                        accent,
+                                                        |ui| ui.button("Открыть").clicked(),
+                                                    ) {
+                                                        open = Some(playlist.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                            });
+                        if let Some(playlist) = open {
+                            self.open_playlist(playlist);
+                            self.active_tab = ActiveTab::Playlists;
+                            return;
+                        }
+                    }
+                    recommended_tracks = recommendations
+                        .tracks
+                        .iter()
+                        .filter(|track| {
+                            !recommendations.excluded_tracks.contains(&track.id)
+                                && !self.library.is_liked(&track.id)
+                        })
+                        .take(24)
+                        .cloned()
+                        .collect();
+                    if let Some(error) = &recommendations.feed_error {
+                        ui.label(error);
+                    }
                 }
             }
         }
@@ -3258,22 +3676,30 @@ impl MetrolistApp {
         }
 
         let tracks = if showing_recommendations {
-            self.recommendations
-                .as_ref()
-                .and_then(|result| result.as_ref().ok())
-                .map(Vec::as_slice)
-                .unwrap_or_default()
+            &recommended_tracks
         } else {
             &self.search_results
         };
         if tracks.is_empty() {
-            ui.label("Результатов пока нет.");
+            if !showing_recommendations
+                || self
+                    .recommendations
+                    .as_ref()
+                    .is_some_and(|items| items.library_error.is_none())
+            {
+                ui.label(if showing_recommendations {
+                    "Новых треков пока нет."
+                } else {
+                    "Результатов пока нет."
+                });
+            }
             return;
         }
 
         // List results
         let mut play_index = None;
         let mut enqueue = None;
+        let mut enqueue_next = None;
         let mut download = None;
         egui::ScrollArea::vertical()
             .id_salt(if showing_recommendations {
@@ -3372,14 +3798,20 @@ impl MetrolistApp {
                                         self.library.toggle_like(track.clone());
                                     }
 
-                                    // Add to queue
-                                    if ui
-                                        .button(if compact { "+" } else { "+ Очередь" })
-                                        .on_hover_text("Добавить в очередь")
-                                        .clicked()
-                                    {
-                                        enqueue = Some(track.clone());
-                                    }
+                                    ui.menu_button(
+                                        if compact { "+" } else { "+ Очередь" },
+                                        |ui| {
+                                            if ui.button("Играть следующим").clicked()
+                                            {
+                                                enqueue_next = Some(track.clone());
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("В конец очереди").clicked() {
+                                                enqueue = Some(track.clone());
+                                                ui.close_menu();
+                                            }
+                                        },
+                                    );
 
                                     // Download
                                     if ui
@@ -3403,7 +3835,11 @@ impl MetrolistApp {
         }
         if let Some(track) = enqueue {
             self.queue.push(track);
+            self.save_queue_state();
             self.status_message = Some("Трек добавлен в очередь".to_string());
+        }
+        if let Some(track) = enqueue_next {
+            self.queue_as_next(track);
         }
         if let Some(track) = download {
             self.download_track(track);
@@ -4058,22 +4494,73 @@ impl MetrolistApp {
         }
     }
 
+    fn clear_queue(&mut self, stop: bool) {
+        self.wave_request = self.wave_request.wrapping_add(1);
+        self.wave_busy = false;
+        self.prefetched_track = None;
+        if !stop {
+            if let Some(current) = self.current_index {
+                self.queue.truncate(current + 1);
+                self.save_queue_state();
+                return;
+            }
+        }
+        self.player.stop();
+        self.queue.clear();
+        self.current_index = None;
+        self.pending_resume = None;
+        self.playback_loaded = false;
+        self.playback_start_deadline = None;
+        self.playback_needs_restart = false;
+        self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
+        self.lyrics = None;
+        self.is_local_lyrics = false;
+        self.save_queue_state();
+    }
+
+    fn move_queue_entry(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.queue.len() || to >= self.queue.len() {
+            return;
+        }
+        let track = self.queue.remove(from);
+        self.queue.insert(to, track);
+        self.current_index = self.current_index.map(|current| match current {
+            i if i == from => to,
+            i if from < i && i <= to => i - 1,
+            i if to <= i && i < from => i + 1,
+            i => i,
+        });
+        self.prefetched_track = None;
+        self.save_queue_state();
+    }
+
+    fn queue_as_next(&mut self, track: Track) {
+        let insert_at = self
+            .current_index
+            .map_or(0, |index| index + 1)
+            .min(self.queue.len());
+        self.queue.insert(insert_at, track);
+        self.prefetched_track = None;
+        self.save_queue_state();
+    }
+
     fn render_queue_tab(&mut self, ui: &mut egui::Ui) {
         let accent = self.accent_color();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Очередь воспроизведения").size(18.0).strong());
             ui.add_space(16.0);
             if ui.button("Перемешать очередь").clicked() {
                 self.shuffle_queue();
+                self.save_queue_state();
                 self.status_message = Some("Очередь перемешана".to_string());
             }
             ui.add_space(8.0);
-            if ui.button("Очистить очередь").clicked() {
-                self.queue.clear();
-                self.current_index = None;
-                self.wave_request = self.wave_request.wrapping_add(1);
-                self.wave_busy = false;
+            if ui.button("Очистить предстоящие").clicked() {
+                self.clear_queue(false);
+            }
+            if ui.button("Остановить и очистить").clicked() {
+                self.clear_queue(true);
             }
         });
 
@@ -4108,6 +4595,8 @@ impl MetrolistApp {
         }
 
         let mut track_to_play = None;
+        let mut entry_to_move = None;
+        let mut entry_to_remove = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (idx, track) in self.queue.iter().enumerate() {
@@ -4142,8 +4631,35 @@ impl MetrolistApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if !is_current && ui.button("▶").clicked() {
-                                track_to_play = Some(track.clone());
+                                track_to_play = Some(idx);
                             }
+                            ui.menu_button("⋯", |ui| {
+                                if !is_current && ui.button("Играть следующим").clicked()
+                                {
+                                    let next = self.current_index.map_or(0, |current| {
+                                        if idx < current {
+                                            current
+                                        } else {
+                                            current + 1
+                                        }
+                                    });
+                                    entry_to_move = Some((idx, next));
+                                    ui.close_menu();
+                                }
+                                if idx > 0 && ui.button("Выше").clicked() {
+                                    entry_to_move = Some((idx, idx - 1));
+                                    ui.close_menu();
+                                }
+                                if idx + 1 < self.queue.len() && ui.button("Ниже").clicked() {
+                                    entry_to_move = Some((idx, idx + 1));
+                                    ui.close_menu();
+                                }
+                                if !is_current && ui.button("Убрать из очереди").clicked()
+                                {
+                                    entry_to_remove = Some(idx);
+                                    ui.close_menu();
+                                }
+                            });
                         });
                     });
                 });
@@ -4151,8 +4667,20 @@ impl MetrolistApp {
             }
         });
 
-        if let Some(t) = track_to_play {
-            self.play_track(t.clone());
+        if let Some(index) = track_to_play {
+            self.current_index = Some(index);
+            self.play_track(self.queue[index].clone());
+        }
+        if let Some((from, to)) = entry_to_move {
+            self.move_queue_entry(from, to);
+        }
+        if let Some(index) = entry_to_remove {
+            self.queue.remove(index);
+            if let Some(current) = &mut self.current_index {
+                *current -= usize::from(index < *current);
+            }
+            self.prefetched_track = None;
+            self.save_queue_state();
         }
     }
 
@@ -4176,9 +4704,35 @@ impl MetrolistApp {
     }
 
     fn import_local_audio(&mut self, path: &std::path::Path) {
-        self.status_message = Some(match self.library.import_audio(path) {
-            Ok(track) => format!("Добавлен трек «{}»", track.title),
-            Err(error) => error,
+        let path = path.to_owned();
+        let tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(AppEvent::LocalAudioChecked(
+                None,
+                crate::local_media::validate_audio(&path),
+            ));
+        });
+    }
+
+    fn pick_replacement_audio(&self, track: Track) {
+        let tx = self.event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = crate::local_media::pick_file(
+                "Выберите новое расположение аудиофайла",
+                "Аудиофайлы | *.mp3 *.flac *.ogg *.opus *.wav *.m4a *.aac *.aiff *.webm",
+            );
+            match result {
+                Ok(Some(path)) => {
+                    let _ = tx.send(AppEvent::LocalAudioChecked(
+                        Some(track),
+                        crate::local_media::validate_audio(&path),
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = tx.send(AppEvent::LocalAudioChecked(Some(track), Err(error)));
+                }
+            }
         });
     }
 
@@ -4272,8 +4826,10 @@ impl MetrolistApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Открыть папку").clicked() {
-                    let dir = self.settings.download_dir.clone();
-                    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                    if let Err(error) = crate::local_media::open_folder(&self.settings.download_dir)
+                    {
+                        self.status_message = Some(error);
+                    }
                 }
 
                 if !self.library.downloaded_tracks.is_empty() {
@@ -4332,6 +4888,7 @@ impl MetrolistApp {
         }
 
         ui.separator();
+        let mut cancel_download = None;
         if let Some((
             track,
             DownloadState::Active {
@@ -4346,7 +4903,12 @@ impl MetrolistApp {
             .find(|(_, state)| matches!(state, DownloadState::Active { .. }))
         {
             ui.heading("Сейчас скачивается");
-            ui.label(RichText::new(format!("{} — {}", track.title, track.artist)).strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("{} — {}", track.title, track.artist)).strong());
+                if ui.button("Отменить").clicked() {
+                    cancel_download = Some(track.id.clone());
+                }
+            });
             let progress = if *processing {
                 "Подготовка файлов".to_owned()
             } else {
@@ -4377,9 +4939,17 @@ impl MetrolistApp {
                 .max_height(160.0)
                 .show(ui, |ui| {
                     for (track, _) in queued {
-                        ui.label(format!("{} — {}", track.title, track.artist));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{} — {}", track.title, track.artist));
+                            if ui.small_button("Убрать из загрузок").clicked() {
+                                cancel_download = Some(track.id.clone());
+                            }
+                        });
                     }
                 });
+        }
+        if let Some(id) = cancel_download {
+            self.cancel_download(&id);
         }
         ui.heading("Скачанные треки");
 
@@ -4409,6 +4979,7 @@ impl MetrolistApp {
             let rounding = Rounding::same(self.settings.album_art_rounding);
 
             for track in &self.library.downloaded_tracks {
+                let missing_file = self.find_local_track_file(track).is_none();
                 let frame = egui::Frame::none()
                     .fill(Color32::from_rgb(26, 26, 34))
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(38, 38, 48)))
@@ -4441,6 +5012,12 @@ impl MetrolistApp {
                                     .color(Color32::WHITE),
                             );
                             ui.add_space(2.0);
+                            if missing_file {
+                                ui.label(
+                                    RichText::new("Файл не найден")
+                                        .color(Color32::from_rgb(255, 135, 140)),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(&track.artist).size(12.0).weak());
                                 if !track.duration_text.is_empty() {
@@ -4477,10 +5054,16 @@ impl MetrolistApp {
                                 track_to_play = Some(track.clone());
                             }
 
-                            ui.add_space(8.0);
-                            if ui.button("Добавить текст").clicked() {
-                                self.pick_lyrics_for_track(track.id.clone());
-                            }
+                            ui.menu_button("⋯", |ui| {
+                                if ui.button("Перепривязать файл").clicked() {
+                                    self.pick_replacement_audio(track.clone());
+                                    ui.close_menu();
+                                }
+                                if ui.button("Добавить текст").clicked() {
+                                    self.pick_lyrics_for_track(track.id.clone());
+                                    ui.close_menu();
+                                }
+                            });
                         });
                     });
                 });
@@ -4490,6 +5073,7 @@ impl MetrolistApp {
 
         if let Some(del_id) = track_to_delete {
             self.library.downloaded_tracks.retain(|t| t.id != del_id);
+            self.library.local_audio.remove(&del_id);
             self.library.save();
         }
 
@@ -4560,7 +5144,8 @@ impl MetrolistApp {
                     let source_title = self
                         .selected_playlist
                         .as_ref()
-                        .map(|p| p.title.as_str())
+                        .filter(|_| self.queue == self.playlist_tracks && !self.queue.is_empty())
+                        .map(|playlist| playlist.title.as_str())
                         .unwrap_or("Очередь воспроизведения");
                     ui.label(
                         RichText::new(source_title)
@@ -5059,9 +5644,10 @@ impl MetrolistApp {
                                                     for (idx, line) in lyrics.lines.iter().enumerate() {
                                                         let is_active = Some(idx) == current_line_idx;
                                                         let response = if is_active {
-                                                            let resp = self.render_highlighted_lyric_line(ui, line, current_time_ms, 15.0);
+                                                            let next_start_ms = lyrics.lines.get(idx + 1).map(|next| next.start_ms);
+                                                            let resp = self.render_highlighted_lyric_line(ui, line, next_start_ms, current_time_ms, 15.0);
 
-                                                            if resp.clicked() {
+                                                            if self.settings.lyrics_change_on_tap && resp.clicked() {
                                                                 seek_to_sec = Some((line.seconds - offset as f64 / 1000.0).max(0.0));
                                                             }
                                                             self.scroll_to_active_lyric(ui, track_id, idx, &resp);
@@ -5084,7 +5670,7 @@ impl MetrolistApp {
                                                             } else {
                                                                 ui.add(label_widget.sense(egui::Sense::click()))
                                                             };
-                                                            if resp.clicked() {
+                                                            if self.settings.lyrics_change_on_tap && resp.clicked() {
                                                                 seek_to_sec = Some((line.seconds - offset as f64 / 1000.0).max(0.0));
                                                             }
                                                             resp

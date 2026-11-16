@@ -2,7 +2,6 @@ use crate::app::{AppEvent, MetrolistApp};
 use crate::browser_auth::BrowserAuth;
 use crate::discord::DiscordStatus;
 use eframe::egui::{self, pos2, Color32, Rect, RichText, Rounding, Stroke, Vec2};
-use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FlagKind {
@@ -456,19 +455,20 @@ impl MetrolistApp {
                                 ui.add_space(8.0);
                             }
 
+                            if ui.button("Переподключить через Firefox").clicked() {
+                                self.connect_youtube(None, BrowserAuth::firefox_sessions);
+                            }
+
                             ui.horizontal(|ui| {
                                 if ui.button("Обновить список аккаунтов").clicked() {
-                                    let client = Arc::clone(&self.innertube);
-                                    let cookie = self.settings.google_cookie.clone();
-                                    let tx = self.event_tx.clone();
-                                    tokio::spawn(async move {
-                                        let accounts = client.discover_accounts(&cookie).await;
-                                        let _ = tx.send(AppEvent::AccountsDiscovered(accounts));
-                                    });
+                                    self.refresh_youtube_accounts();
                                 }
 
                                 if ui.button(RichText::new("Выйти из аккаунта").color(Color32::from_rgb(244, 63, 94))).clicked() {
+                                    self.reset_youtube_library();
                                     self.settings.google_cookie.clear();
+                                    self.youtube_cookie_draft.clear();
+                                    self.youtube_login_error = None;
                                     self.settings.account_name = None;
                                     self.settings.available_accounts.clear();
                                     self.settings.save();
@@ -484,38 +484,43 @@ impl MetrolistApp {
                                 .rounding(Rounding::same(8.0));
 
                             if ui.add_sized([260.0, 36.0], ff_btn).clicked() {
-                                self.status_message = Some("Чтение профилей Firefox в фоне...".to_string());
-                                let tx = self.event_tx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let res = BrowserAuth::extract_firefox_cookies();
-                                    let _ = tx.send(AppEvent::CookiesExtracted(res));
-                                });
+                                self.connect_youtube(None, BrowserAuth::firefox_sessions);
                             }
                             ui.add_space(4.0);
-                            ui.label(RichText::new("Автоматически обнаруживает все ваши аккаунты Google в Firefox и даёт выбрать нужный.").size(11.0).weak());
+                            ui.label(RichText::new("Использует активную сессию YouTube Music в Firefox и предлагает доступные аккаунты.").size(11.0).weak());
 
-                            ui.add_space(8.0);
-                            ui.collapsing("Ввести Cookie вручную (для Chromium / Chrome / Edge)", |ui| {
-                                let mut save_clicked = false;
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::TextEdit::singleline(&mut self.settings.google_cookie)
-                                        .hint_text("Вставьте строку Cookie...")
-                                        .desired_width(ui.available_width() - 90.0));
-                                    if ui.button("Сохранить").clicked() {
-                                        save_clicked = true;
-                                    }
-                                });
-                                if save_clicked {
-                                    self.settings.save();
-                                    let client = Arc::clone(&self.innertube);
-                                    let cookie = self.settings.google_cookie.clone();
-                                    let tx = self.event_tx.clone();
-                                    tokio::spawn(async move {
-                                        let accounts = client.discover_accounts(&cookie).await;
-                                        let _ = tx.send(AppEvent::AccountsDiscovered(accounts));
-                                    });
-                                }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.collapsing("Войти вручную через Cookie", |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("1. Открой");
+                                ui.hyperlink_to("YouTube Music", "https://music.youtube.com");
+                                ui.label("в браузере и войди в нужный аккаунт.");
                             });
+                            ui.label("2. Нажми F12, открой вкладку «Сеть», введи browse в фильтр и нажми «Библиотека» на сайте.");
+                            ui.label("3. Выбери запрос POST browse со статусом 200 и доменом music.youtube.com.");
+                            ui.label("4. В Firefox нажми правой кнопкой по запросу → «Копировать» → «Копировать заголовки запроса». Можно также открыть «Заголовки запроса» и скопировать значение Cookie.");
+                            ui.label("5. Вставь скопированное в поле ниже и нажми «Войти».");
+                            ui.label(RichText::new("Cookie даёт доступ к сессии. Вставляй его только сюда.").weak());
+                            ui.add_space(4.0);
+                            ui.add(egui::TextEdit::multiline(&mut self.youtube_cookie_draft)
+                                .password(true)
+                                .desired_rows(2)
+                                .hint_text("Cookie или заголовки запроса")
+                                .desired_width(ui.available_width()));
+                            if ui.add_enabled(!self.youtube_cookie_draft.trim().is_empty(), egui::Button::new("Войти")).clicked() {
+                                match BrowserAuth::manual_session(&self.youtube_cookie_draft) {
+                                    Ok((cookie, account)) => {
+                                        self.youtube_cookie_draft.clear();
+                                        self.connect_youtube(account, move || Ok(vec![cookie]));
+                                    }
+                                    Err(error) => self.youtube_login_error = Some(error),
+                                }
+                            }
+                        });
+                        if let Some(error) = &self.youtube_login_error {
+                            ui.label(RichText::new(error).color(Color32::from_rgb(248, 113, 113)));
                         }
                     });
                 ui.add_space(12.0);
@@ -812,7 +817,7 @@ impl MetrolistApp {
                         });
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Источник текстов по умолчанию:");
                             let sources = [
                                 (0, "Автоматически"),
@@ -1033,9 +1038,9 @@ impl MetrolistApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Папка для сохранения треков:");
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.download_dir).desired_width(ui.available_width() - 140.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.download_dir).desired_width((ui.available_width() - 150.0).max(100.0)));
                             if ui.button("Сохранить").clicked() {
                                 self.settings.save();
                                 self.status_message = Some("Папка загрузки обновлена".to_string());
@@ -1045,7 +1050,9 @@ impl MetrolistApp {
                         ui.add_space(6.0);
                         let dir = self.settings.download_dir.clone();
                         if ui.button("Открыть папку загрузок в файловом менеджере").clicked() {
-                            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                            if let Err(error) = crate::local_media::open_folder(&dir) {
+                                self.status_message = Some(error);
+                            }
                         }
 
                         ui.add_space(8.0);
@@ -1221,27 +1228,9 @@ impl MetrolistApp {
                                 .fill(accent)
                                 .rounding(Rounding::same(6.0));
                             if ui.add(push_btn).clicked() {
-                                if let Some(track) = self.current_track().cloned() {
-                                    let info = self.player.info.lock().map(|i| (i.position_secs, i.duration_secs, i.is_playing)).unwrap_or((0.0, 0.0, false));
-                                    let res = crate::sync::SyncManager::save_state_with_queue(
-                                        &self.settings.google_drive_sync_folder,
-                                        &track,
-                                        info.0,
-                                        info.1,
-                                        info.2,
-                                        self.settings.playback_speed,
-                                        &self.queue,
-                                        self.current_index.unwrap_or(0),
-                                        if self.repeat_mode == 1 { "one" } else if self.repeat_mode == 2 { "all" } else { "off" },
-                                        self.shuffle_state,
-                                    );
-                                    match res {
-                                        Ok(_) => self.sync_status_message = Some("✓ Состояние и очередь успешно синхронизированы в файл!".to_string()),
-                                        Err(e) => self.sync_status_message = Some(format!("Ошибка синхронизации: {e}")),
-                                    }
-                                } else {
-                                    self.sync_status_message = Some("Сейчас ничего не играет для выгрузки".to_string());
-                                }
+                                let info = self.player.info.lock().map(|info| info.clone()).unwrap_or_default();
+                                self.pending_sync_save = Some(self.trigger_auto_sync(&info));
+                                self.sync_status_message = Some("Сохраняется состояние…".into());
                             }
 
                             let pull_btn = egui::Button::new(RichText::new(strings.sync_pull_btn).strong())
@@ -1249,15 +1238,13 @@ impl MetrolistApp {
                                 .rounding(Rounding::same(6.0));
                             if ui.add(pull_btn).clicked() {
                                 if let Some(state) = crate::sync::SyncManager::load_state(&self.settings.google_drive_sync_folder) {
-                                    let current_t = state.to_track();
-                                    let eff_pos = state.effective_position_secs();
-                                    if !state.queue.is_empty() {
-                                        self.queue = state.queue.iter().map(|e| e.to_track()).collect();
-                                        self.current_index = Some(state.queue_index.min(self.queue.len().saturating_sub(1)));
-                                    }
-                                    self.play_track(current_t);
-                                    self.player.seek(eff_pos);
-                                    self.sync_status_message = Some(format!("✓ Загружен трек: {} ({:.0} сек)", state.title, eff_pos));
+                                    let title = state.title.clone();
+                                    self.restore_session(state, true);
+                                    self.sync_status_message = Some(if title.is_empty() {
+                                        "Загружена пустая очередь.".into()
+                                    } else {
+                                        format!("Загружается «{title}»…")
+                                    });
                                 } else {
                                     self.sync_status_message = Some(format!("Файл {} не найден в указанной папке", crate::sync::SyncManager::SYNC_FILE_NAME));
                                 }

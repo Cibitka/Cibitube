@@ -119,8 +119,18 @@ impl MetrolistApp {
     }
 
     pub(crate) fn trigger_lyrics_search(&mut self, bypass_cache: bool) {
-        self.is_local_lyrics = false;
         if let Some(track) = self.current_track().cloned() {
+            if let Some(path) = self.library.local_lyrics.get(&track.id) {
+                if let Some(lyrics) = crate::lyrics::LocalFileAdapter::load_file(path) {
+                    self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
+                    self.lyrics = Some(lyrics);
+                    self.is_local_lyrics = true;
+                } else {
+                    self.status_message = Some("Не удалось обновить прикреплённый текст.".into());
+                }
+                return;
+            }
+            self.is_local_lyrics = false;
             self.start_lyrics_search_for_track(&track, bypass_cache);
         }
     }

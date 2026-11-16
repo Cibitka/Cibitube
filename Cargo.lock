@@ -644,6 +644,7 @@ dependencies = [
  "egui_extras",
  "hex",
  "image",
+ "libc",
  "reqwest",
  "roxmltree",
  "serde",

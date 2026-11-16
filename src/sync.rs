@@ -46,6 +46,8 @@ pub struct CrossDeviceSyncState {
     pub queue_index: usize,
     #[serde(alias = "repeat_mode", default = "default_repeat_mode")]
     pub repeat_mode: String,
+    #[serde(default)]
+    pub repeat_mode_schema: u8,
     #[serde(alias = "shuffle_enabled", default)]
     pub shuffle_enabled: bool,
     #[serde(alias = "device_name", default = "default_device_name")]
@@ -99,6 +101,16 @@ impl QueueTrackEntry {
 }
 
 impl CrossDeviceSyncState {
+    pub(crate) fn repeat_index(&self) -> usize {
+        let legacy =
+            self.repeat_mode_schema == 0 && self.source_device.starts_with("Cibitube Desktop (");
+        match (self.repeat_mode.as_str(), legacy) {
+            ("all", false) | ("one", true) => 1,
+            ("one", false) | ("all", true) => 2,
+            _ => 0,
+        }
+    }
+
     pub fn to_track(&self) -> Track {
         let mins = (self.duration_secs / 60.0).floor() as u32;
         let secs = (self.duration_secs % 60.0).round() as u32;
@@ -140,6 +152,44 @@ impl CrossDeviceSyncState {
     }
 }
 
+pub(crate) struct SyncWriter {
+    sender: std::sync::mpsc::Sender<SyncWrite>,
+}
+
+struct SyncWrite {
+    folder: String,
+    state: CrossDeviceSyncState,
+    reply: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+impl SyncWriter {
+    pub(crate) fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<SyncWrite>();
+        std::thread::spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                let path = SyncManager::local_sync_path(&job.folder);
+                let result = crate::local_media::write_json(&path, &job.state);
+                let _ = job.reply.send(result);
+            }
+        });
+        Self { sender }
+    }
+
+    pub(crate) fn save(
+        &self,
+        folder: String,
+        state: CrossDeviceSyncState,
+    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+        let (reply, receiver) = std::sync::mpsc::channel();
+        let _ = self.sender.send(SyncWrite {
+            folder,
+            state,
+            reply,
+        });
+        receiver
+    }
+}
+
 pub struct SyncManager;
 
 #[allow(dead_code)]
@@ -160,9 +210,8 @@ impl SyncManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn save_state_with_queue(
-        custom_folder: &str,
-        track: &Track,
+    pub(crate) fn snapshot(
+        track: Option<&Track>,
         position_secs: f64,
         duration_secs: f64,
         is_playing: bool,
@@ -171,7 +220,7 @@ impl SyncManager {
         queue_index: usize,
         repeat_mode: &str,
         shuffle_enabled: bool,
-    ) -> Result<CrossDeviceSyncState, String> {
+    ) -> CrossDeviceSyncState {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -191,12 +240,12 @@ impl SyncManager {
             })
             .collect();
 
-        let state = CrossDeviceSyncState {
-            track_id: track.id.clone(),
-            title: track.title.clone(),
-            artist: track.artist.clone(),
+        CrossDeviceSyncState {
+            track_id: track.map(|t| t.id.clone()).unwrap_or_default(),
+            title: track.map(|t| t.title.clone()).unwrap_or_default(),
+            artist: track.map(|t| t.artist.clone()).unwrap_or_default(),
             album: None,
-            thumbnail: track.thumbnail_url.clone(),
+            thumbnail: track.and_then(|t| t.thumbnail_url.clone()),
             position_secs,
             duration_secs,
             is_playing,
@@ -205,16 +254,12 @@ impl SyncManager {
             queue,
             queue_index,
             repeat_mode: repeat_mode.to_string(),
+            repeat_mode_schema: 1,
             shuffle_enabled,
             source_device: format!("Cibitube Desktop ({})", std::env::consts::OS),
             updated_at: now_iso,
             updated_at_unix: now_unix,
-        };
-
-        let path = Self::local_sync_path(custom_folder);
-        let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-        fs::write(path, json).map_err(|e| e.to_string())?;
-        Ok(state)
+        }
     }
 
     pub fn load_state(custom_folder: &str) -> Option<CrossDeviceSyncState> {
@@ -343,6 +388,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_snapshot_prevents_old_queue_from_returning_and_repeat_schema_is_compatible() {
+        let folder = tempfile::tempdir().unwrap();
+        let writer = SyncWriter::new();
+        let folder = folder.path().to_str().unwrap().to_string();
+        let track = Track {
+            id: "x".into(),
+            title: "Fixture".into(),
+            artist: "Fixture".into(),
+            duration_text: "0:30".into(),
+            thumbnail_url: None,
+        };
+        let mut state = SyncManager::snapshot(
+            Some(&track),
+            7.0,
+            30.0,
+            true,
+            1.0,
+            std::slice::from_ref(&track),
+            0,
+            "one",
+            false,
+        );
+        assert_eq!(state.repeat_index(), 2);
+        state.repeat_mode_schema = 0;
+        assert_eq!(state.repeat_index(), 1);
+        state.source_device = "External fixture".into();
+        assert_eq!(state.repeat_index(), 2);
+        let _ = writer.save(folder.clone(), state);
+        let empty = SyncManager::snapshot(None, 0.0, 0.0, false, 1.0, &[], 0, "off", false);
+        writer
+            .save(folder.clone(), empty)
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let persisted = SyncManager::load_state(&folder).unwrap();
+        assert!(
+            persisted.track_id.is_empty() && persisted.queue.is_empty() && !persisted.is_playing
+        );
+    }
+
+    #[test]
     fn test_sync_state_camel_and_snake_case() {
         let camel = r#"{
             "trackId": "xyz123",
@@ -393,6 +479,7 @@ mod tests {
             queue: vec![],
             queue_index: 0,
             repeat_mode: "all".to_string(),
+            repeat_mode_schema: 1,
             shuffle_enabled: false,
             source_device: "test".to_string(),
             updated_at: "2026-11-09T12:00:00Z".to_string(),

@@ -19,7 +19,9 @@ struct PreparedStream {
     direct_url: Option<String>,
 }
 
+#[derive(Clone)]
 pub enum PlaybackEvent {
+    Loaded,
     Ended,
     Failed(String),
 }
@@ -193,7 +195,8 @@ impl AudioPlayer {
         thread::spawn(move || {
             let mut average = None::<f32>;
             let mut load = None;
-            let mut early_end = None;
+            let mut playing_entry = None;
+            let mut early_events: Vec<(i64, PlaybackEvent)> = Vec::new();
             let reader = BufReader::new(read_stream);
             for line in reader.lines() {
                 let Ok(line_str) = line else { break };
@@ -221,6 +224,7 @@ impl AudioPlayer {
                 }
                 if val.get("event").and_then(Value::as_str) == Some("start-file") {
                     average = None;
+                    playing_entry = val["playlist_entry_id"].as_i64();
                 }
 
                 if let Some(request) = val["request_id"]
@@ -242,30 +246,39 @@ impl AudioPlayer {
                     if let Some(entry) = entry {
                         let request = request & !1;
                         load = Some((entry, request));
-                        if early_end.as_ref().is_some_and(|(id, _)| *id == entry) {
-                            if let Some((_, event)) = early_end.take() {
-                                let _ = playback_tx.send((request, event));
+                        early_events.retain(|(id, event)| {
+                            if *id == entry {
+                                let _ = playback_tx.send((request, event.clone()));
                             }
-                        }
+                            *id > entry
+                        });
                     }
                 }
-                if val["event"].as_str() == Some("end-file") {
-                    let event = match val["reason"].as_str() {
-                        Some("eof") => Some(PlaybackEvent::Ended),
-                        Some("error") => Some(PlaybackEvent::Failed(
-                            val["file_error"]
-                                .as_str()
-                                .unwrap_or("ошибка mpv")
-                                .to_owned(),
-                        )),
-                        _ => None,
-                    };
-                    if let (Some(entry), Some(event)) = (val["playlist_entry_id"].as_i64(), event) {
-                        if let Some((_, request)) = load.filter(|(id, _)| *id == entry) {
-                            let _ = playback_tx.send((request, event));
-                        } else {
-                            early_end = Some((entry, event));
+                let (entry, event) = match val["event"].as_str() {
+                    Some("file-loaded") => (playing_entry, Some(PlaybackEvent::Loaded)),
+                    Some("end-file") => {
+                        let event = match val["reason"].as_str() {
+                            Some("eof") => Some(PlaybackEvent::Ended),
+                            Some("error") => Some(PlaybackEvent::Failed(
+                                val["file_error"]
+                                    .as_str()
+                                    .unwrap_or("ошибка mpv")
+                                    .to_owned(),
+                            )),
+                            _ => None,
+                        };
+                        (val["playlist_entry_id"].as_i64(), event)
+                    }
+                    _ => (None, None),
+                };
+                if let (Some(entry), Some(event)) = (entry, event) {
+                    if let Some((_, request)) = load.filter(|(id, _)| *id == entry) {
+                        let _ = playback_tx.send((request, event));
+                    } else {
+                        if early_events.len() == 8 {
+                            early_events.remove(0);
                         }
+                        early_events.push((entry, event));
                     }
                 }
 
@@ -404,7 +417,12 @@ impl AudioPlayer {
         let _ = self.cmd_tx.send(cmd.to_string());
     }
 
+    #[cfg(test)]
     pub fn play_url(&self, url: &str, start_gain: f64) {
+        self.load_url(url, start_gain, false);
+    }
+
+    pub fn load_url(&self, url: &str, start_gain: f64, paused: bool) {
         let request = self.load_request.fetch_add(2, Ordering::SeqCst) + 2;
         self.set_fade_gain(start_gain);
         let prepared = self.prepared_stream.lock().ok().and_then(|mut slot| {
@@ -425,15 +443,13 @@ impl AudioPlayer {
             "command": ["get_property", "playlist/0/id"],
             "request_id": request + 1
         });
-        let _ = self.cmd_tx.send(format!("{cmd}\n{get_entry}"));
-        let _ = self
-            .cmd_tx
-            .send(r#"{"command":["set_property","pause",false]}"#.to_string());
+        let pause = serde_json::json!({"command": ["set_property", "pause", paused]});
         if let Ok(mut l) = self.info.lock() {
-            l.is_playing = true;
+            l.is_playing = !paused;
             l.position_secs = 0.0;
             l.duration_secs = 0.0;
         }
+        let _ = self.cmd_tx.send(format!("{pause}\n{cmd}\n{get_entry}"));
     }
 
     pub fn stop(&self) {
@@ -454,8 +470,10 @@ impl AudioPlayer {
                 if request != current {
                     return None;
                 }
-                if let Ok(mut info) = self.info.lock() {
-                    info.is_playing = false;
+                if !matches!(event, PlaybackEvent::Loaded) {
+                    if let Ok(mut info) = self.info.lock() {
+                        info.is_playing = false;
+                    }
                 }
                 Some(event)
             })
@@ -477,13 +495,16 @@ impl AudioPlayer {
 
     pub fn toggle_pause(&self) {
         let is_playing = self.info.lock().map(|l| l.is_playing).unwrap_or(false);
+        self.set_paused(is_playing);
+    }
+
+    pub fn set_paused(&self, paused: bool) {
         let cmd = serde_json::json!({
-            "command": ["set_property", "pause", is_playing]
-        })
-        .to_string();
-        let _ = self.cmd_tx.send(cmd);
-        if let Ok(mut l) = self.info.lock() {
-            l.is_playing = !is_playing;
+            "command": ["set_property", "pause", paused]
+        });
+        let _ = self.cmd_tx.send(cmd.to_string());
+        if let Ok(mut info) = self.info.lock() {
+            info.is_playing = !paused;
         }
     }
 
@@ -554,7 +575,9 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(6);
             loop {
                 if let Some(event) = player.playback_event() {
-                    return event;
+                    if !matches!(event, PlaybackEvent::Loaded) {
+                        return event;
+                    }
                 }
                 assert!(Instant::now() < deadline, "no mpv playback event");
                 thread::sleep(Duration::from_millis(20));
