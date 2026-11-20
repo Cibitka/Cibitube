@@ -132,10 +132,27 @@ The desktop client is distributed under the [MIT License](LICENSE).
 
 ### Lyrics in the terminal (Linux)
 
-With the player running, open another terminal and run:
+![Large terminal lyrics using a sample track](docs/media/terminal-lyrics.png)
+
+Start Cibitube and play a track, then open another terminal:
 
 ```sh
 cibitube --lyrics
 ```
 
-`--text` is an alias. The active lyric line is highlighted and follows pause, seeking, track changes and your lyric offsets. Lyrics without timestamps are marked as unsynchronized. Press `Ctrl+C` to close the view while music keeps playing. Redirecting output prints the current lyrics once. This feature requires a build containing the terminal lyrics changes; it is not included in v0.2.10.
+This shows the current lyrics line by line, highlighting the active line in green.
+For large, centered block lettering with animated transitions:
+
+```sh
+cibitube --lyrics --animation
+```
+
+- `cibitube --text` is an alias for `--lyrics`; it also accepts `--animation`.
+- Both views follow the running player: track changes, pause, seeking, and global / per-track lyric offsets. They do not start a second audio player.
+- The animated view shows the current timed **line**. Long lines wrap and resize with the terminal. Cyrillic and Latin text are supported.
+- Lyrics without timestamps are marked **Unsynced** and use the regular text view; animation cannot create missing timing data.
+- **Ctrl+C** closes the terminal view and restores the cursor. Music keeps playing.
+- To save the current lyrics as plain text once: `cibitube --lyrics > lyrics.txt`. Redirected output has no animation or terminal control codes.
+- `cibitube --help` lists the commands; `cibitube --version` prints the build version.
+
+These commands currently work on **Linux** and connect to Cibitube in the same desktop session. Restart the player after installing a build with this feature. The commands are not included in the v0.2.10 release or the AUR recipe targeting that release.

@@ -16,7 +16,7 @@ impl Drop for TerminalScreen {
     }
 }
 
-fn clean_line(text: &str, width: usize) -> String {
+pub(super) fn clean_line(text: &str, width: usize) -> String {
     let mut used = 0;
     text.chars()
         .filter(|character| !character.is_control())
@@ -163,7 +163,7 @@ async fn read_snapshot(
     })
 }
 
-pub(crate) async fn run() -> Result<(), String> {
+pub(crate) async fn run(animated: bool) -> Result<(), String> {
     let locale = std::env::var("LC_ALL")
         .or_else(|_| std::env::var("LANG"))
         .unwrap_or_default();
@@ -184,6 +184,7 @@ pub(crate) async fn run() -> Result<(), String> {
     let mut revision = u64::MAX;
     let mut lines = Vec::new();
     let mut previous = String::new();
+    let mut animation = animated.then(crate::terminal_animation::Animation::new);
     loop {
         let read = async {
             if connection.is_none() {
@@ -247,18 +248,39 @@ pub(crate) async fn run() -> Result<(), String> {
             }
             return Ok(());
         }
-        let (width, height) = terminal_size();
-        let output = render(snapshot.as_ref(), &lines, width, height);
-        if output != previous {
-            io::stdout()
-                .write_all(output.as_bytes())
-                .map_err(|error| error.to_string())?;
-            io::stdout().flush().map_err(|error| error.to_string())?;
-            previous = output;
-        }
-        tokio::select! {
-            _ = &mut stop => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        let next_poll = tokio::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            let (width, height) = terminal_size();
+            let output = animation
+                .as_mut()
+                .and_then(|animation| {
+                    snapshot
+                        .as_ref()
+                        .and_then(|snapshot| animation.render(snapshot, &lines, width, height))
+                })
+                .unwrap_or_else(|| render(snapshot.as_ref(), &lines, width, height));
+            if output != previous {
+                io::stdout()
+                    .write_all(output.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                io::stdout().flush().map_err(|error| error.to_string())?;
+                previous = output;
+            }
+            let frame = if animation
+                .as_ref()
+                .is_some_and(|animation| animation.is_transitioning())
+            {
+                Duration::from_millis(33)
+            } else {
+                Duration::from_millis(250)
+            };
+            tokio::select! {
+                _ = &mut stop => return Ok(()),
+                _ = tokio::time::sleep_until(next_poll.min(tokio::time::Instant::now() + frame)) => {}
+            }
+            if tokio::time::Instant::now() >= next_poll {
+                break;
+            }
         }
     }
 }

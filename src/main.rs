@@ -18,6 +18,8 @@ mod player;
 mod settings;
 mod sync;
 #[cfg(target_os = "linux")]
+mod terminal_animation;
+#[cfg(target_os = "linux")]
 mod terminal_lyrics;
 mod ui_lyrics;
 mod ui_settings;
@@ -109,7 +111,9 @@ fn main() -> eframe::Result<()> {
         match argument.as_str() {
             "--lyrics" | "--text" => {
                 #[cfg(target_os = "linux")]
-                if let Err(error) = rt.block_on(terminal_lyrics::run()) {
+                if let Err(error) = rt.block_on(terminal_lyrics::run(
+                    std::env::args().skip(2).any(|arg| arg == "--animation"),
+                )) {
                     eprintln!("{error}");
                     std::process::exit(1);
                 }
@@ -118,7 +122,7 @@ fn main() -> eframe::Result<()> {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("Cibitube\n\n  cibitube             Open the player\n  cibitube --lyrics    Show live lyrics from the running player\n  cibitube --text      Alias for --lyrics\n  cibitube --version   Print the version");
+                println!("Cibitube\n\n  cibitube             Open the player\n  cibitube --lyrics    Show live lyrics from the running player\n  cibitube --lyrics --animation\n                      Large animated lyrics in the terminal\n  cibitube --text      Alias for --lyrics\n  cibitube --version   Print the version");
                 return Ok(());
             }
             "--version" | "-V" => {

@@ -638,6 +638,7 @@ dependencies = [
 name = "cibitube"
 version = "0.2.10"
 dependencies = [
+ "ab_glyph",
  "chrono",
  "dirs",
  "eframe",

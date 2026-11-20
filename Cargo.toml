@@ -31,6 +31,7 @@ roxmltree = "0.19" # безопасный парсинг TTML XML
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "4.4"
 unicode-width = "0.1"
+ab_glyph = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
