@@ -1224,10 +1224,7 @@ impl LrclibAdapter {
         let cand_words: std::collections::HashSet<&str> = norm_cand.split_whitespace().collect();
         let common = target_words.intersection(&cand_words).count();
         let total = target_words.len().min(cand_words.len());
-        if total > 0 && (common as f64 / total as f64) >= 0.6 {
-            return true;
-        }
-        false
+        total > 0 && (common as f64 / total as f64) >= 0.6
     }
 
     pub fn is_match_eligible(
