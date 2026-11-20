@@ -21,7 +21,7 @@ impl LrcParser {
         let mut offset_ms: i64 = 0;
         let mut has_word_tags = false;
 
-        for raw_line in content.lines() {
+        for raw_line in content.trim_start_matches('\u{feff}').lines() {
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
@@ -159,19 +159,24 @@ impl LrcParser {
     }
 
     pub fn parse_timestamp(s: &str) -> Option<u64> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() == 2 {
-            let mins: f64 = parts[0].parse().ok()?;
-            let secs: f64 = parts[1].parse().ok()?;
-            Some(((mins * 60.0 + secs) * 1000.0).round() as u64)
-        } else if parts.len() == 3 {
-            let hrs: f64 = parts[0].parse().ok()?;
-            let mins: f64 = parts[1].parse().ok()?;
-            let secs: f64 = parts[2].parse().ok()?;
-            Some((((hrs * 60.0 + mins) * 60.0 + secs) * 1000.0).round() as u64)
-        } else {
-            None
+        let (minutes, seconds) = s.rsplit_once(':')?;
+        let seconds = seconds.trim().replace(',', ".").parse::<f64>().ok()?;
+        if !seconds.is_finite() || !(0.0..60.0).contains(&seconds) {
+            return None;
         }
+        let minutes = if let Some((hours, minutes)) = minutes.split_once(':') {
+            hours
+                .trim()
+                .parse::<u64>()
+                .ok()?
+                .checked_mul(60)?
+                .checked_add(minutes.trim().parse::<u64>().ok()?)?
+        } else {
+            minutes.trim().parse::<u64>().ok()?
+        };
+        minutes
+            .checked_mul(60_000)?
+            .checked_add((seconds * 1000.0).round() as u64)
     }
 
     fn parse_enhanced_words(text: &str, line_start_ms: u64) -> (String, Option<Vec<LyricsWord>>) {
@@ -1483,18 +1488,26 @@ impl LocalFileAdapter {
         if ext == "ttml" || content.trim_start().starts_with('<') {
             if let Some(lyrics) = TtmlParser::parse(&content, Some("local")) {
                 let mut l = lyrics;
-                l.source_name = "Локальный файл (TTML)".to_string();
+                l.source_name = crate::i18n::text("Локальный файл (TTML)").to_string();
                 return Some(l);
             }
         }
 
-        if let Some(lyrics) = LrcParser::parse(&content, "Локальный файл (LRC)") {
+        if ext == "qrc" {
+            return QrcParser::parse(&content, Some("local")).map(|mut lyrics| {
+                lyrics.source_name = crate::i18n::text("Локальный файл (QRC)").to_string();
+                lyrics
+            });
+        }
+
+        if let Some(lyrics) = LrcParser::parse(&content, crate::i18n::text("Локальный файл (LRC)"))
+        {
             return Some(lyrics);
         }
 
         // Fallback: read plain text file
         Some(Lyrics {
-            source_name: "Локальный файл (Текст)".to_string(),
+            source_name: crate::i18n::text("Локальный файл (Текст)").to_string(),
             provider: Some("local".to_string()),
             title: None,
             artist: None,
@@ -1758,10 +1771,6 @@ impl LyricsClient {
         None
     }
 
-    pub async fn fetch(&self, title: &str, artist: &str) -> Option<Lyrics> {
-        self.fetch_with_meta(title, artist, None, None).await
-    }
-
     pub async fn fetch_with_meta(
         &self,
         title: &str,
@@ -1790,6 +1799,25 @@ pub fn is_lyrics_response_valid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_lrc_preserves_first_timestamp_with_bom_and_accepts_decimal_comma() {
+        let lyrics = LrcParser::parse(
+            "\u{feff}[00:01,25]Первая строка\n[00:03,5]Вторая строка",
+            "LRC",
+        )
+        .unwrap();
+        assert_eq!(
+            lyrics
+                .lines
+                .iter()
+                .map(|line| line.start_ms)
+                .collect::<Vec<_>>(),
+            [1250, 3500]
+        );
+        assert!(lyrics.is_synced);
+        assert!(!lyrics.is_word_synced());
+    }
 
     #[test]
     fn test_parse_standard_lrc() {

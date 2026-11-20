@@ -1,0 +1,41 @@
+pkgbase = cibitube-bin
+	pkgdesc = Native YouTube Music player with lyrics, playlists and downloads
+	pkgver = 0.2.10
+	pkgrel = 1
+	url = https://github.com/Cibitka/Cibitube
+	arch = x86_64
+	license = MIT
+	depends = gcc-libs
+	depends = glibc
+	depends = libssl.so=3-64
+	depends = libcrypto.so=3-64
+	depends = libglvnd
+	depends = libx11
+	depends = libxcursor
+	depends = libxi
+	depends = libxrandr
+	depends = libxkbcommon
+	depends = wayland
+	depends = mpv
+	depends = yt-dlp
+	depends = ffmpeg
+	depends = nodejs
+	optdepends = sqlite: import a YouTube Music session from Firefox
+	optdepends = zenity: graphical file picker
+	optdepends = xdg-utils: open browser links and folders
+	optdepends = ttf-dejavu: additional interface glyphs
+	optdepends = noto-fonts-cjk: display CJK song titles and lyrics
+	provides = cibitube
+	conflicts = cibitube
+	options = !strip
+	options = !debug
+	source = cibitube-bin-0.2.10.tar.gz::https://github.com/Cibitka/Cibitube/releases/download/v0.2.10/cibitube-linux-x86_64.tar.gz
+	source = LICENSE-0.2.10::https://raw.githubusercontent.com/Cibitka/Cibitube/v0.2.10/LICENSE
+	source = cibitube-0.2.10.png::https://raw.githubusercontent.com/Cibitka/Cibitube/v0.2.10/assets/icon.png
+	source = cibitube.desktop
+	sha256sums = 9ee2f9d6ec4845012b644b145ff0e2a950d0fc948f07b209bc379a242ef37779
+	sha256sums = 7671d745b52e6aca21ea799d389910d22a448c7730e72ea924ae318f2d8a5722
+	sha256sums = c61185543321cd0fc671fa5bdb4d80709292e0a7114c6ea8993370318a6f2875
+	sha256sums = 11a62aff39733bd2b4a5e14e2371cdc52034dc6bcb0485e7c31fee57daf1a2eb
+
+pkgname = cibitube-bin

@@ -638,20 +638,25 @@ dependencies = [
 name = "cibitube"
 version = "0.2.10"
 dependencies = [
+ "ab_glyph",
  "chrono",
  "dirs",
  "eframe",
  "egui_extras",
  "hex",
  "image",
+ "libc",
  "reqwest",
  "roxmltree",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
  "tokio",
+ "unicode-width",
  "urlencoding",
+ "zbus",
 ]
 
 [[package]]
@@ -3749,6 +3754,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

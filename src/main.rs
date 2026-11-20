@@ -7,12 +7,20 @@ mod downloader;
 mod i18n;
 mod innertube;
 mod library;
+mod local_media;
 mod lyrics;
 mod lyrics_loader;
+#[cfg(target_os = "linux")]
+mod media_controls;
 mod models;
+mod pet;
 mod player;
 mod settings;
 mod sync;
+#[cfg(target_os = "linux")]
+mod terminal_animation;
+#[cfg(target_os = "linux")]
+mod terminal_lyrics;
 mod ui_lyrics;
 mod ui_settings;
 mod ui_wave;
@@ -89,8 +97,41 @@ fn setup_custom_fonts(ctx: &eframe::egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let workers = std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .min(4);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
     let _guard = rt.enter();
+
+    if let Some(argument) = std::env::args().nth(1) {
+        match argument.as_str() {
+            "--lyrics" | "--text" => {
+                #[cfg(target_os = "linux")]
+                if let Err(error) = rt.block_on(terminal_lyrics::run(
+                    std::env::args().skip(2).any(|arg| arg == "--animation"),
+                )) {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                #[cfg(not(target_os = "linux"))]
+                eprintln!("Terminal lyrics are currently available on Linux.");
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!("Cibitube\n\n  cibitube             Open the player\n  cibitube --lyrics    Show live lyrics from the running player\n  cibitube --lyrics --animation\n                      Large animated lyrics in the terminal\n  cibitube --text      Alias for --lyrics\n  cibitube --version   Print the version");
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("Cibitube {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("Cibitube — YouTube Music Client")
@@ -102,9 +143,13 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    // Blocking on the compositor's swap can stall the event loop on a hidden Wayland window.
+    let wayland = cfg!(target_os = "linux")
+        && (std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            || std::env::var_os("WAYLAND_DISPLAY").is_some());
     let native_options = eframe::NativeOptions {
         viewport,
-        vsync: false,
+        vsync: !wayland,
         ..Default::default()
     };
 

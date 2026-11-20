@@ -21,10 +21,10 @@ pub enum LyricsSyncType {
 impl std::fmt::Display for LyricsSyncType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LyricsSyncType::None => write!(f, "Обычный текст"),
-            LyricsSyncType::Line => write!(f, "Построчно"),
-            LyricsSyncType::Word => write!(f, "Пословно"),
-            LyricsSyncType::Syllable => write!(f, "По слогам"),
+            LyricsSyncType::None => write!(f, "{}", crate::i18n::text("Обычный текст")),
+            LyricsSyncType::Line => write!(f, "{}", crate::i18n::text("Построчно")),
+            LyricsSyncType::Word => write!(f, "{}", crate::i18n::text("Пословно")),
+            LyricsSyncType::Syllable => write!(f, "{}", crate::i18n::text("По слогам")),
         }
     }
 }

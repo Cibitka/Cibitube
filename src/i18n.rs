@@ -57,7 +57,7 @@ pub struct I18nStrings {
 
 pub const STRINGS_RU: I18nStrings = I18nStrings {
     nav_home: "Главная",
-    nav_search: "Поиск",
+    nav_search: "Главная",
     nav_library: "Медиатека",
     nav_downloads: "Загрузки",
     nav_settings: "Настройки",
@@ -87,7 +87,7 @@ pub const STRINGS_RU: I18nStrings = I18nStrings {
 
 pub const STRINGS_EN: I18nStrings = I18nStrings {
     nav_home: "Home",
-    nav_search: "Search",
+    nav_search: "Home",
     nav_library: "Library",
     nav_downloads: "Downloads",
     nav_settings: "Settings",
@@ -112,12 +112,205 @@ pub const STRINGS_EN: I18nStrings = I18nStrings {
     donate_subtitle: "Support open-source development of Cibitube via Boosty or USDT (TON)",
     donate_boosty_btn: "Donate on Boosty (Cards Worldwide & RU)",
     donate_copy_ton_btn: "Copy USDT (TON) Wallet Address",
-    settings_language_label: "Interface Language / Язык интерфейса",
+    settings_language_label: "Interface language",
 };
 
 pub fn tr(lang_code: &str) -> &'static I18nStrings {
     match UiLanguage::from_code(lang_code) {
         UiLanguage::En => &STRINGS_EN,
         UiLanguage::Ru => &STRINGS_RU,
+    }
+}
+
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    OnceLock,
+};
+
+// Cibitube has one UI locale. Workers use it for messages and native dialogs too.
+static ENGLISH: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_language(code: &str) {
+    ENGLISH.store(
+        UiLanguage::from_code(code) == UiLanguage::En,
+        Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn is_english() -> bool {
+    ENGLISH.load(Ordering::Relaxed)
+}
+
+fn english_strings() -> &'static HashMap<String, String> {
+    static STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    STRINGS.get_or_init(|| {
+        serde_json::from_str(include_str!("translations/en.json"))
+            .expect("English translations must be valid JSON")
+    })
+}
+
+pub(crate) fn text(source: &str) -> &str {
+    if is_english() {
+        english_strings().get(source).map_or(source, String::as_str)
+    } else {
+        source
+    }
+}
+
+#[macro_export]
+macro_rules! localized_format {
+    ($ru:literal, $en:literal $(, $($args:tt)*)?) => {
+        if $crate::i18n::is_english() {
+            format!($en $(, $($args)*)?)
+        } else {
+            format!($ru $(, $($args)*)?)
+        }
+    };
+}
+
+#[derive(Debug)]
+enum MessagePart {
+    Text(String),
+    Value(String),
+}
+
+fn message_parts(template: &str) -> Vec<MessagePart> {
+    let mut parts = Vec::new();
+    let mut remaining = template;
+    let mut index = 0;
+    while let Some(start) = remaining.find('{') {
+        let Some(end) = remaining[start..].find('}') else {
+            break;
+        };
+        let end = start + end;
+        parts.push(MessagePart::Text(remaining[..start].to_owned()));
+        let key = remaining[start + 1..end].split(':').next().unwrap_or("");
+        parts.push(MessagePart::Value(if key.is_empty() {
+            let key = index.to_string();
+            index += 1;
+            key
+        } else {
+            key.to_owned()
+        }));
+        remaining = &remaining[end + 1..];
+    }
+    parts.push(MessagePart::Text(remaining.to_owned()));
+    parts
+}
+
+fn translate_message_parts(
+    from: &[MessagePart],
+    to: &[MessagePart],
+    source: &str,
+) -> Option<String> {
+    let mut remaining = source;
+    let mut values = HashMap::new();
+    for (index, part) in from.iter().enumerate() {
+        match part {
+            MessagePart::Text(text) => remaining = remaining.strip_prefix(text)?,
+            MessagePart::Value(key) => {
+                let end = match from.get(index + 1) {
+                    Some(MessagePart::Text(text)) if !text.is_empty() => remaining.find(text)?,
+                    _ => remaining.len(),
+                };
+                values.insert(key.as_str(), &remaining[..end]);
+                remaining = &remaining[end..];
+            }
+        }
+    }
+    if !remaining.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    for part in to {
+        match part {
+            MessagePart::Text(text) => output.push_str(text),
+            MessagePart::Value(key) => output.push_str(values.get(key.as_str())?),
+        }
+    }
+    Some(output)
+}
+
+fn message_in(source: &str, english: bool) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let dictionary = english_strings();
+    if english {
+        if let Some(value) = dictionary.get(source) {
+            return Cow::Borrowed(value);
+        }
+    } else if let Some((russian, _)) = dictionary
+        .iter()
+        .find(|(_, value)| value.as_str() == source)
+    {
+        return Cow::Borrowed(russian);
+    }
+    type MessageTemplates = Vec<(Vec<MessagePart>, Vec<MessagePart>)>;
+    static TEMPLATES: OnceLock<MessageTemplates> = OnceLock::new();
+    let templates = TEMPLATES.get_or_init(|| {
+        let mut entries: Vec<_> = dictionary
+            .iter()
+            .filter(|(key, _)| key.contains('{'))
+            .collect();
+        entries.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+        entries
+            .into_iter()
+            .map(|(ru, en)| (message_parts(ru), message_parts(en)))
+            .collect()
+    });
+    for (ru, en) in templates {
+        let (from, to) = if english { (ru, en) } else { (en, ru) };
+        if let Some(translated) = translate_message_parts(from, to, source) {
+            return Cow::Owned(translated);
+        }
+    }
+    Cow::Borrowed(source)
+}
+
+// Only application messages go through this function. Track titles and lyrics stay untouched.
+pub(crate) fn message(source: &str) -> std::borrow::Cow<'_, str> {
+    message_in(source, is_english())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn english_catalog_has_no_russian_text_and_preserves_format_arguments() {
+        for (russian, english) in english_strings() {
+            assert!(
+                !english
+                    .chars()
+                    .any(|ch| ('А'..='я').contains(&ch) || ch == 'ё' || ch == 'Ё'),
+                "{russian}"
+            );
+            let keys = |template: &str| {
+                let mut keys: Vec<_> = message_parts(template)
+                    .into_iter()
+                    .filter_map(|part| {
+                        if let MessagePart::Value(key) = part {
+                            Some(key)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                keys.sort();
+                keys
+            };
+            assert_eq!(keys(russian), keys(english), "{russian}");
+        }
+    }
+
+    #[test]
+    fn existing_messages_change_language_without_translating_song_names() {
+        assert_eq!(message_in("Добавлен трек «Пауза»", true), "Added “Пауза”");
+        assert_eq!(message_in("Added “Пауза”", false), "Добавлен трек «Пауза»");
+        assert_eq!(message_in("Локальный файл (LRC)", true), "Local file (LRC)");
+        assert_eq!(
+            message_in("Artist — Название песни", true),
+            "Artist — Название песни"
+        );
     }
 }

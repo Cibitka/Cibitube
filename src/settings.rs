@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    pub(crate) pet: crate::pet::PetSettings,
     pub account_name: Option<String>,
     pub google_cookie: String,
     pub auth_user_index: usize,
@@ -149,6 +150,7 @@ impl Default for AppSettings {
         };
 
         Self {
+            pet: Default::default(),
             account_name: None,
             google_cookie: String::new(),
             auth_user_index: 0,
