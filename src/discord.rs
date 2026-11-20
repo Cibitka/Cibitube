@@ -179,7 +179,10 @@ fn connect_discord() -> Option<RpcStream> {
     None
 }
 
-fn send_activity(stream: &mut RpcStream, act: &ActivityDetails) -> std::io::Result<Option<i64>> {
+fn send_activity(
+    stream: &mut (impl Read + Write),
+    act: &ActivityDetails,
+) -> std::io::Result<Option<i64>> {
     let mut timestamps = json!({ "start": act.start_timestamp });
     if let Some(end) = act.end_timestamp {
         timestamps["end"] = json!(end);
@@ -193,6 +196,7 @@ fn send_activity(stream: &mut RpcStream, act: &ActivityDetails) -> std::io::Resu
     let mut activity_obj = json!({
         "name": "Cibitube",
         "details": act.title,
+        "status_display_type": 2,
         "state": format!("by {}", act.artist),
         "timestamps": timestamps,
         "assets": {
@@ -208,7 +212,7 @@ fn send_activity(stream: &mut RpcStream, act: &ActivityDetails) -> std::io::Resu
         let mut buttons = Vec::new();
         if !act.song_id.is_empty() && !act.song_id.starts_with("local:") {
             buttons.push(json!({
-                "label": "Слушать в YouTube Music",
+                "label": crate::i18n::text("Слушать в YouTube Music"),
                 "url": format!("https://music.youtube.com/watch?v={}", act.song_id)
             }));
         }
@@ -344,6 +348,57 @@ fn read_frame(stream: &mut (impl Read + Write)) -> std::io::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_status_uses_the_track_title_for_each_activity_mode() {
+        struct MockStream {
+            reply: std::io::Cursor<Vec<u8>>,
+            request: Vec<u8>,
+        }
+        impl Read for MockStream {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reply.read(bytes)
+            }
+        }
+        impl Write for MockStream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.request.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (title, activity_type, expected_type) in [("Первый трек", 0, 2), ("Другой трек", 1, 0)]
+        {
+            let mut reply = Vec::new();
+            send_packet(
+                &mut reply,
+                1,
+                r#"{"nonce":"cibitube-activity","cmd":"SET_ACTIVITY"}"#,
+            )
+            .unwrap();
+            let mut stream = MockStream {
+                reply: std::io::Cursor::new(reply),
+                request: Vec::new(),
+            };
+            let activity = ActivityDetails {
+                title: title.into(),
+                artist: "Исполнитель".into(),
+                song_id: title.into(),
+                start_timestamp: 100,
+                end_timestamp: Some(200),
+                thumbnail: None,
+                show_buttons: false,
+                activity_type,
+            };
+            assert_eq!(send_activity(&mut stream, &activity).unwrap(), None);
+            let packet = read_frame(&mut std::io::Cursor::new(stream.request)).unwrap();
+            assert_eq!(packet["args"]["activity"]["details"], title);
+            assert_eq!(packet["args"]["activity"]["status_display_type"], 2);
+            assert_eq!(packet["args"]["activity"]["name"], "Cibitube");
+            assert_eq!(packet["args"]["activity"]["type"], expected_type);
+        }
+    }
 
     #[test]
     fn sends_activity_when_a_restored_track_resumes_and_clears_on_pause() {

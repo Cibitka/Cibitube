@@ -126,7 +126,8 @@ impl MetrolistApp {
                     self.lyrics = Some(lyrics);
                     self.is_local_lyrics = true;
                 } else {
-                    self.status_message = Some("Не удалось обновить прикреплённый текст.".into());
+                    self.status_message =
+                        Some(crate::i18n::text("Не удалось обновить прикреплённый текст.").into());
                 }
                 return;
             }
@@ -145,8 +146,8 @@ impl MetrolistApp {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = crate::local_media::pick_file(
-                "Выберите файл текста песни",
-                "Тексты песен | *.lrc *.ttml *.qrc *.txt",
+                crate::i18n::text("Выберите файл текста песни"),
+                crate::i18n::text("Тексты песен | *.lrc *.ttml *.qrc *.txt"),
             );
             let _ = tx.send(AppEvent::LocalLyricsFileSelected(track_id, result));
         });

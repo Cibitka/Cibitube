@@ -66,6 +66,7 @@ pub(crate) struct Pet {
     menu_rect: Option<Rect>,
     animation: Option<(Pose, f64)>,
     was_enabled: bool,
+    needs_gravity: bool,
     pose: Option<(Pose, f64)>,
     offline: bool,
     next_probe: f64,
@@ -211,15 +212,15 @@ fn sprite_grid(width: u32, height: u32) -> Option<(u32, u32)> {
 fn decode_sprite(path: &Path) -> Result<(Vec<u8>, egui::ColorImage), String> {
     const MAX_FILE: u64 = 8 * 1024 * 1024;
     if std::fs::metadata(path).map_or(true, |meta| !meta.is_file() || meta.len() > MAX_FILE) {
-        return Err("Выберите PNG размером до 8 МБ.".into());
+        return Err(crate::i18n::text("Выберите PNG размером до 8 МБ.").into());
     }
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(&bytes))
-        .map_err(|_| "Файл должен быть PNG.")?;
+        .map_err(|_| crate::i18n::text("Файл должен быть PNG."))?;
     let (width, height) = image::ImageDecoder::dimensions(&decoder);
     if sprite_grid(width, height).is_none() {
         return Err(
-            "Нужен PNG с квадратными кадрами: 36 столбцов с 8–10 строками (16–128 пикселей) или 16 столбцов с 8–10 строками (16–256 пикселей)."
+            crate::i18n::text("Нужен PNG с квадратными кадрами: 36 столбцов с 8–10 строками (16–128 пикселей) или 16 столбцов с 8–10 строками (16–256 пикселей).")
                 .into(),
         );
     }
@@ -524,7 +525,11 @@ impl Pet {
                             return Some(Pose::Fall);
                         }
                     }
-                    recovery.phase = RecoveryPhase::Returning { landed_at: now };
+                    if recovery.previous.0 == Id::new("pet-startup") {
+                        self.recovery = None;
+                    } else {
+                        recovery.phase = RecoveryPhase::Returning { landed_at: now };
+                    }
                     return Some(Pose::Stand);
                 }
                 RecoveryPhase::Returning { landed_at } if now - *landed_at < 0.22 => {
@@ -662,6 +667,9 @@ impl Pet {
                 now,
             ));
             self.was_enabled = settings.enabled;
+            if settings.enabled {
+                self.needs_gravity = true;
+            }
             if !settings.enabled {
                 self.menu = false;
                 self.game = false;
@@ -717,6 +725,23 @@ impl Pet {
                 .filter(|surface| surface.rect.contains(pointer) && surface.supports(bounds, side))
                 .min_by(|a, b| a.rect.area().total_cmp(&b.rect.area()))
         });
+        if self.needs_gravity && self.drag.is_none() {
+            self.needs_gravity = false;
+            self.jump = None;
+            self.recovery = None;
+            let feet_x = pos.x + side / 2.0;
+            self.perch = surfaces
+                .iter()
+                .filter(|surface| surface.supports(bounds, side))
+                .find(|surface| {
+                    surface.rect.x_range().contains(feet_x)
+                        && (surface.landing(0.5, side).y - pos.y).abs() <= 2.0
+                })
+                .map(|surface| (surface.id, surface.anchor(feet_x)));
+            if self.perch.is_none() && pos.y < bounds.bottom() {
+                self.recovery = Some(Recovery::new(pos, (Id::new("pet-startup"), 0.5)));
+            }
+        }
         let previous_pos = pos;
         let motion = if settings.enabled && self.drag.is_none() {
             self.move_on_platforms(ctx, &surfaces, &mut pos, bounds, side)
@@ -849,17 +874,28 @@ impl Pet {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
                             ui.set_width(172.0);
                             changed |= ui
-                                .checkbox(&mut settings.follow, "Следить за курсором")
+                                .checkbox(
+                                    &mut settings.follow,
+                                    crate::i18n::text("Следить за курсором"),
+                                )
                                 .changed();
                             changed |= ui
-                                .checkbox(&mut settings.follow_lyrics, "Следить за строкой песни")
+                                .checkbox(
+                                    &mut settings.follow_lyrics,
+                                    crate::i18n::text("Следить за строкой песни"),
+                                )
                                 .changed();
                             changed |= ui
-                                .checkbox(&mut settings.sing, "Рот под текст песни")
+                                .checkbox(
+                                    &mut settings.sing,
+                                    crate::i18n::text("Рот под текст песни"),
+                                )
                                 .changed();
-                            changed |= ui.checkbox(&mut settings.sitting, "Посадить").changed();
-                            ui.checkbox(&mut self.game, "Режим игры");
-                            if ui.button("Спрятать").clicked() {
+                            changed |= ui
+                                .checkbox(&mut settings.sitting, crate::i18n::text("Посадить"))
+                                .changed();
+                            ui.checkbox(&mut self.game, crate::i18n::text("Режим игры"));
+                            if ui.button(crate::i18n::text("Спрятать")).clicked() {
                                 settings.enabled = false;
                                 changed = true;
                             }
@@ -938,7 +974,7 @@ impl MetrolistApp {
                 self.settings.save();
                 Ok(())
             }) {
-                Ok(()) => "Питомец загружен.".into(),
+                Ok(()) => crate::i18n::text("Питомец загружен.").into(),
                 Err(error) => error,
             },
         );
@@ -960,54 +996,74 @@ impl MetrolistApp {
 
     pub(crate) fn render_pet_settings(&mut self, ui: &mut egui::Ui) {
         let mut changed = ui
-            .checkbox(&mut self.settings.pet.enabled, "Показывать питомца")
+            .checkbox(
+                &mut self.settings.pet.enabled,
+                crate::i18n::text("Показывать питомца"),
+            )
             .changed();
         changed |= ui
-            .checkbox(&mut self.settings.pet.follow, "Следить головой за курсором")
+            .checkbox(
+                &mut self.settings.pet.follow,
+                crate::i18n::text("Следить головой за курсором"),
+            )
             .changed();
         changed |= ui
             .checkbox(
                 &mut self.settings.pet.follow_lyrics,
-                "Следить за подсвеченной строкой песни",
+                crate::i18n::text("Следить за подсвеченной строкой песни"),
             )
             .changed();
         changed |= ui
             .checkbox(
                 &mut self.settings.pet.sing,
-                "Открывать рот по таймингам текста песни",
+                crate::i18n::text("Открывать рот по таймингам текста песни"),
             )
             .changed();
         changed |= ui
             .add(
-                egui::Slider::new(&mut self.settings.pet.size, 36.0..=128.0).text("Размер питомца"),
+                egui::Slider::new(&mut self.settings.pet.size, 36.0..=128.0)
+                    .text(crate::i18n::text("Размер питомца")),
             )
             .changed();
-        ui.label("Перетащите питомца на кнопку, строку песни, заголовок или панель. В режиме игры питомец прыгает к кнопкам рядом с курсором и остаётся на опоре, когда курсор уходит.");
+        ui.label(crate::i18n::text("Перетащите питомца на кнопку, строку песни, заголовок или панель. В режиме игры питомец прыгает к кнопкам рядом с курсором и остаётся на опоре, когда курсор уходит."));
         if let Some((columns, rows)) = self.pet.custom_sprite_grid() {
             if columns == LEGACY_COLUMNS {
-                ui.label("В этом PNG четыре направления. Для диагоналей нужны отдельные кадры в листе на 36 столбцов.");
+                ui.label(crate::i18n::text("В этом PNG четыре направления. Для диагоналей нужны отдельные кадры в листе на 36 столбцов."));
             }
             if rows == LEGACY_ROWS {
-                ui.label("Для пения сидя нужна девятая строка.");
+                ui.label(crate::i18n::text("Для пения сидя нужна девятая строка."));
             }
             if rows < ROWS {
-                ui.label("Для отдельной анимации падения нужна десятая строка PNG.");
+                ui.label(crate::i18n::text(
+                    "Для отдельной анимации падения нужна десятая строка PNG.",
+                ));
             }
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Скопировать промпт для ChatGPT").clicked() {
-                ui.output_mut(|out| out.copied_text = PROMPT.to_owned());
-                self.pet.message = Some("Промпт скопирован.".into());
+            if ui
+                .button(crate::i18n::text("Скопировать промпт для ChatGPT"))
+                .clicked()
+            {
+                ui.output_mut(|out| out.copied_text = crate::i18n::text(PROMPT).to_owned());
+                self.pet.message = Some(crate::i18n::text("Промпт скопирован.").into());
             }
-            if ui.button("Загрузить файл питомца").clicked() {
+            if ui
+                .button(crate::i18n::text("Загрузить файл питомца"))
+                .clicked()
+            {
                 let tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let result =
-                        crate::local_media::pick_file("Выберите спрайт питомца", "PNG | *.png");
+                    let result = crate::local_media::pick_file(
+                        crate::i18n::text("Выберите спрайт питомца"),
+                        "PNG | *.png",
+                    );
                     let _ = tx.send(AppEvent::PetSpriteSelected(result));
                 });
             }
-            if self.settings.pet.custom && ui.button("Вернуть встроенного питомца").clicked()
+            if self.settings.pet.custom
+                && ui
+                    .button(crate::i18n::text("Вернуть встроенного питомца"))
+                    .clicked()
             {
                 self.settings.pet.custom = false;
                 self.pet.texture = None;
@@ -1024,7 +1080,7 @@ impl MetrolistApp {
             }
         }
         if let Some(message) = &self.pet.message {
-            ui.label(message);
+            ui.label(crate::i18n::message(message));
         }
         if changed {
             self.settings.save();
@@ -1077,6 +1133,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut pet = Pet {
             game: true,
+            was_enabled: true,
             next_probe: f64::INFINITY,
             ..Pet::default()
         };
@@ -1242,6 +1299,45 @@ mod tests {
         );
         assert_eq!(pos, cover.landing(0.4, SIDE));
         assert!(pet.recovery.is_none());
+    }
+
+    #[test]
+    fn startup_pet_falls_onto_a_surface_and_stays_there() {
+        let ctx = egui::Context::default();
+        let mut pet = Pet {
+            next_probe: f64::INFINITY,
+            ..Pet::default()
+        };
+        let mut settings = PetSettings {
+            enabled: true,
+            position: [0.5, 0.1],
+            ..PetSettings::default()
+        };
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 500.0));
+        let target = Id::new("startup-platform");
+        let platform = Rect::from_min_size(Pos2::new(200.0, 300.0), Vec2::new(240.0, 30.0));
+        let mut fell = false;
+        for frame in 1..=80 {
+            let _ = ctx.run(
+                RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(f64::from(frame) * 0.05),
+                    predicted_dt: 0.05,
+                    ..Default::default()
+                },
+                |ctx| {
+                    clear_surfaces(ctx);
+                    register_surface(ctx, target, platform, false);
+                    pet.render(ctx, &mut settings, false);
+                },
+            );
+            fell |= pet.pose.is_some_and(|(pose, _)| pose == Pose::Fall);
+        }
+        assert!(fell);
+        assert_eq!(pet.perch.map(|(id, _)| id), Some(target));
+        assert!(pet.recovery.is_none());
+        assert!(pet.jump.is_none());
+        assert!((pet.pos.unwrap().y + settings.size * 0.92 - platform.top()).abs() < 1.0);
     }
 
     #[test]

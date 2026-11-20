@@ -654,6 +654,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "urlencoding",
+ "zbus",
 ]
 
 [[package]]

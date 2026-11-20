@@ -3,16 +3,17 @@ use std::path::{Path, PathBuf};
 pub(crate) fn pick_file(title: &str, filter: &str) -> Result<Option<PathBuf>, String> {
     let mut command = file_dialog(title, filter);
     let result = command.output().map_err(|_| {
-        "Диалог выбора файла недоступен. На Linux можно установить Zenity или перетащить файл в окно.".to_owned()
+        crate::i18n::text("Диалог выбора файла недоступен. На Linux можно установить Zenity или перетащить файл в окно.").to_owned()
     })?;
     if !result.status.success() {
         return if result.status.code() == Some(1) {
             Ok(None)
         } else {
-            Err("Не удалось открыть диалог выбора файла.".into())
+            Err(crate::i18n::text("Не удалось открыть диалог выбора файла.").into())
         };
     }
-    let path = String::from_utf8(result.stdout).map_err(|_| "Путь к файлу не читается.")?;
+    let path = String::from_utf8(result.stdout)
+        .map_err(|_| crate::i18n::text("Путь к файлу не читается."))?;
     let path = path.trim_end_matches(['\r', '\n']);
     Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
@@ -20,16 +21,16 @@ pub(crate) fn pick_file(title: &str, filter: &str) -> Result<Option<PathBuf>, St
 #[cfg(target_os = "windows")]
 fn file_dialog(title: &str, filter: &str) -> std::process::Command {
     let mut command = std::process::Command::new("powershell.exe");
-    let filter =
-        filter
-            .split_once('|')
-            .map_or("Все файлы|*.*".to_owned(), |(title, patterns)| {
-                format!(
-                    "{}|{}",
-                    title.trim(),
-                    patterns.split_whitespace().collect::<Vec<_>>().join(";")
-                )
-            });
+    let filter = filter.split_once('|').map_or(
+        crate::i18n::text("Все файлы|*.*").to_owned(),
+        |(title, patterns)| {
+            format!(
+                "{}|{}",
+                title.trim(),
+                patterns.split_whitespace().collect::<Vec<_>>().join(";")
+            )
+        },
+    );
     command
         .env("CIBITUBE_DIALOG_TITLE", title)
         .env("CIBITUBE_DIALOG_FILTER", filter)
@@ -104,12 +105,12 @@ pub(crate) fn is_lyrics(path: &Path) -> bool {
 
 pub(crate) fn validate_audio(path: &Path) -> Result<PathBuf, String> {
     if !is_audio(path) || !path.is_file() {
-        return Err("Выберите существующий аудиофайл.".into());
+        return Err(crate::i18n::text("Выберите существующий аудиофайл.").into());
     }
     let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-    let input = path
-        .to_str()
-        .ok_or("Путь к файлу содержит неподдерживаемые символы.")?;
+    let input = path.to_str().ok_or(crate::i18n::text(
+        "Путь к файлу содержит неподдерживаемые символы.",
+    ))?;
     let output = std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -126,9 +127,11 @@ pub(crate) fn validate_audio(path: &Path) -> Result<PathBuf, String> {
             input,
         ])
         .output()
-        .map_err(|_| "Для проверки аудиофайла нужен ffprobe из комплекта FFmpeg.")?;
+        .map_err(|_| {
+            crate::i18n::text("Для проверки аудиофайла нужен ffprobe из комплекта FFmpeg.")
+        })?;
     if !output.status.success() || output.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Err("В файле не найдено читаемой аудиодорожки.".into());
+        return Err(crate::i18n::text("В файле не найдено читаемой аудиодорожки.").into());
     }
     Ok(path)
 }
@@ -145,11 +148,18 @@ pub(crate) fn open_folder(path: &str) -> Result<(), String> {
         .arg(path)
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("Не удалось открыть папку: {error}"))
+        .map_err(|error| {
+            crate::localized_format!(
+                "Не удалось открыть папку: {error}",
+                "Could not open the folder: {error}"
+            )
+        })
 }
 
 pub(crate) fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
-    let dir = path.parent().ok_or("У файла нет папки")?;
+    let dir = path
+        .parent()
+        .ok_or(crate::i18n::text("У файла нет папки"))?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut temporary = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
     serde_json::to_writer_pretty(&mut temporary, value).map_err(|e| e.to_string())?;

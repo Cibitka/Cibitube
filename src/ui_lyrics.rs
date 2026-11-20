@@ -287,19 +287,19 @@ impl MetrolistApp {
 
     pub(crate) fn lyric_timing_badge(lyrics: &crate::models::Lyrics, mode: usize) -> String {
         let timing = if !lyrics.is_synced {
-            "Без синхронизации"
+            crate::i18n::text("Без синхронизации")
         } else if lyrics.is_word_synced() {
             match mode {
-                0 => "Тайминги слов • подсветка букв",
-                1 => "По словам",
-                _ => "По строкам",
+                0 => crate::i18n::text("Тайминги слов • подсветка букв"),
+                1 => crate::i18n::text("По словам"),
+                _ => crate::i18n::text("По строкам"),
             }
         } else if mode <= 1 {
-            "Тайминги строк • караоке приблизительное"
+            crate::i18n::text("Тайминги строк • караоке приблизительное")
         } else {
-            "По строкам"
+            crate::i18n::text("По строкам")
         };
-        format!("{} • {timing}", lyrics.source_name)
+        format!("{} • {timing}", crate::i18n::message(&lyrics.source_name))
     }
 
     fn lyric_track_offset(&self) -> i64 {
@@ -337,13 +337,14 @@ impl MetrolistApp {
         let original = self.lyric_track_offset();
         let mut seconds = original as f64 / 1000.0;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Поправка трека").on_hover_text(
+            ui.label(crate::i18n::text("Поправка трека"))
+                .on_hover_text(crate::i18n::text(
                 "Прибавляется к общему сдвигу и автоматически восстанавливается для этого трека.",
-            );
+            ));
             ui.spacing_mut().button_padding.x = 5.0;
             let control_size = egui::vec2(72.0, 26.0);
             if ui
-                .add_sized(control_size, egui::Button::new("−0,5"))
+                .add_sized(control_size, egui::Button::new(crate::i18n::text("−0,5")))
                 .clicked()
             {
                 seconds -= 0.5;
@@ -355,18 +356,22 @@ impl MetrolistApp {
                     .range(-300.0..=300.0)
                     .min_decimals(1)
                     .max_decimals(3)
-                    .suffix(" с"),
+                    .suffix(crate::i18n::text(" с")),
             )
-            .on_hover_text("Если текст отстаёт, введите положительный сдвиг. Например, +45 с.");
+            .on_hover_text(crate::i18n::text(
+                "Если текст отстаёт, введите положительный сдвиг. Например, +45 с.",
+            ));
             if ui
-                .add_sized(control_size, egui::Button::new("+0,5"))
+                .add_sized(control_size, egui::Button::new(crate::i18n::text("+0,5")))
                 .clicked()
             {
                 seconds += 0.5;
             }
             if ui
-                .add_sized(control_size, egui::Button::new("Сброс"))
-                .on_hover_text("Убрать поправку трека и оставить общий сдвиг.")
+                .add_sized(control_size, egui::Button::new(crate::i18n::text("Сброс")))
+                .on_hover_text(crate::i18n::text(
+                    "Убрать поправку трека и оставить общий сдвиг.",
+                ))
                 .clicked()
             {
                 seconds = 0.0;
@@ -378,11 +383,11 @@ impl MetrolistApp {
         }
         let base = self.settings.lyrics_manual_offset_ms;
         ui.label(
-            RichText::new(format!(
-                "Для всех: {base:+} мс  ·  Итог: {:+} мс",
+            RichText::new(crate::localized_format!(
+                "Для всех: {base:+} мс  ·  Итог: {:+} мс", "Default: {base:+} ms  ·  Total: {:+} ms",
                 base.saturating_add(offset)
             )).small(),
-        ).on_hover_text("Сумма общего сдвига и поправки трека. Метка [offset] в файле текста учитывается отдельно.");
+        ).on_hover_text(crate::i18n::text("Сумма общего сдвига и поправки трека. Метка [offset] в файле текста учитывается отдельно."));
     }
 
     pub(crate) fn render_lyrics_tab(&mut self, ui: &mut egui::Ui, current_time: f64) {
@@ -392,7 +397,11 @@ impl MetrolistApp {
 
         if is_narrow {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Текст песни").size(18.0).strong());
+                ui.label(
+                    RichText::new(crate::i18n::text("Текст песни"))
+                        .size(18.0)
+                        .strong(),
+                );
                 if let Some(lyrics) = &self.lyrics {
                     let badge_text =
                         Self::lyric_timing_badge(lyrics, self.settings.lyrics_animation_mode);
@@ -407,19 +416,19 @@ impl MetrolistApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let current_source_name = match self.settings.lyrics_source_mode {
-                    0 => "Авто",
+                    0 => crate::i18n::text("Авто"),
                     1 => "LRCLIB",
                     2 => "QQ",
                     3 => "TTML",
                     4 => "KuGou",
                     5 => "LrcMux",
-                    _ => "Авто",
+                    _ => crate::i18n::text("Авто"),
                 };
                 egui::ComboBox::from_id_salt("lyrics_source_combo_tab")
                     .selected_text(current_source_name)
                     .show_ui(ui, |ui| {
                         let options = [
-                            (0, "Автоматически"),
+                            (0, crate::i18n::text("Автоматически")),
                             (1, "LRCLIB"),
                             (2, "Better Lyrics (QQ)"),
                             (3, "Better Lyrics (TTML)"),
@@ -438,12 +447,15 @@ impl MetrolistApp {
                         }
                     });
 
-                if ui.button(RichText::new("↻ Повторить").size(11.0)).clicked() {
+                if ui
+                    .button(RichText::new(crate::i18n::text("↻ Повторить")).size(11.0))
+                    .clicked()
+                {
                     self.trigger_lyrics_search(true);
                 }
 
                 if ui
-                    .button(RichText::new("Загрузить файл").size(11.0))
+                    .button(RichText::new(crate::i18n::text("Загрузить файл")).size(11.0))
                     .clicked()
                 {
                     self.pick_and_load_local_lyrics_file();
@@ -451,7 +463,11 @@ impl MetrolistApp {
             });
         } else {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Текст песни").size(18.0).strong());
+                ui.label(
+                    RichText::new(crate::i18n::text("Текст песни"))
+                        .size(18.0)
+                        .strong(),
+                );
                 if let Some(lyrics) = &self.lyrics {
                     let badge_text =
                         Self::lyric_timing_badge(lyrics, self.settings.lyrics_animation_mode);
@@ -465,19 +481,19 @@ impl MetrolistApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let current_source_name = match self.settings.lyrics_source_mode {
-                        0 => "Авто",
+                        0 => crate::i18n::text("Авто"),
                         1 => "LRCLIB",
                         2 => "QQ",
                         3 => "TTML",
                         4 => "KuGou",
                         5 => "LrcMux",
-                        _ => "Авто",
+                        _ => crate::i18n::text("Авто"),
                     };
                     egui::ComboBox::from_id_salt("lyrics_source_combo_tab")
                         .selected_text(current_source_name)
                         .show_ui(ui, |ui| {
                             let options = [
-                                (0, "Автоматически"),
+                                (0, crate::i18n::text("Автоматически")),
                                 (1, "LRCLIB"),
                                 (2, "Better Lyrics (QQ)"),
                                 (3, "Better Lyrics (TTML)"),
@@ -499,12 +515,15 @@ impl MetrolistApp {
                             }
                         });
 
-                    if ui.button(RichText::new("↻ Повторить").size(11.0)).clicked() {
+                    if ui
+                        .button(RichText::new(crate::i18n::text("↻ Повторить")).size(11.0))
+                        .clicked()
+                    {
                         self.trigger_lyrics_search(true);
                     }
 
                     if ui
-                        .button(RichText::new("Загрузить файл").size(11.0))
+                        .button(RichText::new(crate::i18n::text("Загрузить файл")).size(11.0))
                         .clicked()
                     {
                         self.pick_and_load_local_lyrics_file();
@@ -521,7 +540,10 @@ impl MetrolistApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(60.0);
                 ui.label(
-                    RichText::new("Текст песни не найден или трек ещё не воспроизводится").weak(),
+                    RichText::new(crate::i18n::text(
+                        "Текст песни не найден или трек ещё не воспроизводится",
+                    ))
+                    .weak(),
                 );
             });
             return;
@@ -535,9 +557,11 @@ impl MetrolistApp {
         );
         if !lyrics.is_synced {
             ui.label(
-                RichText::new("ℹ Для этого трека доступен только несинхронизированный текст")
-                    .size(12.0)
-                    .color(Color32::from_rgb(180, 180, 195)),
+                RichText::new(crate::i18n::text(
+                    "ℹ Для этого трека доступен только несинхронизированный текст",
+                ))
+                .size(12.0)
+                .color(Color32::from_rgb(180, 180, 195)),
             );
             ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| {

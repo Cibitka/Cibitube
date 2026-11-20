@@ -138,7 +138,10 @@ impl Library {
             if inserted {
                 self.downloaded_tracks.pop();
             }
-            return Err(format!("Не удалось сохранить медиатеку: {error}"));
+            return Err(crate::localized_format!(
+                "Не удалось сохранить медиатеку: {error}",
+                "Could not save your library: {error}"
+            ));
         }
         Ok(())
     }

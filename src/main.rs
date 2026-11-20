@@ -10,6 +10,8 @@ mod library;
 mod local_media;
 mod lyrics;
 mod lyrics_loader;
+#[cfg(target_os = "linux")]
+mod media_controls;
 mod models;
 mod pet;
 mod player;

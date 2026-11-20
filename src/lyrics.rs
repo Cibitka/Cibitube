@@ -1488,25 +1488,26 @@ impl LocalFileAdapter {
         if ext == "ttml" || content.trim_start().starts_with('<') {
             if let Some(lyrics) = TtmlParser::parse(&content, Some("local")) {
                 let mut l = lyrics;
-                l.source_name = "Локальный файл (TTML)".to_string();
+                l.source_name = crate::i18n::text("Локальный файл (TTML)").to_string();
                 return Some(l);
             }
         }
 
         if ext == "qrc" {
             return QrcParser::parse(&content, Some("local")).map(|mut lyrics| {
-                lyrics.source_name = "Локальный файл (QRC)".to_string();
+                lyrics.source_name = crate::i18n::text("Локальный файл (QRC)").to_string();
                 lyrics
             });
         }
 
-        if let Some(lyrics) = LrcParser::parse(&content, "Локальный файл (LRC)") {
+        if let Some(lyrics) = LrcParser::parse(&content, crate::i18n::text("Локальный файл (LRC)"))
+        {
             return Some(lyrics);
         }
 
         // Fallback: read plain text file
         Some(Lyrics {
-            source_name: "Локальный файл (Текст)".to_string(),
+            source_name: crate::i18n::text("Локальный файл (Текст)").to_string(),
             provider: Some("local".to_string()),
             title: None,
             artist: None,

@@ -155,7 +155,11 @@ impl InnertubeClient {
         if let Some(auth_user) = confirmed_without_name {
             if accounts.is_empty() || auth_user == selected {
                 accounts.push(AccountProfile {
-                    name: format!("Аккаунт YouTube Music ({})", auth_user.saturating_add(1)),
+                    name: crate::localized_format!(
+                        "Аккаунт YouTube Music ({})",
+                        "YouTube Music account ({})",
+                        auth_user.saturating_add(1)
+                    ),
                     email: String::new(),
                     auth_user,
                 });
@@ -163,7 +167,10 @@ impl InnertubeClient {
         }
         if accounts.is_empty() {
             return Err(last_error.unwrap_or_else(|| {
-                "YouTube Music не подтвердил вход. Обнови вход через Firefox или Cookie.".into()
+                crate::i18n::text(
+                    "YouTube Music не подтвердил вход. Обнови вход через Firefox или Cookie.",
+                )
+                .into()
             }));
         }
         accounts.sort_by_key(|account| account.auth_user);
@@ -260,14 +267,22 @@ impl InnertubeClient {
         let res = req
             .send()
             .await
-            .map_err(|e| format!("Сетевая ошибка: {}", e))?
+            .map_err(|e| crate::localized_format!("Сетевая ошибка: {}", "Network error: {}", e))?
             .error_for_status()
-            .map_err(|e| format!("YouTube Music отклонил поиск: {e}"))?;
+            .map_err(|e| {
+                crate::localized_format!(
+                    "YouTube Music отклонил поиск: {e}",
+                    "YouTube Music rejected the search: {e}"
+                )
+            })?;
 
-        let json: Value = res
-            .json()
-            .await
-            .map_err(|e| format!("Ошибка парсинга ответа: {}", e))?;
+        let json: Value = res.json().await.map_err(|e| {
+            crate::localized_format!(
+                "Ошибка парсинга ответа: {}",
+                "Could not read the response: {}",
+                e
+            )
+        })?;
 
         let mut tracks = Vec::new();
 
@@ -434,11 +449,17 @@ impl InnertubeClient {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| format!("Рекомендации недоступны: {}", error.without_url()))?;
+            .map_err(|error| {
+                crate::localized_format!(
+                    "Рекомендации недоступны: {}",
+                    "Recommendations unavailable: {}",
+                    error.without_url()
+                )
+            })?;
         let json: Value = response
             .json()
             .await
-            .map_err(|_| "Ответ YouTube Music не распознан")?;
+            .map_err(|_| crate::i18n::text("Ответ YouTube Music не распознан"))?;
         let mut tracks = Vec::new();
         let mut playlists = Vec::new();
         Self::collect_home(&json["contents"], &mut tracks, &mut playlists);
@@ -462,23 +483,33 @@ impl InnertubeClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("Радио недоступно: {}", e.without_url()))?;
+            .map_err(|e| {
+                crate::localized_format!(
+                    "Радио недоступно: {}",
+                    "Radio unavailable: {}",
+                    e.without_url()
+                )
+            })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!(
+            return Err(crate::localized_format!(
                 "YouTube Music отклонил запрос радио (HTTP {}). Попробуй другой трек.",
+                "YouTube Music rejected the radio request (HTTP {}). Try another track.",
                 status.as_u16()
             ));
         }
-        let json: Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Ответ радио не распознан: {e}"))?;
+        let json: Value = response.json().await.map_err(|e| {
+            crate::localized_format!(
+                "Ответ радио не распознан: {e}",
+                "Could not read the radio response: {e}"
+            )
+        })?;
         let tracks = Self::parse_radio_tracks(&json);
         if tracks.is_empty() {
-            return Err(
-                "YouTube Music не вернул радио для этого трека. Попробуй другую песню.".into(),
-            );
+            return Err(crate::i18n::text(
+                "YouTube Music не вернул радио для этого трека. Попробуй другую песню.",
+            )
+            .into());
         }
         Ok(tracks)
     }
@@ -553,10 +584,10 @@ impl InnertubeClient {
         auth_user: usize,
     ) -> Result<Vec<Track>, String> {
         if cookie.is_empty() {
-            return Err(
-                "Для загрузки любимых треков с YouTube войдите в аккаунт во вкладке Настройки"
-                    .to_string(),
-            );
+            return Err(crate::i18n::text(
+                "Для загрузки любимых треков с YouTube войдите в аккаунт во вкладке Настройки",
+            )
+            .to_string());
         }
 
         self.fetch_playlist_tracks("FEmusic_liked_videos", cookie, auth_user)
@@ -569,7 +600,9 @@ impl InnertubeClient {
         auth_user: usize,
     ) -> Result<Vec<Playlist>, String> {
         if cookie.is_empty() {
-            return Err("Для загрузки плейлистов требуется войти в аккаунт".to_string());
+            return Err(
+                crate::i18n::text("Для загрузки плейлистов требуется войти в аккаунт").to_string(),
+            );
         }
 
         fn collect(node: &Value, playlists: &mut Vec<Playlist>, tokens: &mut Vec<String>) {
@@ -617,7 +650,9 @@ impl InnertubeClient {
             {
                 Ok(page) if page.get("contents").is_some() || page.get("header").is_some() => page,
                 Ok(_) => {
-                    last_error = Some("YouTube Music не вернул список плейлистов.".to_owned());
+                    last_error = Some(
+                        crate::i18n::text("YouTube Music не вернул список плейлистов.").to_owned(),
+                    );
                     continue;
                 }
                 Err(error) => {
@@ -634,7 +669,10 @@ impl InnertubeClient {
                     continue;
                 }
                 if seen.len() > 50 {
-                    return Err("YouTube Music вернул слишком много страниц плейлистов.".into());
+                    return Err(crate::i18n::text(
+                        "YouTube Music вернул слишком много страниц плейлистов.",
+                    )
+                    .into());
                 }
                 let page = self
                     .playlist_request(
@@ -653,7 +691,8 @@ impl InnertubeClient {
         if loaded {
             Ok(playlists)
         } else {
-            Err(last_error.unwrap_or_else(|| "Список плейлистов недоступен.".into()))
+            Err(last_error
+                .unwrap_or_else(|| crate::i18n::text("Список плейлистов недоступен.").into()))
         }
     }
 
@@ -673,7 +712,7 @@ impl InnertubeClient {
             self.fetch_user_playlists(&cookie, auth_user),
         )
         .await
-        .map_err(|_| "Не дождались списка плейлистов.")??;
+        .map_err(|_| crate::i18n::text("Не дождались списка плейлистов."))??;
         let own: std::collections::HashSet<_> = playlists
             .into_iter()
             .map(|p| p.id.strip_prefix("VL").unwrap_or(&p.id).to_owned())
@@ -713,7 +752,10 @@ impl InnertubeClient {
             let Some(result) = workers.join_next().await else {
                 break;
             };
-            tracks.extend(result.map_err(|_| "Проверка состава плейлиста остановилась.")??);
+            tracks
+                .extend(result.map_err(|_| {
+                    crate::i18n::text("Проверка состава плейлиста остановилась.")
+                })??);
         }
         Ok((own, tracks))
     }
@@ -746,8 +788,9 @@ impl InnertubeClient {
         cookie: &str,
         auth_user: usize,
     ) -> Result<Value, String> {
-        let (auth, origin, referer) = Self::get_sapisid_auth(cookie)
-            .ok_or("В Cookie не найдены данные входа YouTube Music.")?;
+        let (auth, origin, referer) = Self::get_sapisid_auth(cookie).ok_or(crate::i18n::text(
+            "В Cookie не найдены данные входа YouTube Music.",
+        ))?;
         self.web_browse_request(
             endpoint,
             &mut payload,
@@ -804,21 +847,31 @@ impl InnertubeClient {
         if let Some(token) = payload["continuation"].as_str() {
             request = request.query(&[("continuation", token)]);
         }
-        let response =
-            request.json(payload).send().await.map_err(|e| {
-                format!("Не удалось связаться с YouTube Music: {}", e.without_url())
-            })?;
+        let response = request.json(payload).send().await.map_err(|e| {
+            crate::localized_format!(
+                "Не удалось связаться с YouTube Music: {}",
+                "Could not connect to YouTube Music: {}",
+                e.without_url()
+            )
+        })?;
         let status = response.status();
         match status.as_u16() {
-            401 => return Err("Сессия YouTube Music истекла. Войди в аккаунт заново.".into()),
-            403 => {
-                return Err(
-                    "YouTube Music не разрешил это действие для выбранного аккаунта.".into(),
+            401 => {
+                return Err(crate::i18n::text(
+                    "Сессия YouTube Music истекла. Войди в аккаунт заново.",
                 )
+                .into())
+            }
+            403 => {
+                return Err(crate::i18n::text(
+                    "YouTube Music не разрешил это действие для выбранного аккаунта.",
+                )
+                .into())
             }
             _ if !status.is_success() => {
-                return Err(format!(
+                return Err(crate::localized_format!(
                     "YouTube Music отклонил запрос (HTTP {}).",
+                    "YouTube Music rejected the request (HTTP {}).",
                     status.as_u16()
                 ));
             }
@@ -827,7 +880,7 @@ impl InnertubeClient {
         response
             .json()
             .await
-            .map_err(|_| "Не удалось прочитать ответ YouTube Music.".into())
+            .map_err(|_| crate::i18n::text("Не удалось прочитать ответ YouTube Music.").into())
     }
 
     pub(crate) async fn playlist_choices(
@@ -1087,10 +1140,10 @@ impl InnertubeClient {
                 .await
             {
                 PlaylistMembership::Present(Some(id)) => id,
-                _ => return Err(
-                    "Не удалось найти запись трека для удаления. Обнови плейлист в YouTube Music."
-                        .into(),
-                ),
+                _ => return Err(crate::i18n::text(
+                    "Не удалось найти запись трека для удаления. Обнови плейлист в YouTube Music.",
+                )
+                .into()),
             }
         };
         let action = serde_json::json!({
@@ -1121,10 +1174,10 @@ impl InnertubeClient {
         if json["status"].as_str() == Some("STATUS_SUCCEEDED") {
             Ok(())
         } else {
-            Err(
-                "YouTube Music не подтвердил изменение. Проверь плейлист перед повторной попыткой."
-                    .into(),
+            Err(crate::i18n::text(
+                "YouTube Music не подтвердил изменение. Проверь плейлист перед повторной попыткой.",
             )
+            .into())
         }
     }
 
@@ -1165,7 +1218,7 @@ impl InnertubeClient {
 
         let mut page = request_page(serde_json::json!({"browseId": actual_id})).await?;
         if page.get("contents").is_none() && page.get("header").is_none() {
-            return Err("YouTube Music не вернул содержимое плейлиста.".into());
+            return Err(crate::i18n::text("YouTube Music не вернул содержимое плейлиста.").into());
         }
         let mut seen_tokens = std::collections::HashSet::new();
         loop {
@@ -1175,9 +1228,10 @@ impl InnertubeClient {
             }
             let Some(token) = token else { break };
             if !seen_tokens.insert(token.clone()) {
-                return Err(
-                    "YouTube Music повторил страницу плейлиста. Попробуй обновить его.".into(),
-                );
+                return Err(crate::i18n::text(
+                    "YouTube Music повторил страницу плейлиста. Попробуй обновить его.",
+                )
+                .into());
             }
             page = request_page(serde_json::json!({"continuation": token})).await?;
             if page.pointer("/onResponseReceivedActions").is_none()
@@ -1188,7 +1242,10 @@ impl InnertubeClient {
                     .pointer("/continuationContents/musicShelfContinuation/contents")
                     .is_none()
             {
-                return Err("YouTube Music не вернул следующую страницу плейлиста.".into());
+                return Err(crate::i18n::text(
+                    "YouTube Music не вернул следующую страницу плейлиста.",
+                )
+                .into());
             }
         }
         Ok(())
@@ -1321,7 +1378,7 @@ impl InnertubeClient {
             id: video_id,
             title,
             artist: if artist.is_empty() {
-                "Неизвестный исполнитель".to_string()
+                crate::i18n::text("Неизвестный исполнитель").to_string()
             } else {
                 artist
             },
@@ -1339,7 +1396,7 @@ impl InnertubeClient {
         let artist = card
             .pointer("/subtitle/runs/0/text")
             .and_then(|v| v.as_str())
-            .unwrap_or("Неизвестный")
+            .unwrap_or(crate::i18n::text("Неизвестный"))
             .to_string();
 
         let video_id = card

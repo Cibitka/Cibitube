@@ -81,7 +81,11 @@ impl BytesLoader for CoverLoader {
                     mime: mime.clone(),
                 })
             }
-            Some(Cover::Failed) => return Err(LoadError::Loading("Обложка недоступна".into())),
+            Some(Cover::Failed) => {
+                return Err(LoadError::Loading(
+                    crate::i18n::text("Обложка недоступна").into(),
+                ))
+            }
             Some(Cover::Loading) => return Ok(BytesPoll::Pending { size: None }),
             None => {
                 covers.insert(uri.to_owned(), Cover::Loading);

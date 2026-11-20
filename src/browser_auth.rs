@@ -19,15 +19,15 @@ enum FirefoxReadError {
 impl FirefoxReadError {
     fn message(self) -> &'static str {
         match self {
-            Self::SqliteUnavailable => "Не удалось запустить sqlite3. Проверь, что он установлен.",
+            Self::SqliteUnavailable => crate::i18n::text("Не удалось запустить sqlite3. Проверь, что он установлен."),
             Self::Busy => {
-                "Firefox сейчас обновляет данные входа. Повтори подключение через несколько секунд."
+                crate::i18n::text("Firefox сейчас обновляет данные входа. Повтори подключение через несколько секунд.")
             }
             Self::Unreadable => {
-                "Нет доступа к базе Firefox. Можно подключиться через Cookie вручную."
+                crate::i18n::text("Нет доступа к базе Firefox. Можно подключиться через Cookie вручную.")
             }
             Self::Unsupported => {
-                "Не удалось распознать базу Firefox. Можно подключиться через Cookie вручную."
+                crate::i18n::text("Не удалось распознать базу Firefox. Можно подключиться через Cookie вручную.")
             }
         }
     }
@@ -66,7 +66,9 @@ impl BrowserAuth {
             )
         });
         if profiles.is_empty() {
-            return Err("Профиль Firefox с файлом cookies.sqlite не найден.".into());
+            return Err(
+                crate::i18n::text("Профиль Firefox с файлом cookies.sqlite не найден.").into(),
+            );
         }
 
         let mut read_profile = false;
@@ -99,7 +101,7 @@ impl BrowserAuth {
                 .message()
                 .into());
         }
-        Err("В Firefox нет сохранённой сессии YouTube Music. Открой music.youtube.com в обычном окне Firefox, войди в аккаунт и повтори подключение.".into())
+        Err(crate::i18n::text("В Firefox нет сохранённой сессии YouTube Music. Открой music.youtube.com в обычном окне Firefox, войди в аккаунт и повтори подключение.").into())
     }
 
     pub(crate) fn manual_session(input: &str) -> Result<(String, Option<usize>), String> {
@@ -124,10 +126,10 @@ impl BrowserAuth {
         if reqwest::header::HeaderValue::from_str(&cookie).is_err()
             || !crate::innertube::InnertubeClient::has_browser_auth(&cookie)
         {
-            return Err(
-                "Вставь Cookie из заголовков запроса к music.youtube.com после входа в аккаунт."
-                    .into(),
-            );
+            return Err(crate::i18n::text(
+                "Вставь Cookie из заголовков запроса к music.youtube.com после входа в аккаунт.",
+            )
+            .into());
         }
         Ok((cookie, account))
     }

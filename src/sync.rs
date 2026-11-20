@@ -332,9 +332,10 @@ impl SyncManager {
         }.map_err(|e| e.to_string())?;
 
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(
-                "AUTH_EXPIRED: Токен Google Drive истек. Пожалуйста, войдите снова.".to_string(),
-            );
+            return Err(crate::i18n::text(
+                "AUTH_EXPIRED: Токен Google Drive истек. Пожалуйста, войдите снова.",
+            )
+            .to_string());
         }
 
         if res.status().is_success() {
@@ -368,7 +369,7 @@ impl SyncManager {
             .map_err(|e| e.to_string())?;
 
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("AUTH_EXPIRED: Токен Google Drive истек.".to_string());
+            return Err(crate::i18n::text("AUTH_EXPIRED: Токен Google Drive истек.").to_string());
         }
 
         if res.status().is_success() {

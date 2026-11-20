@@ -92,7 +92,7 @@ impl Downloader {
                 ctx.request_repaint();
             };
             while let Ok(task) = task_rx.recv() {
-                let mut result = Err("Загрузка не началась".to_owned());
+                let mut result = Err(crate::i18n::text("Загрузка не началась").to_owned());
                 for attempt in 1..=3 {
                     if task.control.cancelled() {
                         break;
@@ -146,8 +146,12 @@ impl Downloader {
     ) -> Result<(String, PathBuf), String> {
         let opts = &task.options;
 
-        std::fs::create_dir_all(&opts.download_dir)
-            .map_err(|e| format!("Не удалось создать папку загрузок: {e}"))?;
+        std::fs::create_dir_all(&opts.download_dir).map_err(|e| {
+            crate::localized_format!(
+                "Не удалось создать папку загрузок: {e}",
+                "Could not create the download folder: {e}"
+            )
+        })?;
 
         let mut ffmpeg = Command::new("ffmpeg");
         ffmpeg.arg("-version");
@@ -159,7 +163,9 @@ impl Downloader {
         )
         .is_ok_and(|(status, _)| status.success())
         {
-            return Err("Для скачивания и конвертации нужен работающий FFmpeg.".into());
+            return Err(
+                crate::i18n::text("Для скачивания и конвертации нужен работающий FFmpeg.").into(),
+            );
         }
 
         let safe_title = Self::track_basename(&task.track);
@@ -207,8 +213,9 @@ impl Downloader {
 
         let cookie_file = if attempt == 3 && !opts.google_cookie.is_empty() {
             Some(youtube_cookie_file(&opts.google_cookie).map_err(|e| {
-                format!(
+                crate::localized_format!(
                     "Не удалось подготовить авторизацию для yt-dlp: {}",
+                    "Could not prepare authentication for yt-dlp: {}",
                     e.kind()
                 )
             })?)
@@ -286,7 +293,10 @@ impl Downloader {
             .metadata()
             .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
         {
-            return Err("yt-dlp завершился, но итоговый аудиофайл отсутствует.".to_owned());
+            return Err(
+                crate::i18n::text("yt-dlp завершился, но итоговый аудиофайл отсутствует.")
+                    .to_owned(),
+            );
         }
         progress(100.0, None, true);
         // Текст песни (.lrc), только после успешной загрузки аудио
@@ -337,15 +347,15 @@ impl Downloader {
             }
         }
 
-        let mut details = vec!["Аудио"];
+        let mut details = vec![crate::i18n::text("Аудио")];
         if embed_cover || save_cover {
-            details.push("Обложка");
+            details.push(crate::i18n::text("Обложка"));
         }
         if lyrics_saved {
-            details.push("Текст");
+            details.push(crate::i18n::text("Текст"));
         }
         Ok((
-            format!("Скачано ({})", details.join(" + ")),
+            crate::localized_format!("Скачано ({})", "Downloaded ({})", details.join(" + ")),
             audio.canonicalize().unwrap_or(audio),
         ))
     }
@@ -468,23 +478,35 @@ fn run_bounded(
         .stdout(stdout_writer)
         .stderr(stderr_writer)
         .spawn()
-        .map_err(|error| format!("Не удалось запустить загрузчик: {error}"))?;
+        .map_err(|error| {
+            crate::localized_format!(
+                "Не удалось запустить загрузчик: {error}",
+                "Could not start the downloader: {error}"
+            )
+        })?;
     let deadline = Instant::now() + timeout;
     let mut pending = Vec::new();
     let status = loop {
         if control.cancelled() || Instant::now() >= deadline {
             stop_process(&mut child);
             return Err(if control.cancelled() {
-                "Загрузка отменена".into()
+                crate::i18n::text("Загрузка отменена").into()
             } else {
-                format!("Загрузчик превысил лимит {} сек.", timeout.as_secs())
+                crate::localized_format!(
+                    "Загрузчик превысил лимит {} сек.",
+                    "The downloader exceeded the {} second time limit.",
+                    timeout.as_secs()
+                )
             });
         }
         let status = match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
                 stop_process(&mut child);
-                return Err(format!("Ошибка ожидания загрузчика: {error}"));
+                return Err(crate::localized_format!(
+                    "Ошибка ожидания загрузчика: {error}",
+                    "Could not wait for the downloader: {error}"
+                ));
             }
         };
 

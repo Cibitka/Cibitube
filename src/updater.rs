@@ -71,13 +71,16 @@ impl Updater {
         if status == reqwest::StatusCode::FORBIDDEN
             || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         {
-            return Err(
-                "Лимит запросов к GitHub API исчерпан. Откройте страницу релизов в браузере."
-                    .to_string(),
-            );
+            return Err(crate::i18n::text(
+                "Лимит запросов к GitHub API исчерпан. Откройте страницу релизов в браузере.",
+            )
+            .to_string());
         }
         if !status.is_success() {
-            return Err(format!("GitHub API вернул статус: {status}"));
+            return Err(crate::localized_format!(
+                "GitHub API вернул статус: {status}",
+                "GitHub API returned status: {status}"
+            ));
         }
 
         let release = resp
@@ -205,8 +208,9 @@ impl Updater {
             }
         }
 
-        Err(format!(
-            "Контрольная сумма SHA-256 для файла «{clean_asset}» не найдена в описании релиза"
+        Err(crate::localized_format!(
+            "Контрольная сумма SHA-256 для файла «{clean_asset}» не найдена в описании релиза",
+            "The SHA-256 checksum for “{clean_asset}” was not found in the release notes"
         ))
     }
 
@@ -243,14 +247,15 @@ impl Updater {
     ) -> Result<String, String> {
         if !cfg!(target_os = "linux") {
             return Err(
-                "Автообновление доступно только на Linux. Скачайте новую версию со страницы релизов."
+                crate::i18n::text("Автообновление доступно только на Linux. Скачайте новую версию со страницы релизов.")
                     .to_string(),
             );
         }
-        let url = download_url.ok_or_else(|| "URL для скачивания релиза не найден".to_string())?;
+        let url = download_url
+            .ok_or_else(|| crate::i18n::text("URL для скачивания релиза не найден").to_string())?;
         let (_base, asset_name) = url
             .rsplit_once('/')
-            .ok_or_else(|| "Некорректный URL релиза".to_string())?;
+            .ok_or_else(|| crate::i18n::text("Некорректный URL релиза").to_string())?;
 
         let client = Self::http_client(120)?;
 
@@ -266,14 +271,25 @@ impl Updater {
                     .header("Accept", "application/vnd.github+json")
                     .send()
                     .await
-                    .map_err(|e| format!("Не удалось запросить релиз для проверки SHA-256: {e}"))?;
+                    .map_err(|e| {
+                        crate::localized_format!(
+                            "Не удалось запросить релиз для проверки SHA-256: {e}",
+                            "Could not retrieve the release for SHA-256 verification: {e}"
+                        )
+                    })?;
                 if !resp.status().is_success() {
-                    return Err(format!("GitHub API вернул статус: {}", resp.status()));
+                    return Err(crate::localized_format!(
+                        "GitHub API вернул статус: {}",
+                        "GitHub API returned status: {}",
+                        resp.status()
+                    ));
                 }
-                let rel = resp
-                    .json::<GitHubRelease>()
-                    .await
-                    .map_err(|e| format!("Ошибка парсинга релиза: {e}"))?;
+                let rel = resp.json::<GitHubRelease>().await.map_err(|e| {
+                    crate::localized_format!(
+                        "Ошибка парсинга релиза: {e}",
+                        "Could not read the release data: {e}"
+                    )
+                })?;
                 let body = rel.body.unwrap_or_default();
                 Self::extract_sha256_from_release_body(&body, asset_name)?
             }
@@ -287,27 +303,33 @@ impl Updater {
         let (bytes, message) = match partial {
             Some((bytes, downloaded)) => {
                 let percent = downloaded * 100 / bytes.len();
-                (bytes, format!("Обновление установлено. Патч занял {percent}% от полной загрузки. Перезапустите Cibitube."))
+                (bytes, crate::localized_format!("Обновление установлено. Патч занял {percent}% от полной загрузки. Перезапустите Cibitube.", "Update installed. The patch was {percent}% of the full download. Restart Cibitube."))
             }
             None => (
-                Self::get_bytes(&client, &url)
-                    .await
-                    .map_err(|e| format!("Ошибка скачивания: {e}"))?,
-                "Обновление установлено полной загрузкой. Перезапустите Cibitube.".to_owned(),
+                Self::get_bytes(&client, &url).await.map_err(|e| {
+                    crate::localized_format!("Ошибка скачивания: {e}", "Download failed: {e}")
+                })?,
+                crate::i18n::text(
+                    "Обновление установлено полной загрузкой. Перезапустите Cibitube.",
+                )
+                .to_owned(),
             ),
         };
 
         if !Self::verify_sha256(&bytes, &expected_hash) {
             let computed = hex::encode(Sha256::digest(&bytes));
-            return Err(format!(
-                "Контрольная сумма SHA-256 не совпадает (ожидалось: {}, получено: {}): обновление отменено",
+            return Err(crate::localized_format!(
+                "Контрольная сумма SHA-256 не совпадает (ожидалось: {}, получено: {}): обновление отменено", "SHA-256 checksum mismatch (expected: {}, received: {}): update canceled",
                 expected_hash.trim(),
                 computed
             ));
         }
 
         if bytes.len() < 500_000 || !bytes.starts_with(b"\x7fELF") {
-            return Err("Скачанный файл не является исполняемым бинарником Linux".to_string());
+            return Err(crate::i18n::text(
+                "Скачанный файл не является исполняемым бинарником Linux",
+            )
+            .to_string());
         }
 
         Self::install_binary(&bytes)?;
@@ -379,20 +401,33 @@ impl Updater {
         let backup = exe.with_extension("bak");
         let tmp = exe.with_extension("new");
 
-        fs::write(&tmp, bytes)
-            .map_err(|e| format!("Не удалось записать {}: {e}", tmp.display()))?;
+        fs::write(&tmp, bytes).map_err(|e| {
+            crate::localized_format!(
+                "Не удалось записать {}: {e}",
+                "Could not write {}: {e}",
+                tmp.display()
+            )
+        })?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("Не удалось выставить права: {e}"))?;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).map_err(|e| {
+                crate::localized_format!(
+                    "Не удалось выставить права: {e}",
+                    "Could not set file permissions: {e}"
+                )
+            })?;
         }
 
         let _ = fs::copy(&exe, &backup);
         fs::rename(&tmp, &exe).map_err(|e| {
             let _ = fs::remove_file(&tmp);
-            format!("Не удалось заменить бинарник {}: {e}", exe.display())
+            crate::localized_format!(
+                "Не удалось заменить бинарник {}: {e}",
+                "Could not replace the executable {}: {e}",
+                exe.display()
+            )
         })
     }
 

@@ -14,21 +14,24 @@ impl MetrolistApp {
         let playlist = self.settings.wave_playlist.clone();
         let track = self.settings.wave_track.clone();
         if mode == 1 && self.settings.youtube_playlist_hidden(&playlist) {
-            self.wave_message =
-                "Этот плейлист скрыт. Выбери другой или верни его в настройках библиотеки.".into();
+            self.wave_message = crate::i18n::text(
+                "Этот плейлист скрыт. Выбери другой или верни его в настройках библиотеки.",
+            )
+            .into();
             return;
         }
         if (mode == 0 && keyword.is_empty())
             || (mode == 1 && playlist.is_empty())
             || (mode == 2 && track.is_none())
         {
-            self.wave_message = "Выбери слово, плейлист или трек для волны.".into();
+            self.wave_message =
+                crate::i18n::text("Выбери слово, плейлист или трек для волны.").into();
             return;
         }
         self.wave_request = self.wave_request.wrapping_add(1);
         let request = self.wave_request;
         self.wave_busy = true;
-        self.wave_message = "Собираю музыкальное радио…".into();
+        self.wave_message = crate::i18n::text("Собираю музыкальное радио…").into();
         let current = self.current_track().cloned();
         let resume_after = if resume {
             current.as_ref().map(|t| t.id.clone())
@@ -53,7 +56,7 @@ impl MetrolistApp {
                     }
                     2 if resume => current.into_iter().collect(),
                     2 => track.into_iter().collect(),
-                    _ if keyword == "Для меня" => {
+                    _ if keyword == "Для меня" || keyword == "For me" => {
                         if liked.is_empty() {
                             history
                         } else {
@@ -62,17 +65,24 @@ impl MetrolistApp {
                     }
                     _ => {
                         let query = match keyword.as_str() {
-                            "Спокойствие" => "спокойная музыка",
-                            "Энергия" => "энергичная музыка",
-                            "Для работы" => "музыка для работы",
-                            "Ночь" => "ночной плейлист музыка",
+                            "Спокойствие" | "Relax" => {
+                                crate::i18n::text("спокойная музыка")
+                            }
+                            "Энергия" | "Energy" => crate::i18n::text("энергичная музыка"),
+                            "Для работы" | "Focus" => {
+                                crate::i18n::text("музыка для работы")
+                            }
+                            "Ночь" | "Night" => crate::i18n::text("ночной плейлист музыка"),
+                            preset @ ("Рок" | "Электроника" | "Джаз") => {
+                                crate::i18n::text(preset)
+                            }
                             other => other,
                         };
                         client.search(query, &country, &cookie, auth).await?
                     }
                 };
                 if seeds.is_empty() {
-                    return Err("Не найдены треки для основы волны. Выбери другой запрос, трек или непустой плейлист.".into());
+                    return Err(crate::i18n::text("Не найдены треки для основы волны. Выбери другой запрос, трек или непустой плейлист.").into());
                 }
                 let offset = request.wrapping_sub(1) as usize % seeds.len();
                 if mode == 1 {
@@ -87,10 +97,9 @@ impl MetrolistApp {
                     }
                 }
                 if tracks.is_empty() {
-                    return Err(failures
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| "Станция не вернула треков.".into()));
+                    return Err(failures.into_iter().next().unwrap_or_else(|| {
+                        crate::i18n::text("Станция не вернула треков.").into()
+                    }));
                 }
                 let mut seen = std::collections::HashSet::new();
                 // Keep the seed first for an explicit start; skip it for continuation.
@@ -103,7 +112,10 @@ impl MetrolistApp {
                 tokio::time::timeout(Duration::from_secs(65), work)
                     .await
                     .unwrap_or_else(|_| {
-                        Err("YouTube Music долго не отвечает. Попробуй снова.".into())
+                        Err(
+                            crate::i18n::text("YouTube Music долго не отвечает. Попробуй снова.")
+                                .into(),
+                        )
                     });
             let _ = tx.send(AppEvent::WaveLoaded {
                 request,
@@ -134,7 +146,9 @@ impl MetrolistApp {
                 client.search(&query, &country, &cookie, auth),
             )
             .await
-            .unwrap_or_else(|_| Err("Поиск не ответил вовремя. Попробуй ещё раз.".into()));
+            .unwrap_or_else(|_| {
+                Err(crate::i18n::text("Поиск не ответил вовремя. Попробуй ещё раз.").into())
+            });
             let _ = tx.send(AppEvent::WaveSearchLoaded { request, result });
         });
     }
@@ -151,13 +165,17 @@ impl MetrolistApp {
                     .rounding(22.0)
                     .inner_margin(16.0)
                     .show(ui, |ui| {
-                        ui.heading("Своя волна");
-                        ui.label("Музыка под твой настрой");
+                        ui.heading(crate::i18n::text("Своя волна"));
+                        ui.label(crate::i18n::text("Музыка под твой настрой"));
                         ui.add_space(8.0);
                         ui.horizontal_wrapped(|ui| {
-                            for (mode, label) in ["Настроение и слово", "Мой плейлист", "Один трек"]
-                                .iter()
-                                .enumerate()
+                            for (mode, label) in [
+                                crate::i18n::text("Настроение и слово"),
+                                crate::i18n::text("Мой плейлист"),
+                                crate::i18n::text("Один трек"),
+                            ]
+                            .iter()
+                            .enumerate()
                             {
                                 changed |= ui
                                     .selectable_value(&mut self.settings.wave_mode, mode, *label)
@@ -168,11 +186,13 @@ impl MetrolistApp {
                 ui.add_space(14.0);
                 match self.settings.wave_mode {
                     1 => {
-                        ui.label("Выбери основу — радио подберёт музыку по песням плейлиста.");
+                        ui.label(crate::i18n::text(
+                            "Выбери основу — радио подберёт музыку по песням плейлиста.",
+                        ));
                         egui::ComboBox::from_id_salt("wave_playlist")
                             .width(ui.available_width().min(320.0))
                             .selected_text(if self.settings.wave_playlist == "__liked" {
-                                "Любимые треки".to_string()
+                                crate::i18n::text("Любимые треки").to_string()
                             } else {
                                 self.playlists
                                     .iter()
@@ -181,14 +201,14 @@ impl MetrolistApp {
                                             && !self.settings.youtube_playlist_hidden(&p.id)
                                     })
                                     .map(|p| p.title.clone())
-                                    .unwrap_or_else(|| "Выбрать плейлист".into())
+                                    .unwrap_or_else(|| crate::i18n::text("Выбрать плейлист").into())
                             })
                             .show_ui(ui, |ui| {
                                 changed |= ui
                                     .selectable_value(
                                         &mut self.settings.wave_playlist,
                                         "__liked".into(),
-                                        "Любимые треки",
+                                        crate::i18n::text("Любимые треки"),
                                     )
                                     .changed();
                                 for playlist in &self.playlists {
@@ -204,7 +224,10 @@ impl MetrolistApp {
                                         .changed();
                                 }
                             });
-                        if ui.button("Обновить мои плейлисты").clicked() {
+                        if ui
+                            .button(crate::i18n::text("Обновить мои плейлисты"))
+                            .clicked()
+                        {
                             self.sync_playlists();
                         }
                         if self.is_loading_playlists {
@@ -212,16 +235,18 @@ impl MetrolistApp {
                         }
                     }
                     2 => {
-                        ui.label("Найди песню и выбери её для запуска радио.");
+                        ui.label(crate::i18n::text(
+                            "Найди песню и выбери её для запуска радио.",
+                        ));
                         ui.horizontal_wrapped(|ui| {
                             let edit = ui.add(
                                 egui::TextEdit::singleline(&mut self.wave_search_query)
-                                    .hint_text("Название трека или исполнитель")
+                                    .hint_text(crate::i18n::text("Название трека или исполнитель"))
                                     .desired_width((ui.available_width() - 90.0).max(120.0)),
                             );
                             let enter =
                                 edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if ui.button("Найти").clicked() || enter {
+                            if ui.button(crate::i18n::text("Найти")).clicked() || enter {
                                 self.search_wave_seed();
                             }
                         });
@@ -229,7 +254,7 @@ impl MetrolistApp {
                             ui.spinner();
                         }
                         if !self.wave_search_message.is_empty() {
-                            ui.label(&self.wave_search_message);
+                            ui.label(crate::i18n::message(&self.wave_search_message));
                         }
                         let mut selected = None;
                         egui::ScrollArea::vertical()
@@ -255,7 +280,9 @@ impl MetrolistApp {
                                     }
                                 }
                             });
-                        if ui.button("Использовать текущую песню").clicked()
+                        if ui
+                            .button(crate::i18n::text("Использовать текущую песню"))
+                            .clicked()
                         {
                             selected = self.current_track().cloned();
                         }
@@ -265,23 +292,45 @@ impl MetrolistApp {
                         }
                         if let Some(track) = &self.settings.wave_track {
                             ui.label(
-                                RichText::new(format!(
+                                RichText::new(crate::localized_format!(
                                     "Основа волны: {} — {}",
-                                    track.artist, track.title
+                                    "Station seed: {} — {}",
+                                    track.artist,
+                                    track.title
                                 ))
                                 .color(accent),
                             );
                         }
                     }
                     _ => {
-                        ui.label("Выбери настроение, жанр или введи своё слово.");
-                        changed |= ui
+                        ui.label(crate::i18n::text(
+                            "Выбери настроение, жанр или введи своё слово.",
+                        ));
+                        let mut keyword = match self.settings.wave_keyword.as_str() {
+                            preset @ ("Для меня"
+                            | "Рок"
+                            | "Электроника"
+                            | "Джаз"
+                            | "Спокойствие"
+                            | "Энергия"
+                            | "Для работы"
+                            | "Ночь") => crate::i18n::text(preset),
+                            other => other,
+                        }
+                        .to_owned();
+                        let keyword_changed = ui
                             .add(
-                                egui::TextEdit::singleline(&mut self.settings.wave_keyword)
-                                    .hint_text("Например: инди, прогулка, спокойствие")
+                                egui::TextEdit::singleline(&mut keyword)
+                                    .hint_text(crate::i18n::text(
+                                        "Например: инди, прогулка, спокойствие",
+                                    ))
                                     .desired_width(ui.available_width().min(400.0)),
                             )
                             .changed();
+                        if keyword_changed {
+                            self.settings.wave_keyword = keyword;
+                            changed = true;
+                        }
                         ui.horizontal_wrapped(|ui| {
                             for word in [
                                 "Для меня",
@@ -295,7 +344,7 @@ impl MetrolistApp {
                             ] {
                                 if ui
                                     .add(
-                                        egui::Button::new(word)
+                                        egui::Button::new(crate::i18n::text(word))
                                             .selected(self.settings.wave_keyword == word)
                                             .rounding(16.0),
                                     )
@@ -313,7 +362,7 @@ impl MetrolistApp {
                     .add_enabled(
                         !self.wave_busy,
                         egui::Button::new(
-                            RichText::new("▶ Запустить волну")
+                            RichText::new(crate::i18n::text("▶ Запустить волну"))
                                 .color(Color32::WHITE)
                                 .size(17.0),
                         )
@@ -322,11 +371,13 @@ impl MetrolistApp {
                         .min_size(egui::vec2(210.0, 46.0)),
                     )
                     .clicked();
-                ui.label("Запустит первый трек волны. Остальные добавятся в очередь.");
+                ui.label(crate::i18n::text(
+                    "Запустит первый трек волны. Остальные добавятся в очередь.",
+                ));
                 if ui
                     .checkbox(
                         &mut self.settings.wave_auto,
-                        "Продолжать волну после конца очереди",
+                        crate::i18n::text("Продолжать волну после конца очереди"),
                     )
                     .changed()
                 {
@@ -336,7 +387,7 @@ impl MetrolistApp {
                     ui.spinner();
                 }
                 if !self.wave_message.is_empty() {
-                    ui.label(&self.wave_message);
+                    ui.label(crate::i18n::message(&self.wave_message));
                 }
             });
         if changed {

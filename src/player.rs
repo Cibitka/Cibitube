@@ -82,15 +82,21 @@ impl AudioPlayer {
     ) -> Result<(IpcReader, IpcWriter), String> {
         for _ in 0..100 {
             if let Ok(Some(status)) = process.try_wait() {
-                return Err(format!("mpv завершился при запуске ({status})"));
+                return Err(crate::localized_format!(
+                    "mpv завершился при запуске ({status})",
+                    "mpv exited during startup ({status})"
+                ));
             }
 
             #[cfg(unix)]
             {
                 if let Ok(stream) = UnixStream::connect(sock_path) {
-                    let reader = stream
-                        .try_clone()
-                        .map_err(|e| format!("Не удалось клонировать сокет mpv: {e}"))?;
+                    let reader = stream.try_clone().map_err(|e| {
+                        crate::localized_format!(
+                            "Не удалось клонировать сокет mpv: {e}",
+                            "Could not clone the mpv socket: {e}"
+                        )
+                    })?;
                     return Ok((Box::new(reader), Box::new(stream)));
                 }
             }
@@ -103,9 +109,12 @@ impl AudioPlayer {
                     .write(true)
                     .open(sock_path)
                 {
-                    let reader = file
-                        .try_clone()
-                        .map_err(|e| format!("Не удалось клонировать канал mpv: {e}"))?;
+                    let reader = file.try_clone().map_err(|e| {
+                        crate::localized_format!(
+                            "Не удалось клонировать канал mpv: {e}",
+                            "Could not clone the mpv pipe: {e}"
+                        )
+                    })?;
                     return Ok((Box::new(reader), Box::new(file)));
                 }
             }
@@ -115,7 +124,7 @@ impl AudioPlayer {
 
         let _ = process.kill();
         let _ = process.wait();
-        Err("Таймаут подключения к IPC mpv (5 сек).".to_string())
+        Err(crate::i18n::text("Таймаут подключения к IPC mpv (5 сек).").to_string())
     }
 
     /// Совместимый конструктор (как раньше, без аргументов).
@@ -134,6 +143,7 @@ impl AudioPlayer {
         mpv_cmd
             .arg("--idle=yes")
             .arg("--no-video")
+            .arg("--audio-client-name=Cibitube")
             .arg(format!("--input-ipc-server={}", sock_path.display()))
             .arg("--ytdl-format=bestaudio/best")
             .arg("--keep-open=no")
@@ -163,7 +173,10 @@ impl AudioPlayer {
         }
 
         let mut process = mpv_cmd.spawn().map_err(|e| {
-            format!("Не удалось запустить mpv: {e}. Убедитесь, что пакет mpv установлен.")
+            crate::localized_format!(
+                "Не удалось запустить mpv: {e}. Убедитесь, что пакет mpv установлен.",
+                "Could not start mpv: {e}. Check that mpv is installed."
+            )
         })?;
 
         let (read_stream, mut write_stream) = Self::connect_ipc(&sock_path, &mut process)?;
@@ -232,7 +245,9 @@ impl AudioPlayer {
                     .filter(|id| *id >= FIRST_LOAD_REQUEST)
                 {
                     if val["error"].as_str() != Some("success") && request % 2 == 0 {
-                        let error = val["error"].as_str().unwrap_or("ошибка команды mpv");
+                        let error = val["error"]
+                            .as_str()
+                            .unwrap_or(crate::i18n::text("ошибка команды mpv"));
                         let _ =
                             playback_tx.send((request, PlaybackEvent::Failed(error.to_owned())));
                     }
@@ -262,7 +277,7 @@ impl AudioPlayer {
                             Some("error") => Some(PlaybackEvent::Failed(
                                 val["file_error"]
                                     .as_str()
-                                    .unwrap_or("ошибка mpv")
+                                    .unwrap_or(crate::i18n::text("ошибка mpv"))
                                     .to_owned(),
                             )),
                             _ => None,
