@@ -1128,18 +1128,22 @@ impl MetrolistApp {
                                 ui.label(format!("• {}", crate::i18n::text(&note[2..])));
                             }
                         });
+                        let package_managed = crate::updater::Updater::package_managed();
+                        if package_managed {
+                            ui.label(crate::updater::Updater::package_update_message());
+                        }
                         let cur_ver = crate::updater::Updater::CURRENT_VERSION;
                         ui.label(RichText::new(crate::localized_format!("Текущая версия Cibitube: v{}", "Current Cibitube version: v{}", cur_ver)).size(13.0).strong());
                         ui.add_space(6.0);
 
                         ui.horizontal(|ui| {
-                            let check_label = if cfg!(target_os = "linux") { crate::i18n::text("Проверить и обновить") } else { strings.updater_check_btn };
+                            let check_label = if cfg!(target_os = "linux") && !package_managed { crate::i18n::text("Проверить и обновить") } else { strings.updater_check_btn };
                             let check_btn = egui::Button::new(RichText::new(check_label).strong())
                                 .fill(Color32::from_rgb(35, 45, 55))
                                 .rounding(Rounding::same(6.0));
                             if ui.add_enabled(!self.is_checking_update && !self.is_applying_update, check_btn).clicked() {
                                 self.is_checking_update = true;
-                                self.install_after_check = cfg!(target_os = "linux");
+                                self.install_after_check = cfg!(target_os = "linux") && !package_managed;
                                 self.update_status = Some(crate::i18n::text("Проверка новых релизов на GitHub...").to_string());
                                 let tx = self.event_tx.clone();
                                 tokio::spawn(async move {
@@ -1174,7 +1178,9 @@ impl MetrolistApp {
                                 }
                                 ui.add_space(8.0);
 
-                                if self.is_applying_update {
+                                if package_managed {
+                                    ui.label(crate::updater::Updater::package_update_message());
+                                } else if self.is_applying_update {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
                                         ui.label(RichText::new(crate::i18n::text("Скачивание и замена файла программы...")).color(Color32::from_rgb(56, 189, 248)));

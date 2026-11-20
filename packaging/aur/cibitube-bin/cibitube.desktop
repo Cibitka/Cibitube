@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Cibitube
+GenericName=Music Player
+GenericName[ru]=Музыкальный плеер
+Comment=Listen to YouTube Music
+Comment[ru]=Слушайте музыку из YouTube Music
+Exec=cibitube
+Icon=cibitube
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;youtube;player;
+StartupWMClass=cibitube

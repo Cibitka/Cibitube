@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReleaseAsset {
@@ -45,6 +46,33 @@ impl Updater {
     pub const REPO: &'static str = "Cibitka/Cibitube";
     pub const RELEASES_URL: &'static str = "https://github.com/Cibitka/Cibitube/releases";
     pub const CURRENT_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    pub fn package_managed() -> bool {
+        static MANAGED: OnceLock<bool> = OnceLock::new();
+        *MANAGED.get_or_init(|| {
+            std::env::current_exe().is_ok_and(|path| Self::package_managed_at(&path))
+        })
+    }
+
+    fn package_managed_at(executable: &Path) -> bool {
+        let Some(bin) = executable
+            .parent()
+            .filter(|path| path.file_name().is_some_and(|name| name == "bin"))
+        else {
+            return false;
+        };
+        let Some(prefix) = bin.parent() else {
+            return false;
+        };
+        fs::read_to_string(prefix.join("share/cibitube/package-manager"))
+            .is_ok_and(|manager| manager.trim() == "pacman")
+    }
+
+    pub fn package_update_message() -> &'static str {
+        crate::i18n::text(
+            "Cibitube установлен через пакетный менеджер. Для обновления выполните paru -Syu.",
+        )
+    }
 
     fn http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
@@ -245,6 +273,9 @@ impl Updater {
         expected_sha256: Option<String>,
         patch: Option<UpdatePatch>,
     ) -> Result<String, String> {
+        if Self::package_managed() {
+            return Err(Self::package_update_message().into());
+        }
         if !cfg!(target_os = "linux") {
             return Err(
                 crate::i18n::text("Автообновление доступно только на Linux. Скачайте новую версию со страницы релизов.")
@@ -453,6 +484,26 @@ impl Updater {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_marker_applies_only_to_the_matching_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("usr");
+        let marker = prefix.join("share/cibitube/package-manager");
+        let executable = prefix.join("bin/cibitube");
+        assert!(!Updater::package_managed_at(&executable));
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "pacman\n").unwrap();
+        assert!(Updater::package_managed_at(&executable));
+        assert!(!Updater::package_managed_at(
+            &root.path().join("portable/cibitube")
+        ));
+        assert!(!Updater::package_managed_at(
+            &root.path().join("other/bin/cibitube")
+        ));
+        fs::write(&marker, "unknown").unwrap();
+        assert!(!Updater::package_managed_at(&executable));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

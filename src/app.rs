@@ -734,6 +734,14 @@ impl MetrolistApp {
         fade_in.min(fade_out)
     }
 
+    pub(crate) fn set_current_lyrics(&mut self, track_id: Option<&str>, lyrics: Option<Lyrics>) {
+        #[cfg(target_os = "linux")]
+        self.media_controls.set_lyrics(track_id, lyrics.as_ref());
+        #[cfg(not(target_os = "linux"))]
+        let _ = track_id;
+        self.lyrics = lyrics;
+    }
+
     fn load_track_lyrics(&mut self, track: &Track) {
         let attached = self.library.local_lyrics.get(&track.id).cloned();
         let adjacent = self
@@ -741,18 +749,19 @@ impl MetrolistApp {
             .local_audio
             .get(&track.id)
             .into_iter()
-            .flat_map(|audio| ["lrc", "ttml", "qrc", "txt"].map(|ext| audio.with_extension(ext)));
+            .flat_map(|audio| ["lrc", "ttml", "qrc", "txt"].map(|ext| audio.with_extension(ext)))
+            .collect::<Vec<_>>();
         for path in attached.into_iter().chain(adjacent) {
             if let Some(lyrics) = crate::lyrics::LocalFileAdapter::load_file(&path) {
                 self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
-                self.lyrics = Some(lyrics);
+                self.set_current_lyrics(Some(&track.id), Some(lyrics));
                 self.is_local_lyrics = true;
                 return;
             }
         }
         if track.id.starts_with("local:") {
             self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
-            self.lyrics = None;
+            self.set_current_lyrics(None, None);
             self.is_local_lyrics = false;
             return;
         }
@@ -773,7 +782,7 @@ impl MetrolistApp {
                 if p.exists() {
                     if let Some(loaded) = crate::lyrics::LocalFileAdapter::load_file(&p) {
                         self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
-                        self.lyrics = Some(loaded);
+                        self.set_current_lyrics(Some(&track.id), Some(loaded));
                         self.is_local_lyrics = true;
                         lyrics_loaded = true;
                         break;
@@ -2721,9 +2730,9 @@ impl eframe::App for MetrolistApp {
                         &track_id,
                     ) {
                         if let Some(new_lyrics) = lyrics {
-                            self.lyrics = Some(new_lyrics);
+                            self.set_current_lyrics(Some(&track_id), Some(new_lyrics));
                         } else if !is_upgraded && self.lyrics.is_none() {
-                            self.lyrics = None;
+                            self.set_current_lyrics(None, None);
                         }
                     }
                 }
@@ -3720,6 +3729,9 @@ impl eframe::App for MetrolistApp {
                     .is_some_and(|index| index > 0 || self.repeat_mode == 1),
             ),
             self.settings.playback_speed,
+            self.lyrics
+                .as_ref()
+                .map_or(0, |lyrics| self.lyric_total_offset(lyrics)),
         );
         self.render_download_log(ctx);
         self.render_playlist_picker(ctx);
@@ -4873,7 +4885,7 @@ impl MetrolistApp {
         self.playback_start_deadline = None;
         self.playback_needs_restart = false;
         self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
-        self.lyrics = None;
+        self.set_current_lyrics(None, None);
         self.is_local_lyrics = false;
         self.save_queue_state();
     }
@@ -5062,6 +5074,12 @@ impl MetrolistApp {
     }
 
     pub(crate) fn begin_update(&mut self, info: crate::updater::UpdateInfo) {
+        if crate::updater::Updater::package_managed() {
+            self.show_update_confirm = false;
+            self.update_status = Some(crate::updater::Updater::package_update_message().into());
+            return;
+        }
+
         if self.is_applying_update {
             return;
         }
@@ -5136,7 +5154,7 @@ impl MetrolistApp {
         {
             self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
             self.is_local_lyrics = true;
-            self.lyrics = Some(lyrics);
+            self.set_current_lyrics(Some(track_id), Some(lyrics));
         }
         self.status_message = Some(crate::i18n::text("Текст песни привязан к треку.").into());
     }

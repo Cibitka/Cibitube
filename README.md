@@ -129,3 +129,13 @@ Cibitube is free and open-source. If you enjoy using Cibitube and want to suppor
 
 The desktop client is distributed under the [MIT License](LICENSE).
 
+
+### Lyrics in the terminal (Linux)
+
+With the player running, open another terminal and run:
+
+```sh
+cibitube --lyrics
+```
+
+`--text` is an alias. The active lyric line is highlighted and follows pause, seeking, track changes and your lyric offsets. Lyrics without timestamps are marked as unsynchronized. Press `Ctrl+C` to close the view while music keeps playing. Redirecting output prints the current lyrics once. This feature requires a build containing the terminal lyrics changes; it is not included in v0.2.10.

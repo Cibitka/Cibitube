@@ -1,4 +1,4 @@
-use crate::models::{PlaybackInfo, Track};
+use crate::models::{Lyrics, PlaybackInfo, Track};
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
@@ -33,6 +33,7 @@ struct State {
     rate: f64,
     next: bool,
     previous: bool,
+    lyrics_offset: i64,
 }
 
 impl State {
@@ -238,9 +239,102 @@ impl Service {
     }
 }
 
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LyricsSnapshot {
+    pub track_id: String,
+    pub title: String,
+    pub artist: String,
+    pub playing: bool,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub english: bool,
+    pub revision: u64,
+    pub synced: bool,
+    pub available: bool,
+    pub active: Option<usize>,
+    pub lines: Option<Vec<String>>,
+}
+
+#[derive(Default)]
+struct LyricContent {
+    track_id: Option<String>,
+    revision: u64,
+    lyrics: Option<Arc<Lyrics>>,
+}
+
+struct TerminalService {
+    service: Service,
+    content: Arc<Mutex<LyricContent>>,
+}
+
+#[zbus::interface(name = "io.github.Cibitka.Cibitube.Lyrics1")]
+impl TerminalService {
+    fn snapshot(&self, known_track: &str, known_revision: u64) -> zbus::fdo::Result<String> {
+        let state = self.service.snapshot();
+        let (revision, owner, lyrics) = {
+            let content = self
+                .content
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (
+                content.revision,
+                content.track_id.clone(),
+                content.lyrics.clone(),
+            )
+        };
+        let track_id = state.track.as_ref().map_or("", |track| track.id.as_str());
+        let lyrics = lyrics.filter(|_| owner.as_deref() == Some(track_id));
+        let synced = lyrics.as_ref().is_some_and(|lyrics| lyrics.is_synced);
+        let position_ms = (state.position / 1000)
+            .saturating_add(state.lyrics_offset)
+            .max(0) as u64;
+        let active = lyrics.as_ref().filter(|_| synced).and_then(|lyrics| {
+            lyrics
+                .lines
+                .iter()
+                .rposition(|line| line.start_ms <= position_ms)
+        });
+        let changed = known_track != track_id || known_revision != revision;
+        let lines = changed.then(|| {
+            lyrics.as_ref().map_or_else(Vec::new, |lyrics| {
+                if lyrics.lines.is_empty() {
+                    lyrics.plain.lines().map(str::to_owned).collect()
+                } else {
+                    lyrics.lines.iter().map(|line| line.text.clone()).collect()
+                }
+            })
+        });
+        let snapshot = LyricsSnapshot {
+            track_id: track_id.to_owned(),
+            title: state
+                .track
+                .as_ref()
+                .map_or_else(String::new, |track| track.title.clone()),
+            artist: state
+                .track
+                .as_ref()
+                .map_or_else(String::new, |track| track.artist.clone()),
+            playing: state.loaded && state.playing,
+            position_secs: state.position as f64 / 1_000_000.0,
+            duration_secs: state.duration as f64 / 1_000_000.0,
+            english: crate::i18n::is_english(),
+            revision,
+            synced,
+            available: lyrics
+                .as_ref()
+                .is_some_and(|lyrics| !lyrics.lines.is_empty() || !lyrics.plain.trim().is_empty()),
+            active,
+            lines,
+        };
+        serde_json::to_string(&snapshot)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+}
+
 pub(crate) struct MediaControls {
     commands: mpsc::Receiver<Command>,
     updates: watch::Sender<State>,
+    lyrics: Arc<Mutex<LyricContent>>,
 }
 
 impl MediaControls {
@@ -253,6 +347,8 @@ impl MediaControls {
             commands: tx,
             ctx: ctx.clone(),
         };
+        let lyrics = Arc::new(Mutex::new(LyricContent::default()));
+        let terminal_lyrics = lyrics.clone();
         tokio::spawn(async move {
             loop {
                 let connect = async {
@@ -263,6 +359,13 @@ impl MediaControls {
                         ))?
                         .serve_at(PATH, Root(service.clone()))?
                         .serve_at(PATH, service.clone())?
+                        .serve_at(
+                            PATH,
+                            TerminalService {
+                                service: service.clone(),
+                                content: terminal_lyrics.clone(),
+                            },
+                        )?
                         .build()
                         .await
                 };
@@ -333,7 +436,21 @@ impl MediaControls {
                 }
             }
         });
-        Self { commands, updates }
+        Self {
+            commands,
+            updates,
+            lyrics,
+        }
+    }
+
+    pub(crate) fn set_lyrics(&self, track_id: Option<&str>, lyrics: Option<&Lyrics>) {
+        let mut content = self
+            .lyrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        content.track_id = track_id.map(str::to_owned);
+        content.lyrics = lyrics.map(|lyrics| Arc::new(lyrics.clone()));
+        content.revision = content.revision.wrapping_add(1);
     }
 
     pub(crate) fn command(&self) -> Option<Command> {
@@ -353,6 +470,7 @@ impl MediaControls {
         loaded: bool,
         navigation: (bool, bool),
         rate: f64,
+        lyrics_offset: i64,
     ) {
         let state = State {
             track: track.cloned(),
@@ -363,6 +481,7 @@ impl MediaControls {
             volume: info.volume / 100.0,
             next: navigation.0,
             previous: navigation.1,
+            lyrics_offset,
             rate,
         };
         self.updates.send_if_modified(|previous| {

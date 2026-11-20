@@ -17,6 +17,8 @@ mod pet;
 mod player;
 mod settings;
 mod sync;
+#[cfg(target_os = "linux")]
+mod terminal_lyrics;
 mod ui_lyrics;
 mod ui_settings;
 mod ui_wave;
@@ -102,6 +104,30 @@ fn main() -> eframe::Result<()> {
         .build()
         .expect("Failed to create tokio runtime");
     let _guard = rt.enter();
+
+    if let Some(argument) = std::env::args().nth(1) {
+        match argument.as_str() {
+            "--lyrics" | "--text" => {
+                #[cfg(target_os = "linux")]
+                if let Err(error) = rt.block_on(terminal_lyrics::run()) {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                #[cfg(not(target_os = "linux"))]
+                eprintln!("Terminal lyrics are currently available on Linux.");
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!("Cibitube\n\n  cibitube             Open the player\n  cibitube --lyrics    Show live lyrics from the running player\n  cibitube --text      Alias for --lyrics\n  cibitube --version   Print the version");
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("Cibitube {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("Cibitube — YouTube Music Client")

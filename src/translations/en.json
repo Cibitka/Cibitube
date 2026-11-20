@@ -569,5 +569,11 @@
   "Загрузчик превысил лимит {} сек.": "The downloader exceeded the {} second time limit.",
   "Ошибка ожидания загрузчика: {error}": "Could not wait for the downloader: {error}",
   "−0,5": "−0.5",
-  "+0,5": "+0.5"
+  "+0,5": "+0.5",
+  "Cibitube установлен через пакетный менеджер. Для обновления выполните paru -Syu.": "Cibitube is managed by your package manager. Update it with paru -Syu.",
+  "Подготовлен пакет cibitube-bin для Arch Linux / AUR. Пакетная установка обновляется через пакетный менеджер.": "Prepared an Arch Linux / AUR package for cibitube-bin. Package installations update through the package manager.",
+  "Воспроизведение": "Playing",
+  "Ожидание Cibitube. Откройте плеер и включите трек.": "Waiting for Cibitube. Open the player and start a track.",
+  "Ctrl+C — закрыть текст, музыка продолжит играть": "Ctrl+C — close lyrics; music will keep playing",
+  "Текст текущего трека в терминале Linux: cibitube --lyrics (или --text). Активная строка подсвечивается с учётом общего и индивидуального сдвига. Ctrl+C закрывает текст без остановки музыки.": "Live lyrics in the Linux terminal: cibitube --lyrics (or --text). The active line follows global and per-track offsets. Ctrl+C closes lyrics without stopping music."
 }

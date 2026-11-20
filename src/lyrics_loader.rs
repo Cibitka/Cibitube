@@ -115,7 +115,7 @@ impl MetrolistApp {
                 }
             }
         });
-        self.lyrics = None;
+        self.set_current_lyrics(None, None);
     }
 
     pub(crate) fn trigger_lyrics_search(&mut self, bypass_cache: bool) {
@@ -123,7 +123,7 @@ impl MetrolistApp {
             if let Some(path) = self.library.local_lyrics.get(&track.id) {
                 if let Some(lyrics) = crate::lyrics::LocalFileAdapter::load_file(path) {
                     self.lyrics_req_id = self.lyrics_req_id.wrapping_add(1);
-                    self.lyrics = Some(lyrics);
+                    self.set_current_lyrics(Some(&track.id), Some(lyrics));
                     self.is_local_lyrics = true;
                 } else {
                     self.status_message =
